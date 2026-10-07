@@ -12,7 +12,8 @@
 #   3. gen_xcodeproj.py  the app links with -u _mv_shims_install: the shims are
 #                   reached only through a constructor, and a static archive's
 #                   member that nothing references is otherwise not linked
-#   4. guests       staged guest trees symlinked in (metavision-targets link)
+#   4. kl_app.c     multi-guest bundles: titles load from Frameworks/<target>/
+#   5. guests       staged guest trees symlinked in (metavision-targets link)
 #
 # Idempotent; each step checks its anchor and fails loudly if upstream moved it.
 #
@@ -56,7 +57,50 @@ if ! grep -q '_mv_shims_install' "$G"; then
 fi
 echo "overlay: app links with -u _mv_shims_install"
 
-# 4 — guests
+# 4 — multi-guest bundles (the metavision launcher)
+#
+# A launcher embeds many titles, and two Unity titles both ship libunity, so
+# each title's translations live in Frameworks/<target>/ instead of flat in
+# Frameworks/. When that folder exists, kl_app.c loads the title from it,
+# keeps ANGLE and MoltenVK on the shared Frameworks/, and gives the title its
+# own Android files directory (otherwise every title would share one, and
+# with it each other's saves). A single-title app has no such folder and is
+# unchanged.
+A="$K/visionos/Sources/kl_app.c"
+if ! grep -q 'metavision: multi-guest' "$A"; then
+    python3 - "$A" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+def rep(old, new):
+    global s
+    if s.count(old) != 1:
+        sys.exit(f"overlay: kl_app.c anchor moved upstream: {old[:60]!r}")
+    s = s.replace(old, new)
+rep('static char g_dylibs[1024];',
+    'static char g_dylibs[1024];\nstatic char g_shared_fw[1024];   // metavision: multi-guest — ANGLE/MoltenVK stay here')
+rep('    snprintf(g_dylibs, sizeof g_dylibs, "%s/Frameworks", resources);\n',
+    '    snprintf(g_dylibs, sizeof g_dylibs, "%s/Frameworks", resources);\n'
+    '    snprintf(g_shared_fw, sizeof g_shared_fw, "%s", g_dylibs);\n'
+    '    {   // metavision: multi-guest — a launcher keeps each title in Frameworks/<target>/\n'
+    '        char per[1100];\n'
+    '        snprintf(per, sizeof per, "%s/%s", g_shared_fw, g_target->name);\n'
+    '        if (have(per)) snprintf(g_dylibs, sizeof g_dylibs, "%s", per);\n'
+    '    }\n')
+rep('    snprintf(g_files,  sizeof g_files,  "%s/android-files", container);\n',
+    '    if (strcmp(g_dylibs, g_shared_fw) != 0)   // metavision: multi-guest — per-title files\n'
+    '    {   snprintf(g_files, sizeof g_files, "%s/%s", container, g_target->tree);\n'
+    '        mkdir(g_files, 0755);   /* the title folder may not exist before its assets do */\n'
+    '        snprintf(g_files, sizeof g_files, "%s/%s/android-files", container, g_target->tree); }\n'
+    '    else\n'
+    '        snprintf(g_files, sizeof g_files, "%s/android-files", container);\n')
+rep('    setenv("KL_ANGLE_DIR", g_dylibs, 0);', '    setenv("KL_ANGLE_DIR", g_shared_fw, 0);')
+rep('    setenv("KL_MVK_DIR", g_dylibs, 0);', '    setenv("KL_MVK_DIR", g_shared_fw, 0);')
+open(p, "w").write(s)
+EOF
+fi
+echo "overlay: kl_app.c loads a launcher's titles from Frameworks/<target>/"
+
+# 5 — guests
 if [ -f "$ROOT/build/guests/targets.json" ]; then
     python3 - "$ROOT/build/guests" "$K" <<'EOF'
 import json, os, sys
