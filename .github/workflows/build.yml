@@ -1,0 +1,65 @@
+name: build
+
+on:
+  workflow_dispatch:        # manual "Run workflow" button
+  push:
+    tags: ['v*']
+
+jobs:
+  # Runs on Linux deliberately: these checks need no Darwin SDK, and macOS
+  # minutes bill at 10x. A broken shim should not cost a Mac runner to discover.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+
+  ipa:
+    needs: test
+    runs-on: macos-15       # real Apple hardware, Xcode preinstalled
+    steps:
+      - uses: actions/checkout@v4
+
+      # Signing identity lives in Settings → Secrets, never in the repo.
+      # SIGNING_P12 is the base64 of your exported .p12.
+      - name: Import signing certificate
+        env:
+          P12: ${{ secrets.SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import /tmp/cert.p12 -k build.keychain \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm /tmp/cert.p12
+
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          cd app && xcodegen generate
+
+      - name: Archive
+        run: |
+          xcodebuild -project app/MetaVision.xcodeproj \
+                     -scheme MetaVision \
+                     -destination 'generic/platform=visionOS' \
+                     -archivePath build/MetaVision.xcarchive \
+                     archive
+
+      - name: Export .ipa
+        run: |
+          xcodebuild -exportArchive \
+                     -archivePath build/MetaVision.xcarchive \
+                     -exportOptionsPlist app/ExportOptions.plist \
+                     -exportPath build/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MetaVision-ipa
+          path: build/*.ipa
+          retention-days: 14

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# metavision-triage <apk> — decide whether a title can run, emit one manifest record.
+# Gate order matters: ABI is terminal, so check it before anything expensive.
+set -euo pipefail
+
+APK="${1:?usage: metavision-triage <apk>}"
+PKG="$(basename "$(dirname "$APK")")"
+L="$(unzip -l "$APK")"
+has() { grep -q -- "$1" <<<"$L"; }
+
+# gate 1 — ABI. armeabi-v7a only is terminal: AArch32 does not execute on Apple silicon.
+if ! has 'lib/arm64-v8a/'; then
+  printf '{"pkg":"%s","status":"ARCH32","note":"32-bit only — AArch32 not executable at EL0"}\n' "$PKG"
+  exit 0
+fi
+
+# gate 2 — scripting backend
+if   has 'libil2cpp.so';        then BACKEND=IL2CPP
+elif has 'libmonobdwgc-2.0.so'; then BACKEND=MONO
+elif has 'libmain.so';          then BACKEND=NATIVE
+else                                 BACKEND=UNKNOWN; fi
+
+# gate 3 — XR runtime, picks the shim
+if   has 'libopenxr_loader.so'; then XR=OPENXR
+elif has 'libvrapi.so';         then XR=VRAPI
+else                                 XR=NONE; fi
+
+# gate 4 — graphics path. Vulkan means framebuffer submit, which means no gaze.
+if unzip -p "$APK" 'lib/arm64-v8a/*.so' 2>/dev/null | strings | grep -q vkCreateInstance
+  then GFX=VULKAN; GAZE=NONE
+  else GFX=GLES;   GAZE=PINCH; fi
+
+# gate 5 — JIT canaries
+JIT=none
+for c in luajit libv8 hermes libmonobdwgc; do has "$c" && JIT="$c"; done
+
+STATUS=OK
+[ "$BACKEND" = MONO ] && STATUS=JIT
+[ "$JIT" != none ]    && STATUS=JIT
+
+printf '{"pkg":"%s","status":"%s","backend":"%s","xr":"%s","gfx":"%s","gaze":"%s","jit":"%s"}\n' \
+  "$PKG" "$STATUS" "$BACKEND" "$XR" "$GFX" "$GAZE" "$JIT"

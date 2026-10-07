@@ -1,0 +1,26 @@
+# XcodeGen spec. The .xcodeproj is generated on the build host, so nothing
+# Mac-authored needs to live in the repo.
+name: MetaVision
+options:
+  bundleIdPrefix: com.metavision
+  deploymentTarget:
+    visionOS: "2.0"
+
+targets:
+  MetaVision:
+    type: application
+    platform: visionOS
+    sources:
+      - Sources
+      # Relinked titles land here at build time; each is a signed .framework
+      # embedded in the bundle. Code cannot be sideloaded — see METAVISION.md.
+      - path: ../build/frameworks
+        optional: true
+        buildPhase: frameworks
+    settings:
+      base:
+        INFOPLIST_FILE: Resources/Info.plist
+        PRODUCT_BUNDLE_IDENTIFIER: com.metavision.launcher
+        SWIFT_VERSION: "5.9"
+        ENABLE_HARDENED_RUNTIME: YES
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks"

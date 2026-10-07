@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Can this archive possibly run? Answered without either device.
+
+metavision-archive proves an extraction is structurally complete — splits
+present, zips readable, OBB transferred. That is necessary and nowhere near
+sufficient: an archive can pass all of it and still be a title that cannot
+start, because something it loads at runtime was never in the APK to begin with.
+
+Those failures are predictable today. A stripped ELF still declares what it
+needs, and the questions that decide whether a title can run are answerable from
+the files alone:
+
+  * every DT_NEEDED library resolves — inside the APK, or from the runtime
+  * undefined symbols have somewhere to come from
+  * the engine's own bootstrap asset is present (IL2CPP dies without
+    global-metadata.dat before a line of managed code runs)
+  * OBB archives decompress rather than merely exist
+
+None of this proves a title runs. It does prove the archive is not missing
+something, which is the only question that stops mattering once the Quest is
+gone.
+
+    metavision-closure pull/com.example.vrtitle
+    metavision-closure --all
+
+Exit 1 if any title cannot run as archived.
+"""
+import argparse, os, re, subprocess, sys, tempfile, zipfile
+
+# Provided by the runtime: bionic, the NDK surface, and the graphics translation.
+# A title needing these is fine.
+PROVIDED = {
+    "libc.so", "libm.so", "libdl.so", "libstdc++.so", "liblog.so",
+    "libandroid.so", "libz.so", "libjnigraphics.so", "libmediandk.so",
+    "libOpenSLES.so", "libOpenMAXAL.so", "libaaudio.so", "libnativewindow.so",
+    "libEGL.so", "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so",
+    "libvulkan.so", "libneuralnetworks.so", "libcamera2ndk.so",
+    # API 29+ NDK surface. libamidi in particular is on the Quest at
+    # /system/lib64, so a title linking it is using the platform, not shipping
+    # a dependency it forgot.
+    "libamidi.so", "libbinder_ndk.so", "libnativehelper.so", "libGLESv3_adreno.so",
+}
+
+# Libraries the loader pulls in at startup. Everything else in an APK is a
+# plugin variant: Unity ships one per XR backend and dlopens only the one that
+# matches the device, so an unresolved dependency of an unloaded plugin is not
+# a blocker. libwvr_api (HTC Vive Wave) reaches us exactly this way — it is
+# absent from the Quest too, and these titles ran there.
+PRIMARY = {
+    "libmain.so", "libunity.so", "libil2cpp.so", "libUE4.so", "libUnreal.so",
+    "libopenxr_loader.so", "libvrapi.so", "libovrplatformloader.so",
+    "libgodot_android.so", "libSDL2.so",
+}
+
+# Vendor blobs that only exist on Quest hardware. A title linking one directly
+# cannot be made to run by extracting harder — the dependency is a driver.
+QUEST_ONLY = {
+    "libgsl.so", "libadreno_utils.so", "libGLESv2_adreno.so", "libEGL_adreno.so",
+    "vulkan.adreno.so", "libq3dtools_adreno.so", "libllvm-glnext.so",
+    "libCB.so", "libOpenCL.so", "libhardware.so", "libsync.so",
+}
+
+# IL2CPP cannot start without global-metadata.dat, so that one is exact.
+# Unity's asset layout is not: newer builds ship a single data.unity3d, older
+# ones a tree of hash-named files, and either may live in an OBB instead. The
+# check is that assets/bin/Data exists at all.
+ENGINE_ASSETS = [
+    ("IL2CPP", "libil2cpp.so", "assets/bin/Data/Managed/Metadata/global-metadata.dat"),
+    ("Unity",  "libunity.so",  "assets/bin/Data/"),
+]
+
+
+def readelf(path, *flags):
+    for tool in ("readelf", "llvm-readelf", "eu-readelf"):
+        try:
+            r = subprocess.run([tool, *flags, "-W", path],
+                               capture_output=True, text=True, check=True)
+            return r.stdout
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError:
+            return ""
+    sys.exit("need readelf on PATH")
+
+
+def needed_and_symbols(path):
+    dyn = readelf(path, "-d")
+    needed = set(re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", dyn))
+    syms = readelf(path, "--dyn-syms")
+    undefined, exported = set(), set()
+    for line in syms.splitlines():
+        parts = line.split()
+        if len(parts) < 8 or not parts[0].endswith(":"):
+            continue
+        ndx, name = parts[6], parts[7].split("@")[0]
+        if not name:
+            continue
+        (undefined if ndx == "UND" else exported).add(name)
+    return needed, undefined, exported
+
+
+def check(apk_dir):
+    problems, notes = [], []
+    base = os.path.join(apk_dir, "base.apk")
+    if not os.path.exists(base):
+        return [f"{apk_dir}: no base.apk"], []
+
+    pkg = os.path.basename(apk_dir)
+    apks = [os.path.join(apk_dir, f) for f in sorted(os.listdir(apk_dir))
+            if f.endswith(".apk")]
+
+    entries, in_apk = set(), {}
+    all_exported, all_undefined = set(), set()
+    needed_by = {}     # soname -> set of libraries that need it
+
+    # Analysis stays inside the TemporaryDirectory. Extracting here and reading
+    # after the block exits leaves readelf pointed at deleted files: it fails,
+    # returns nothing, and every title passes. A verifier that reports clean
+    # because it examined nothing is worse than no verifier.
+    with tempfile.TemporaryDirectory() as tmp:
+        for apk in apks:
+            try:
+                z = zipfile.ZipFile(apk)
+            except zipfile.BadZipFile:
+                problems.append(f"{pkg}: {os.path.basename(apk)} is not a readable zip")
+                continue
+            with z:
+                entries |= set(z.namelist())
+                for name in z.namelist():
+                    if name.startswith("lib/arm64-v8a/") and name.endswith(".so"):
+                        in_apk[os.path.basename(name)] = z.extract(name, tmp)
+
+        if not in_apk:
+            problems.append(f"{pkg}: no arm64 libraries in any split")
+            return problems, notes
+
+        for soname, path in sorted(in_apk.items()):
+            needed, undefined, exported = needed_and_symbols(path)
+            if not needed and not exported:
+                problems.append(f"{pkg}: {soname} yielded no ELF data — "
+                                f"unreadable or truncated")
+            for lib in needed:
+                needed_by.setdefault(lib, set()).add(soname)
+            all_undefined |= undefined
+            all_exported |= exported
+
+    # 1. Library closure, weighted by who needs it.
+    for lib in sorted(needed_by):
+        if lib in in_apk or lib in PROVIDED:
+            continue
+        requesters = needed_by[lib]
+        primary = requesters & PRIMARY
+        if lib in QUEST_ONLY:
+            problems.append(f"{pkg}: links {lib}, a Quest driver blob — "
+                            f"cannot run off-device regardless of extraction")
+        elif primary:
+            problems.append(f"{pkg}: {', '.join(sorted(primary))} needs {lib}, "
+                            f"which is not in the APK and not provided")
+        else:
+            notes.append(f"{pkg}: {lib} missing, wanted only by "
+                         f"{', '.join(sorted(requesters))} — a plugin variant "
+                         f"the loader does not reach on this device")
+
+    # 2. Symbol closure. Only meaningful for symbols nothing could satisfy —
+    # libc names are answered by the runtime and are not worth listing.
+    unresolved = {s for s in all_undefined - all_exported
+                  if s.startswith(("vrapi_", "ovrp_", "ovr_", "xr"))}
+    byname = {}
+    for s in sorted(unresolved):
+        byname.setdefault(s.split("_")[0], []).append(s)
+    for prefix, syms in sorted(byname.items()):
+        notes.append(f"{pkg}: {len(syms)} undefined {prefix}* symbol(s) — "
+                     f"must come from the shim, e.g. {syms[0]}")
+
+    # 3. Engine bootstrap assets. IL2CPP reads global-metadata.dat before any
+    # managed code runs, so its absence is not a degraded title, it is no title.
+    has_obb = os.path.isdir(os.path.join(apk_dir, "obb"))
+    for engine, marker, required in ENGINE_ASSETS:
+        if marker not in in_apk:
+            continue
+        present = (any(e.startswith(required) for e in entries)
+                   if required.endswith("/")
+                   else required in entries)
+        if not present and not has_obb:
+            problems.append(f"{pkg}: {engine} title with no {required} "
+                            f"and no OBB — will not start")
+
+    # 4. OBB archives must decompress, not merely exist.
+    obb_dir = os.path.join(apk_dir, "obb")
+    for dirpath, _, files in os.walk(obb_dir):
+        for name in files:
+            full = os.path.join(dirpath, name)
+            if not name.endswith(".obb"):
+                continue
+            try:
+                with zipfile.ZipFile(full) as z:
+                    bad = z.testzip()
+                if bad:
+                    problems.append(f"{pkg}: {name} corrupt at {bad}")
+            except zipfile.BadZipFile:
+                # Not every OBB is a zip; only flag one that is empty as well.
+                if os.path.getsize(full) == 0:
+                    problems.append(f"{pkg}: {name} is empty")
+    return problems, notes
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dirs", nargs="*")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--root", default=os.environ.get("MV_PULL_ROOT", "pull"))
+    args = ap.parse_args()
+
+    targets = args.dirs
+    if args.all:
+        targets = [os.path.join(args.root, d) for d in sorted(os.listdir(args.root))
+                   if os.path.isdir(os.path.join(args.root, d))]
+    if not targets:
+        ap.error("give archive directories or --all")
+
+    total_problems, total_notes = [], []
+    for d in targets:
+        problems, notes = check(d)
+        print(f"  {'FAIL' if problems else 'ok  '}  {os.path.basename(d)}")
+        total_problems += problems
+        total_notes += notes
+
+    for n in total_notes:
+        print(f"note: {n}")
+    for p in total_problems:
+        print(f"error: {p}", file=sys.stderr)
+    print(f"\n{len(targets)} title(s), {len(total_problems)} blocker(s)")
+    return 1 if total_problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

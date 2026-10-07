@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# metavision-sync <package> [host] — push assets into the app's Documents container.
+#
+# One file per request. devicectl is macOS-only and its recursive directory copy
+# is broken; a tarball would need an extractor on-device, where there is no shell.
+# Game assets are few and large, so the round-trip count stays low.
+set -euo pipefail
+
+PKG="${1:?usage: metavision-sync <package> [host]}"
+HOST="${2:-vision.local}"
+SRC="build/assets/$PKG"
+
+[ -d "$SRC" ] || { echo "no assets at $SRC — run the relink stage first" >&2; exit 1; }
+
+enc() { python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
+
+mapfile -d '' -t files < <(find "$SRC" -type f -print0)
+total=${#files[@]}
+echo "==> $total files, $(du -sh "$SRC" | cut -f1) → $HOST:8787"
+
+n=0
+for f in "${files[@]}"; do
+  rel="${f#"$SRC"/}"
+  n=$((n + 1))
+  printf '    [%d/%d] %s\n' "$n" "$total" "$rel"
+  url="http://$HOST:8787/ingest?pkg=$(enc "$PKG")&path=$(enc "$rel")"
+  curl --fail --silent --show-error -X PUT --data-binary "@$f" "$url" \
+    || { echo "failed: $rel" >&2; exit 1; }
+done
+
+echo "==> $total files delivered"

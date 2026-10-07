@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Derive VrApi ground truth from files the user already has.
+
+We declare the VrApi ABI ourselves because Meta's headers are not
+redistributable. That leaves two ways to be wrong, and neither announces
+itself:
+
+  1. A struct field at the wrong offset reads its neighbour. The symptom is a
+     drifting pose or a swapchain index off the end, arriving far from the
+     cause.
+  2. A function the guest calls that we never implemented. Without a named
+     stub this is a jump to null with one guest frame above it.
+
+Both are answerable from artefacts a user of this project necessarily has: the
+libvrapi.so inside any Quest 1-era APK, and — if they downloaded the old Mobile
+SDK — VrApi_Types.h. Neither is redistributed; both are read in place.
+
+    metavision-vrapi-abi --lib    path/to/libvrapi.so
+    metavision-vrapi-abi --header path/to/VrApi_Types.h -o vrapi/vrapi_abi_expect.h
+
+Exit 1 on a disagreement, 0 when clean.
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+# Fields we declare and therefore must get right. Extend alongside kl_vrapi.h.
+PROBE = [
+    ("ovrSubmitFrameDescription2", ["Flags", "SwapInterval", "FrameIndex",
+                                    "DisplayTime", "LayerCount", "Layers"]),
+    ("ovrLayerHeader2",            ["Type", "Flags", "ColorScale",
+                                    "SrcBlend", "DstBlend"]),
+    ("ovrLayerProjection2",        ["Header", "HeadPose", "Textures"]),
+    ("ovrTracking2",               ["HeadPose", "Eye"]),
+    ("ovrModeParms",               ["Type", "Flags"]),
+    ("ovrRigidBodyPosef",          ["Pose", "TimeInSeconds"]),
+    ("ovrPosef",                   ["Orientation", "Translation"]),
+]
+
+
+def die(msg):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def readelf(path, *flags):
+    for tool in ("readelf", "llvm-readelf", "eu-readelf"):
+        try:
+            return subprocess.run([tool, *flags, "-W", path], capture_output=True,
+                                  text=True, check=True).stdout
+        except FileNotFoundError:
+            continue
+        except subprocess.CalledProcessError:
+            return ""
+    die("need readelf on PATH")
+
+
+def exported_symbols(lib):
+    """Every vrapi_* the real library exports."""
+    for tool in (["nm", "-D", "--defined-only", lib],
+                 ["readelf", "--dyn-syms", "-W", lib]):
+        try:
+            out = subprocess.run(tool, capture_output=True, text=True, check=True).stdout
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+        names = set(re.findall(r"\b(vrapi_[A-Za-z0-9_]+)\b", out))
+        if names:
+            return names
+    die("need nm or readelf on PATH to read the library")
+
+
+def implemented_symbols(root):
+    """Every vrapi_* we define. Definitions only — a call is not an entry point."""
+    names = set()
+    for dirpath, _, files in os.walk(root):
+        if ".git" in dirpath or "/vendor/" in dirpath:
+            continue
+        for f in files:
+            if not f.endswith(".c"):
+                continue
+            with open(os.path.join(dirpath, f), errors="ignore") as fh:
+                for m in re.finditer(r"^\w[\w \t*]*?\b(vrapi_[A-Za-z0-9_]+)\s*\(",
+                                     fh.read(), re.M):
+                    names.add(m.group(1))
+    return names
+
+
+def check_lib(lib, root):
+    real = exported_symbols(lib)
+    ours = implemented_symbols(root)
+    missing = sorted(real - ours)
+    extra = sorted(ours - real)
+
+    print(f"{len(real)} entry points exported by {os.path.basename(lib)}")
+    print(f"{len(ours & real)} implemented here")
+
+    if extra:
+        # Ours and not theirs means we invented a name — it will never be called,
+        # and the guest is meanwhile calling something we did not notice.
+        print(f"\n{len(extra)} defined here but NOT exported by the real library:")
+        for name in extra:
+            print(f"  {name}")
+
+    if missing:
+        print(f"\n{len(missing)} not implemented here (each aborts by name if reached):")
+        for name in missing[:40]:
+            print(f"  {name}")
+        if len(missing) > 40:
+            print(f"  ... and {len(missing) - 40} more")
+
+    return 1 if extra else 0
+
+
+def dwarf_layouts(lib, wanted):
+    """Read real struct layouts out of the library's own DWARF.
+
+    Meta shipped libvrapi.so unstripped and with debug_info, which makes the
+    binary a better authority than any header we could obtain: it is the exact
+    build the guest was compiled against, so there is no SDK-version question
+    to get wrong.
+
+    Parses readelf output rather than pulling in pyelftools — one external tool
+    we already depend on, versus a dependency for a few hundred lines of DIE
+    walking.
+    """
+    out = readelf(lib, "--debug-dump=info")
+    if not out:
+        die("no DWARF in that library — stripped? try another title's copy")
+
+    # VrApi declares `typedef struct ovrFoo_ { ... } ovrFoo;`, so the name we
+    # reference is the typedef and the structure tag carries a trailing
+    # underscore. Accept either and report under the name callers use.
+    accept = {}
+    for name in wanted:
+        accept[name] = name
+        accept[name + "_"] = name
+
+    layouts, current, depth = {}, None, None
+    pending_name = None
+
+    for line in out.splitlines():
+        m = re.match(r"\s*<(\d+)><[0-9a-f]+>:.*\((DW_TAG_\w+)\)", line)
+        if m:
+            level, tag = int(m.group(1)), m.group(2)
+            # Leaving the struct's subtree ends it; members sit exactly one
+            # level deeper, and nested types must not be mistaken for members.
+            if current is not None and level <= depth:
+                current = None
+            if tag == "DW_TAG_structure_type":
+                pending_name = ("struct", level)
+            elif tag == "DW_TAG_member" and current is not None and level == depth + 1:
+                pending_name = ("member", level)
+            else:
+                pending_name = None
+            continue
+
+        m = re.search(r"DW_AT_name\s*:.*?:\s*(\S+)\s*$", line)
+        if m and pending_name:
+            kind, level = pending_name
+            name = m.group(1)
+            if kind == "struct" and name in accept:
+                current, depth = accept[name], level
+                layouts.setdefault(current, {"size": None, "fields": {}})
+            elif kind == "member" and current:
+                layouts[current]["fields"][name] = None
+                layouts[current]["_last"] = name
+            continue
+
+        m = re.search(r"DW_AT_byte_size\s*:.*?(\d+)\s*$", line)
+        if m and current and layouts[current]["size"] is None:
+            layouts[current]["size"] = int(m.group(1))
+            continue
+
+        m = re.search(r"DW_AT_data_member_location\s*:.*?(\d+)\s*$", line)
+        if m and current and layouts[current].get("_last"):
+            # Consume the pending member once. ovrLayerHeader2 contains a union,
+            # whose members are DIEs one level deeper and carry their own
+            # locations relative to the union; without this they overwrite the
+            # enclosing struct's last member and report it at offset 0.
+            layouts[current]["fields"][layouts[current]["_last"]] = int(m.group(1))
+            layouts[current]["_last"] = None
+
+    for v in layouts.values():
+        v.pop("_last", None)
+        v["fields"] = {k: o for k, o in v["fields"].items() if o is not None}
+    return {k: v for k, v in layouts.items() if v["fields"]}
+
+
+def check_dwarf(lib, out_path):
+    wanted = {name for name, _ in PROBE}
+    layouts = dwarf_layouts(lib, wanted)
+    if not layouts:
+        die("DWARF present but none of the expected structs are in it")
+
+    missing = wanted - set(layouts)
+    for name in sorted(missing):
+        print(f"note: {name} not in this library's DWARF", file=sys.stderr)
+
+    body = [
+        "/* GENERATED by tools/metavision-vrapi-abi --dwarf. Do not edit.",
+        f" * Ground truth read from the DWARF in {os.path.basename(lib)} —",
+        " * the exact build the guest was compiled against.",
+        " * Present means kl_vrapi.h's declarations are checked at compile time. */",
+        "#ifndef KL_VRAPI_ABI_EXPECT_H",
+        "#define KL_VRAPI_ABI_EXPECT_H",
+        "",
+    ]
+    fields = 0
+    for name in sorted(layouts):
+        if layouts[name]["size"] is not None:
+            body.append(f"#define KL_ABI_SIZEOF_{name} {layouts[name]['size']}")
+    body.append("")
+    for name in sorted(layouts):
+        for field, off in sorted(layouts[name]["fields"].items(), key=lambda kv: kv[1]):
+            body.append(f"#define KL_ABI_OFFSET_{name}_{field} {off}")
+            fields += 1
+    body += ["", "#endif"]
+    text = "\n".join(body) + "\n"
+
+    if out_path:
+        with open(out_path, "w") as f:
+            f.write(text)
+        print(f"wrote {out_path}: {len(layouts)} structs, {fields} fields from DWARF")
+    else:
+        print(text)
+
+    for name in sorted(layouts):
+        offs = ", ".join(f"{f}@{o}" for f, o in
+                         sorted(layouts[name]["fields"].items(), key=lambda kv: kv[1]))
+        print(f"  {name} (size {layouts[name]['size']}): {offs}")
+    return 0
+
+
+def probe_struct(cc, tmp, header, struct, fields):
+    """Compile one struct's probe alone.
+
+    Per-struct rather than one program: headers differ across SDK versions, and
+    a single missing struct must not take the whole run down with it. An
+    all-or-nothing probe fails open — it compiles with everything ifdef'd out
+    and reports nothing, which looks like success.
+    """
+    src = os.path.join(tmp, f"probe_{struct}.c")
+    exe = os.path.join(tmp, f"probe_{struct}")
+    lines = ['#include <stdio.h>', '#include <stddef.h>',
+             f'#include "{os.path.abspath(header)}"', 'int main(void) {',
+             f'  printf("SIZE {struct} %zu\\n", sizeof({struct}));']
+    for field in fields:
+        lines.append(f'  printf("OFF {struct} {field} %zu\\n", offsetof({struct}, {field}));')
+    lines += ['  return 0;', '}']
+    with open(src, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    r = subprocess.run([cc, "-o", exe, src], capture_output=True, text=True)
+    if r.returncode != 0:
+        first = next((l for l in r.stderr.splitlines() if "error" in l), "").strip()
+        return None, first or "did not compile"
+    return subprocess.run([exe], capture_output=True, text=True, check=True).stdout, None
+
+
+def check_header(header, out_path):
+    """Read real offsets out of the user's own header."""
+    cc = os.environ.get("CC", "cc")
+    sizes, offsets, skipped = {}, [], []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for struct, fields in PROBE:
+            out, err = probe_struct(cc, tmp, header, struct, fields)
+            if out is None:
+                skipped.append((struct, err))
+                continue
+            for line in out.splitlines():
+                parts = line.split()
+                if parts[0] == "SIZE":
+                    sizes[parts[1]] = int(parts[2])
+                elif parts[0] == "OFF":
+                    offsets.append((parts[1], parts[2], int(parts[3])))
+
+    for struct, err in skipped:
+        print(f"skipped {struct}: {err}", file=sys.stderr)
+
+    # Nothing measured means the header is wrong or unreadable. Emitting an
+    # empty expect header would turn the asserts into no-ops while the banner
+    # claimed the ABI was verified — the one outcome worse than not running.
+    if not sizes:
+        die(f"probed {len(PROBE)} structs against {os.path.basename(header)} "
+            f"and measured none — wrong header?")
+
+    body = [
+        "/* GENERATED by tools/metavision-vrapi-abi. Do not edit.",
+        f" * Ground truth read from {os.path.basename(header)}.",
+        " * Present means kl_vrapi.h's declarations are checked at compile time. */",
+        "#ifndef KL_VRAPI_ABI_EXPECT_H",
+        "#define KL_VRAPI_ABI_EXPECT_H",
+        "",
+    ]
+    for struct, size in sorted(sizes.items()):
+        body.append(f"#define KL_ABI_SIZEOF_{struct} {size}")
+    body.append("")
+    for struct, field, off in offsets:
+        body.append(f"#define KL_ABI_OFFSET_{struct}_{field} {off}")
+    body += ["", "#endif"]
+    text = "\n".join(body) + "\n"
+
+    if out_path:
+        with open(out_path, "w") as f:
+            f.write(text)
+        print(f"wrote {out_path}: {len(sizes)} structs, {len(offsets)} fields"
+              + (f", {len(skipped)} skipped" if skipped else ""))
+    else:
+        print(text)
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lib", help="a real libvrapi.so (from an APK you own)")
+    ap.add_argument("--header", help="a real VrApi_Types.h (from the Mobile SDK)")
+    ap.add_argument("--dwarf", metavar="LIB",
+                    help="read layouts from an unstripped libvrapi.so's DWARF — "
+                         "better than a header, since it is the exact build the "
+                         "guest was compiled against")
+    ap.add_argument("--root", default=".", help="tree to scan for our definitions")
+    ap.add_argument("-o", "--out", help="write the generated expect header here")
+    args = ap.parse_args()
+
+    if not args.lib and not args.header and not args.dwarf:
+        ap.error("give --lib, --header, --dwarf, or a combination")
+
+    status = 0
+    if args.lib:
+        status |= check_lib(args.lib, args.root)
+    if args.header:
+        if args.lib:
+            print()
+        status |= check_header(args.header, args.out)
+    if args.dwarf:
+        if args.lib or args.header:
+            print()
+        status |= check_dwarf(args.dwarf, args.out)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

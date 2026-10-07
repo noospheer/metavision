@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# metavision-overlay — apply metavision's build-time changes to a Klepton tree.
+#
+# Run on a THROWAWAY checkout (the CI runner's, or a copy): it edits files in
+# vendor/klepton so that its own build picks up what metavision adds. The
+# submodule in the repo is never committed with these changes.
+#
+#   1. targets.py   <- build/klepton-targets.py (upstream table + generated rows)
+#   2. Makefile     RUNTIME_SHIP gains shims/mv_shims.c, so the shim layer is
+#                   compiled into libklepton.a with the runtime's own flags
+#   3. gen_xcodeproj.py  the app links with -u _mv_shims_install: the shims are
+#                   reached only through a constructor, and a static archive's
+#                   member that nothing references is otherwise not linked
+#   4. guests       staged guest trees symlinked in (metavision-targets link)
+#
+# Idempotent; each step checks its anchor and fails loudly if upstream moved it.
+#
+# usage: tools/metavision-overlay [KLEPTON_DIR]     (default: vendor/klepton)
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+K=$(cd "${1:-$ROOT/vendor/klepton}" && pwd)
+SHIMS_REL=$(python3 -c "import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))" "$ROOT/shims" "$K")
+
+die() { echo "overlay: $*" >&2; exit 1; }
+
+# 1 — target table
+[ -f "$ROOT/build/klepton-targets.py" ] || die "build/klepton-targets.py missing: run tools/metavision-targets emit"
+cp "$ROOT/build/klepton-targets.py" "$K/visionos/targets.py"
+echo "overlay: targets.py <- generated table ($(python3 "$K/visionos/targets.py" --list | grep -c '^mv_') mv_ targets)"
+
+# 2 — shims into the shipping runtime
+if ! grep -q 'mv_shims.c' "$K/Makefile"; then
+    grep -q '^RUNTIME_SHIP := ' "$K/Makefile" || die "RUNTIME_SHIP not found in Makefile"
+    # After the (possibly multi-line) RUNTIME_SHIP definition: the first line
+    # that does not end in a backslash closes it.
+    awk -v add="RUNTIME_SHIP += $SHIMS_REL/mv_shims.c" '
+        { print }
+        /^RUNTIME_SHIP := / { inside = 1 }
+        inside && !/\\$/ { print add; inside = 0 }
+    ' "$K/Makefile" > "$K/Makefile.mv" && mv "$K/Makefile.mv" "$K/Makefile"
+    grep -q '^RUNTIME_INC' "$K/Makefile" || die "RUNTIME_INC not found in Makefile"
+    sed -i.bak "s|^RUNTIME_INC \(:\?=\) |RUNTIME_INC \1 -I$SHIMS_REL |" "$K/Makefile" && rm -f "$K/Makefile.bak"
+fi
+echo "overlay: Makefile RUNTIME_SHIP += $SHIMS_REL/mv_shims.c"
+
+# 3 — keep the constructor-only shim object in the link
+G="$K/visionos/gen_xcodeproj.py"
+if ! grep -q '_mv_shims_install' "$G"; then
+    grep -q 'OTHER_LDFLAGS = "-lz ' "$G" || die "OTHER_LDFLAGS anchor not found in gen_xcodeproj.py"
+    sed -i.bak 's|OTHER_LDFLAGS = "-lz |OTHER_LDFLAGS = "-Wl,-u,_mv_shims_install -lz |' "$G" && rm -f "$G.bak"
+fi
+echo "overlay: app links with -u _mv_shims_install"
+
+# 4 — guests
+if [ -f "$ROOT/build/guests/targets.json" ]; then
+    python3 - "$ROOT/build/guests" "$K" <<'EOF'
+import json, os, sys
+guests, k = sys.argv[1], sys.argv[2]
+n = 0
+for slug in json.load(open(os.path.join(guests, "targets.json"))):
+    for name in (slug, slug + ".apk"):
+        src, dst = os.path.join(guests, name), os.path.join(k, name)
+        if os.path.exists(src) and not os.path.lexists(dst):
+            os.symlink(src, dst); n += 1
+print(f"overlay: linked {n} staged guest paths")
+EOF
+fi

@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# metavision-pull <package> — pull every APK split plus OBB/data from a Quest.
+# Store titles are split APKs; base.apk alone will not run.
+set -euo pipefail
+
+PKG="${1:?usage: metavision-pull <package>   (list with: adb shell pm list packages -3)}"
+OUT="pull/$PKG"
+
+adb get-state >/dev/null 2>&1 || { echo "no device — is the Quest in Developer Mode and authorized?" >&2; exit 1; }
+
+mkdir -p "$OUT"
+echo "==> splits"
+adb shell pm path "$PKG" | tr -d '\r' | sed 's/^package://' | while read -r p; do
+  [ -n "$p" ] || continue
+  echo "    $(basename "$p")"
+  adb pull "$p" "$OUT/" >/dev/null
+done
+
+echo "==> obb"
+adb pull "/sdcard/Android/obb/$PKG"  "$OUT/obb"  >/dev/null 2>&1 || echo "    (none)"
+echo "==> data"
+adb pull "/sdcard/Android/data/$PKG" "$OUT/data" >/dev/null 2>&1 || echo "    (none)"
+
+echo "==> $(du -sh "$OUT" | cut -f1) in $OUT"

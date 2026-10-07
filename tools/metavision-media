@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Capture and verify shared storage outside the per-app paths.
+
+metavision-archive pulls /sdcard/Android/{obb,data}, which is where titles keep
+their own content. It is not where the rest of a collection lives: 360 films in
+Movies, headset recordings in Oculus/VideoShots, and — the ones that exist
+nowhere else at all — whatever a creative tool wrote to its own top-level
+directory: sketches, paintings, recordings. That can be many gigabytes the
+per-app pull leaves behind, including the user's own work.
+
+Every top-level directory is captured except the per-app tree and the stock
+Android ringtone folders.
+
+    metavision-media --serial <id> --pull
+    metavision-media --verify          # no device needed
+
+Exit 1 on any mismatch.
+"""
+import argparse, hashlib, json, os, subprocess, sys
+
+ROOT = os.environ.get("MV_MEDIA_ROOT", "media")
+
+# Not captured: Android is the per-app tree metavision-archive already owns, and
+# the rest are stock folders that hold system sounds rather than anyone's work.
+EXCLUDE = {"Android", "Alarms", "Notifications", "Ringtones", "Podcasts", "Audiobooks"}
+
+
+def discover(serial):
+    """Top-level directories of shared storage, minus EXCLUDE."""
+    out = adb(serial, "shell", "ls -1p /sdcard/", check=False)
+    return sorted(n.rstrip("/") for n in out.splitlines()
+                  if n.endswith("/") and not n.startswith(".") and n.rstrip("/") not in EXCLUDE)
+
+
+def adb(serial, *args, check=True):
+    cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
+    r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if check and r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "adb failed")
+    return r.stdout
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def record(out_path):
+    """Hash everything pulled, so later corruption is distinguishable from a
+    bad transfer once the device is gone."""
+    files, total = {}, 0
+    for dirpath, _, names in os.walk(ROOT):
+        for name in names:
+            if name == "MEDIA.json":
+                continue
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, ROOT)
+            size = os.path.getsize(full)
+            files[rel] = {"bytes": size, "sha256": sha256(full)}
+            total += size
+    with open(out_path, "w") as f:
+        json.dump({"files": files, "total_bytes": total}, f, indent=2)
+    return files, total
+
+
+def pull(serial):
+    os.makedirs(ROOT, exist_ok=True)
+    dirs = discover(serial)
+    print("capturing: " + ", ".join(dirs))
+    for d in dirs:
+        present = adb(serial, "shell", f"[ -d '/sdcard/{d}' ] && echo yes || echo no",
+                      check=False).strip()
+        if present != "yes":
+            continue
+        print(f"== {d}")
+        adb(serial, "pull", f"/sdcard/{d}", os.path.join(ROOT, d), check=False)
+
+    # Compare regular-file bytes, not du: du counts directory inodes, which
+    # differ harmlessly between filesystems and make an exact match look wrong.
+    problems = []
+    for d in dirs:
+        local = os.path.join(ROOT, d)
+        if not os.path.isdir(local):
+            continue
+        dev = adb(serial, "shell",
+                  f"find '/sdcard/{d}' -type f -printf '%s\\n' 2>/dev/null "
+                  f"| awk '{{s+=$1}} END {{print s+0}}'", check=False).strip()
+        loc = sum(os.path.getsize(os.path.join(dp, n))
+                  for dp, _, ns in os.walk(local) for n in ns)
+        if dev and int(dev) != loc:
+            problems.append(f"{d}: device {dev} bytes, local {loc}")
+        print(f"  {d}: {loc} bytes {'OK' if not problems or problems[-1].split(':')[0] != d else 'MISMATCH'}")
+
+    files, total = record(os.path.join(ROOT, "MEDIA.json"))
+    print(f"\n{len(files)} files, {total / 1e9:.2f} GB")
+    for p in problems:
+        print(f"error: {p}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def verify():
+    manifest = os.path.join(ROOT, "MEDIA.json")
+    if not os.path.exists(manifest):
+        sys.exit(f"no {manifest} — run --pull first")
+    with open(manifest) as f:
+        recorded = json.load(f)["files"]
+
+    problems = []
+    for rel, meta in recorded.items():
+        full = os.path.join(ROOT, rel)
+        if not os.path.exists(full):
+            problems.append(f"{rel}: missing")
+        elif os.path.getsize(full) != meta["bytes"]:
+            problems.append(f"{rel}: wrong size")
+        elif sha256(full) != meta["sha256"]:
+            problems.append(f"{rel}: digest mismatch — corrupted since pull")
+    print(f"{len(recorded)} file(s), {len(problems)} problem(s)")
+    for p in problems:
+        print(f"error: {p}", file=sys.stderr)
+    return 1 if problems else 0
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--serial")
+    ap.add_argument("--pull", action="store_true")
+    ap.add_argument("--verify", action="store_true")
+    args = ap.parse_args()
+    if args.verify:
+        return verify()
+    if args.pull:
+        return pull(args.serial or os.environ.get("ANDROID_SERIAL"))
+    ap.error("give --pull or --verify")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

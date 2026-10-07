@@ -1,0 +1,208 @@
+#!/usr/bin/env python3
+"""Generate Klepton targets for every archived title — no hand-written rows.
+
+Klepton describes a guest with one row in vendor/klepton/visionos/targets.py.
+For the two engines it boots generically, that row is fully determined by the
+APK, so writing it by hand per title is pure transcription:
+
+    unity  libil2cpp.so present -> entry libmain, OBB at <files>/obb
+    ue4    libUE4.so present    -> entry libUE4,  OBB at Android/obb/<package>
+
+Anything else (Mono/JIT, native engines, closure blockers) is reported, not
+guessed at.
+
+    metavision-targets list                 what each title would become
+    metavision-targets stage [PKG ...]      apktool-decode into build/guests/
+    metavision-targets emit                 write build/guests/targets.json and
+                                            build/klepton-targets.py (upstream
+                                            table + generated rows)
+    metavision-targets link                 symlink staged guests into
+                                            vendor/klepton/ (build-time only)
+
+The submodule is never edited: emit writes a merged COPY of targets.py, and
+the build points Klepton at it.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+PULL = ROOT / "pull"
+GUESTS = ROOT / "build" / "guests"
+KLEPTON = ROOT / "vendor" / "klepton"
+UPSTREAM_TARGETS = KLEPTON / "visionos" / "targets.py"
+APKTOOL = ROOT / "build" / "tools" / "apktool.jar"
+APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.3/apktool_3.0.3.jar"
+CLOSURE_LOG = ROOT / "closure.log"
+
+
+def slug_for(pkg, depth=1):
+    """Short, stable target name from the package id: its last component, or
+    the last `depth` components when that would collide."""
+    parts = [p for p in pkg.split(".") if p.lower() not in ("com", "org", "net", "xyz", "apk")]
+    s = re.sub(r"[^a-z0-9]", "", "".join(parts[-depth:]).lower()) or "title"
+    return "mv_" + s[:40]
+
+
+def closure_blocked():
+    if not CLOSURE_LOG.exists():
+        return set()
+    return {m.group(1) for m in re.finditer(r"^\s*FAIL\s+(\S+)", CLOSURE_LOG.read_text(), re.M)}
+
+
+def classify(pkg):
+    """-> (kind, entry, reason). kind None means 'not generated', with why."""
+    apk = PULL / pkg / "base.apk"
+    if not apk.exists():
+        return None, None, "no base.apk"
+    names = set(zipfile.ZipFile(apk).namelist())
+    libs = {n.split("/")[-1] for n in names if n.startswith("lib/arm64-v8a/")}
+    if not libs:
+        return None, None, "no arm64-v8a libraries (32-bit only?)"
+    if "libUE4.so" in libs:
+        return "ue4", "libUE4", None
+    if "libil2cpp.so" in libs and "libmain.so" in libs:
+        return "unity", "libmain", None
+    if "libmonobdwgc-2.0.so" in libs:
+        return None, None, "Unity Mono backend needs a JIT"
+    if "libunity.so" in libs:
+        return None, None, "Unity without IL2CPP (Mono): needs a JIT"
+    return None, None, "engine not recognised: " + ", ".join(sorted(libs)[:4])
+
+
+def display_name(pkg, tree):
+    """App label from the decoded tree when staged, else the package's tail."""
+    strings = tree / "res" / "values" / "strings.xml"
+    manifest = tree / "AndroidManifest.xml"
+    if manifest.exists():
+        m = re.search(r'<application[^>]*android:label="([^"]+)"', manifest.read_text(errors="replace"))
+        if m:
+            label = m.group(1)
+            if label.startswith("@string/") and strings.exists():
+                key = label.split("/", 1)[1]
+                s = re.search(r'<string name="%s">([^<]+)</string>' % re.escape(key),
+                              strings.read_text(errors="replace"))
+                if s:
+                    return s.group(1).strip()
+            elif not label.startswith("@"):
+                return label
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", pkg.split(".")[-1])
+
+
+def rows():
+    blocked = closure_blocked()
+    seen = {}
+    out = []
+    for d in sorted(p for p in PULL.iterdir() if p.is_dir()):
+        pkg = d.name
+        kind, entry, reason = classify(pkg)
+        if kind and pkg in blocked:
+            kind, reason = None, "closure check failed (see closure.log)"
+        slug = slug_for(pkg)
+        if slug in seen:
+            slug = slug_for(pkg, 2)
+        if slug in seen:
+            slug = f"{slug}_{len(seen)}"
+        seen[slug] = pkg
+        out.append(dict(pkg=pkg, slug=slug, kind=kind, entry=entry, reason=reason))
+    return out
+
+
+def target_row(r):
+    s, pkg = r["slug"], r["pkg"]
+    return {
+        "libs": None,                       # discovered from the APK, as upstream does
+        "srcdir": f"{s}/lib/arm64-v8a",
+        "tree": s,
+        "apk": f"{s}.apk",
+        "assets": f"{s}/assets",
+        "qtplugins": "",
+        "obb": "obb" if r["kind"] == "unity" else f"Android/obb/{pkg}",
+        "entry": r["entry"],
+        "kind": r["kind"],
+        "product": "MV" + re.sub(r"[^A-Za-z0-9]", "", s[3:].title()),
+        "display": display_name(pkg, GUESTS / s),
+    }
+
+
+def ensure_apktool():
+    if not APKTOOL.exists():
+        APKTOOL.parent.mkdir(parents=True, exist_ok=True)
+        print(f"fetching apktool -> {APKTOOL}", file=sys.stderr)
+        urllib.request.urlretrieve(APKTOOL_URL, APKTOOL)
+    return APKTOOL
+
+
+def cmd_list(_):
+    rs = rows()
+    for r in rs:
+        state = r["kind"] or "skip"
+        print(f"{state:6} {r['slug']:34} {r['pkg']}" + (f"   ({r['reason']})" if r["reason"] else ""))
+    gen = [r for r in rs if r["kind"]]
+    print(f"\n{len(gen)} generated ({sum(r['kind']=='unity' for r in gen)} unity, "
+          f"{sum(r['kind']=='ue4' for r in gen)} ue4), {len(rs)-len(gen)} skipped", file=sys.stderr)
+
+
+def cmd_stage(pkgs):
+    jar = ensure_apktool()
+    GUESTS.mkdir(parents=True, exist_ok=True)
+    for r in rows():
+        if not r["kind"] or (pkgs and r["pkg"] not in pkgs):
+            continue
+        src = PULL / r["pkg"] / "base.apk"
+        tree = GUESTS / r["slug"]
+        apk = GUESTS / f"{r['slug']}.apk"
+        if (tree / "apktool.yml").exists() and apk.exists() and apk.stat().st_mtime >= src.stat().st_mtime:
+            print(f"up to date  {r['slug']}")
+            continue
+        print(f"stage       {r['slug']}  <- {r['pkg']}", flush=True)
+        apk.unlink(missing_ok=True)         # Unity opens its own APK as a zip
+        try:
+            os.link(src, apk)               # same bytes, no second copy
+        except OSError:
+            shutil.copy2(src, apk)
+        subprocess.run(["java", "-jar", str(jar), "d", "-f", "-q", "-o", str(tree), str(apk)], check=True)
+
+
+def cmd_emit(_):
+    gen = {r["slug"]: target_row(r) for r in rows() if r["kind"]}
+    GUESTS.mkdir(parents=True, exist_ok=True)
+    (GUESTS / "targets.json").write_text(json.dumps(gen, indent=2) + "\n")
+
+    # Merged copy of the upstream table: generated rows are added AFTER the
+    # upstream dict closes, so an upstream row always wins a name clash (and
+    # every generated name is mv_-prefixed so none should occur).
+    src = UPSTREAM_TARGETS.read_text()
+    m = re.search(r"^TARGETS = \{.*?^\}\n", src, re.S | re.M)
+    if not m:
+        sys.exit("could not find the TARGETS table in upstream targets.py")
+    block = ("\n# --- generated by metavision-targets; do not edit ---\n"
+             f"for _k, _v in {json.dumps(gen, indent=4).replace('null', 'None')}.items():\n"
+             "    TARGETS.setdefault(_k, _v)\n")
+    merged = src[:m.end()] + block + src[m.end():]
+    out = ROOT / "build" / "klepton-targets.py"
+    out.write_text(merged)
+    print(f"{len(gen)} targets -> {GUESTS/'targets.json'}\nmerged table -> {out}")
+
+
+def cmd_link(_):
+    for slug in json.loads((GUESTS / "targets.json").read_text()):
+        for name in (slug, f"{slug}.apk"):
+            dst, src = KLEPTON / name, GUESTS / name
+            if src.exists() and not dst.exists():
+                dst.symlink_to(src)
+    print("linked staged guests into vendor/klepton/ (untracked symlinks)")
+
+
+COMMANDS = {"list": cmd_list, "stage": cmd_stage, "emit": cmd_emit, "link": cmd_link}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        sys.exit(__doc__)
+    COMMANDS[sys.argv[1]](sys.argv[2:])

@@ -1,0 +1,29 @@
+# raw extraction — large, and not ours to redistribute
+pull/
+build/
+*.apk
+*.obb
+*.ipa
+*.xcarchive
+
+# signing material — never commit
+*.p12
+*.mobileprovision
+*.cer
+certs/
+
+.DS_Store
+archive.log
+closure.log
+media/
+media.log
+
+# your own library inventory and outputs — personal, never published
+TITLES.md
+triage/*.tsv
+triage/*.json
+!triage/manifest.sample.json
+exports/
+*.key
+*.enc
+*.p8

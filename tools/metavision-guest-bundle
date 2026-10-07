@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# metavision-guest-bundle — pack what a CI build needs of the guests, encrypted.
+#
+# The macOS runner never sees an APK. It needs, per target, only the guest's
+# arm64 libraries (klepton-ld translates them there, mkguest.sh wraps them as
+# frameworks) plus the generated target table. Assets, OBBs and decoded
+# metadata go to the headset's app container at install time, not into the
+# build. Guest code is not ours to publish, so the bundle is AES-256 encrypted
+# with a passphrase that lives only here and in the repo's secrets.
+#
+#   tools/metavision-guest-bundle [-o FILE] TARGET...     (mv_ names; 'all' = every target)
+#
+# Passphrase: $MV_GUEST_KEY, else build/guest-bundle.key (created on first use).
+# Inspect without the runner:  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+#                                -pass file:build/guest-bundle.key -in FILE | tar -tz
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+G="$ROOT/build/guests"
+OUT="$ROOT/build/guest-bundle.tar.gz.enc"
+[ "${1:-}" = "-o" ] && { OUT=$2; shift 2; }
+[ $# -gt 0 ] || { sed -n '2,16p' "$0"; exit 2; }
+[ -f "$G/targets.json" ] || { echo "run tools/metavision-targets stage && emit first" >&2; exit 1; }
+
+if [ "$1" = all ]; then set -- $(python3 -c "import json;print(' '.join(json.load(open('$G/targets.json'))))"); fi
+
+KEYFILE="$ROOT/build/guest-bundle.key"
+if [ -z "${MV_GUEST_KEY:-}" ]; then
+    [ -f "$KEYFILE" ] || { umask 077; openssl rand -base64 48 | tr -d '\n' > "$KEYFILE"; echo "new key -> $KEYFILE (add it as the MV_GUEST_KEY secret)" >&2; }
+    MV_GUEST_KEY=$(cat "$KEYFILE")
+fi
+
+STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
+mkdir -p "$STAGE/guests"
+cp "$ROOT/build/klepton-targets.py" "$G/targets.json" "$STAGE/guests/"
+for t in "$@"; do
+    python3 -c "import json,sys; sys.exit(0 if '$t' in json.load(open('$G/targets.json')) else 1)" ||
+        { echo "unknown target: $t" >&2; exit 1; }
+    [ -d "$G/$t/lib/arm64-v8a" ] || { echo "$t not staged (tools/metavision-targets stage)" >&2; exit 1; }
+    mkdir -p "$STAGE/guests/$t/lib"
+    cp -a "$G/$t/lib/arm64-v8a" "$STAGE/guests/$t/lib/"
+    echo "  + $t  ($(du -sh "$G/$t/lib/arm64-v8a" | cut -f1))" >&2
+done
+printf '%s\n' "$@" > "$STAGE/guests/BUNDLED"
+
+tar -C "$STAGE" -czf - guests |
+    openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$MV_GUEST_KEY" -out "$OUT"
+echo "$OUT ($(du -h "$OUT" | cut -f1), $# target(s))"

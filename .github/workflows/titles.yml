@@ -1,0 +1,160 @@
+name: titles
+
+# Build signed visionOS apps for generated Klepton targets — one app per title.
+#
+# Inputs come from three places, and none of them is the repo:
+#   * guest code   — MV_GUEST_BUNDLE_URL: tools/metavision-guest-bundle output,
+#                    AES-256 encrypted with MV_GUEST_KEY. Hosted privately.
+#   * signing      — a development certificate (.p12) and an App Store Connect
+#                    API key, so automatic signing can create each title's
+#                    explicit App ID + profile (the memory entitlements need
+#                    explicit App IDs; API keys need a PAID membership)
+#   * ANGLE        — built here from Klepton's pinned commit, then cached
+#
+# Output: one .ipa per target, encrypted with MV_GUEST_KEY before upload,
+# because a built app embeds the translated guest code.
+#
+# Secrets:
+#   MV_GUEST_BUNDLE_URL  MV_GUEST_KEY
+#   SIGNING_P12  SIGNING_P12_PASSWORD  KEYCHAIN_PASSWORD
+#   ASC_KEY_P8  ASC_KEY_ID  ASC_ISSUER_ID  APPLE_TEAM_ID
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Space-separated mv_ targets (tools/metavision-targets list)"
+        required: true
+        default: "mv_<title>"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - run: pip install pyelftools && make test
+
+  ipa:
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 240
+    env:
+      K: vendor/klepton
+      XROS_PLATFORMS: xros            # device slice only: what an install needs
+      KLEPTON_LOW_LATENCY: "0"        # unverified entitlement; see Klepton.entitlements
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Free disk for the ANGLE build
+        run: |
+          df -h /
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/iOS* \
+                      /Users/runner/Library/Android /usr/local/share/dotnet || true
+          df -h /
+
+      - name: ANGLE cache
+        id: angle
+        uses: actions/cache@v4
+        with:
+          path: |
+            vendor/klepton/vendor/out/xros
+            vendor/klepton/vendor/out/xrsim
+          key: angle-${{ hashFiles('vendor/klepton/angle-patches/**') }}-${{ hashFiles('vendor/klepton/Makefile') }}
+
+      - name: Build ANGLE (first run only, ~1 h)
+        if: steps.angle.outputs.cache-hit != 'true'
+        run: make -C "$K" angle-xros angle-xrsim
+
+      - name: Fetch and decrypt guest bundle
+        env:
+          URL: ${{ secrets.MV_GUEST_BUNDLE_URL }}
+          KEY: ${{ secrets.MV_GUEST_KEY }}
+        run: |
+          mkdir -p build
+          curl -fsSL "$URL" -o /tmp/guests.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "pass:$KEY" -in /tmp/guests.enc |
+            tar -xz -C build
+          mv build/guests/klepton-targets.py build/klepton-targets.py
+          rm /tmp/guests.enc
+          echo "bundled: $(tr '\n' ' ' < build/guests/BUNDLED)"
+
+      - name: Overlay metavision onto Klepton
+        run: tools/metavision-overlay
+
+      - name: Signing material
+        env:
+          P12: ${{ secrets.SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          echo "$P12" | base64 --decode > /tmp/cert.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          security import /tmp/cert.p12 -k build.keychain -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm /tmp/cert.p12
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "$ASC_KEY_P8" > ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+
+      - name: Runtime and translator
+        run: |
+          make -C "$K" build/klepton-ld
+          make -C "$K" xros
+
+      - name: Build each target
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
+          KLEPTON_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          KLEPTON_BUNDLE_SCOPE: metavision
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          MV_GUEST_KEY: ${{ secrets.MV_GUEST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for t in $TARGETS; do
+            echo "::group::$t"
+            ( cd "$K/visionos"
+              KLEPTON_TARGET=$t ./mkguest.sh | tail -3
+              ./mkangle.sh | tail -1
+              KLEPTON_TARGET=$t python3 gen_xcodeproj.py | head -8
+              eval "$(python3 targets.py "$t")"
+              xcodebuild -project "$KLT_PRODUCT.xcodeproj" -scheme "$KLT_PRODUCT" \
+                -configuration Debug -destination 'generic/platform=visionOS' \
+                -archivePath "build/$t.xcarchive" archive \
+                -allowProvisioningUpdates \
+                -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+                -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+              cat > build/export.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>debugging</string>
+            <key>teamID</key><string>$KLEPTON_TEAM</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          EOF
+              xcodebuild -exportArchive -archivePath "build/$t.xcarchive" \
+                -exportOptionsPlist build/export.plist -exportPath "build/export-$t" \
+                -allowProvisioningUpdates \
+                -authenticationKeyPath ~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 \
+                -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+            )
+            ipa=$(ls "$K"/visionos/build/export-$t/*.ipa)
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$MV_GUEST_KEY" \
+              -in "$ipa" -out "out/$t.ipa.enc"
+            echo "::endgroup::"
+          done
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: titles-ipa-encrypted
+          path: out/*.ipa.enc
+          retention-days: 7

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Capture everything from a Quest you will not have later, and prove it.
+
+Extraction is the only step that needs the headset. Everything after it — relink,
+build, install — works from files. So the archive has to be complete *before* the
+Quest goes away, and an incomplete pull discovered afterwards is unrecoverable.
+
+Hence verification runs while the device is still attached. Each title is checked
+for the things that make it usable at all: every APK split present and readable as
+a zip, an arm64 slice inside, OBB that is not silently empty, and a recorded digest
+so later corruption is distinguishable from a bad pull.
+
+    metavision-archive --list                 # what is installed, and how big
+    metavision-archive --all                  # pull and verify everything
+    metavision-archive com.example.vrtitle
+    metavision-archive --verify               # re-check, no device needed
+
+Exit 1 if any title is incomplete.
+"""
+import argparse, hashlib, json, os, subprocess, sys, zipfile
+
+ROOT = os.environ.get("MV_PULL_ROOT", "pull")
+
+# System, first-party and service apps. Archiving these wastes the one resource
+# that is actually scarce — time with the headset — and none of them would run
+# anyway: they are Meta shell components, or clients whose whole function is
+# talking to a backend we do not authenticate against.
+SKIP_PREFIXES = (
+    "com.oculus.", "com.meta.", "com.facebook.",
+    "com.google.android.", "com.android.", "com.netflix.",
+    "com.whatsapp", "com.valvesoftware.steamlink",
+)
+SKIP_EXACT = {"com.unity.template", "com.DefaultCompany.MixedRealityTemplate",
+              "com.UnityTechnologies.com.unity.template.urpblank"}
+
+# Vendor prefix is a proxy for "service app", and it misfires on creative tools
+# that happen to be published under a platform vendor's namespace. Those are
+# exactly what an archive exists to protect, so they can be kept explicitly:
+# --keep PKG (repeatable) or MV_KEEP="pkg1 pkg2".
+KEEP_EXACT = set(os.environ.get("MV_KEEP", "").split())
+
+
+def is_system(pkg):
+    if pkg in KEEP_EXACT:
+        return False
+    return pkg.startswith(SKIP_PREFIXES) or pkg in SKIP_EXACT
+
+
+SERIAL = None
+
+
+def adb(*args, binary=False, check=True):
+    prefix = ["adb"] + (["-s", SERIAL] if SERIAL else [])
+    r = subprocess.run([*prefix, *args], capture_output=True, check=False)
+    if check and r.returncode != 0:
+        raise RuntimeError(r.stderr.decode(errors="ignore").strip() or "adb failed")
+    return r.stdout if binary else r.stdout.decode(errors="ignore")
+
+
+def attached():
+    """Every authorized device, as (serial, model)."""
+    out = subprocess.run(["adb", "devices", "-l"], capture_output=True,
+                         text=True, check=False).stdout
+    found = []
+    for line in out.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            model = next((p.split(":", 1)[1] for p in parts if p.startswith("model:")), "?")
+            found.append((parts[0], model))
+    return found
+
+
+def require_device():
+    """Pick a device, and refuse to guess.
+
+    Archiving the wrong device is silent: a phone has packages, they pull, and
+    nothing complains until you notice the library is full of the wrong thing.
+    With more than one attached, an explicit serial is required.
+    """
+    global SERIAL
+    devices = attached()
+    if not devices:
+        sys.exit("no authorized device. Developer Mode on, data cable, and the "
+                 "'Allow USB debugging' prompt accepted inside the headset?")
+
+    if SERIAL:
+        if SERIAL not in [s for s, _ in devices]:
+            sys.exit(f"{SERIAL} is not attached. Present: "
+                     + ", ".join(f"{s} ({m})" for s, m in devices))
+        return
+
+    if len(devices) > 1:
+        listing = "\n".join(f"  --serial {s}    {m}" for s, m in devices)
+        sys.exit(f"{len(devices)} devices attached — name one:\n{listing}")
+
+    serial, model = devices[0]
+    if "quest" not in model.lower():
+        sys.exit(f"the only attached device is {model} ({serial}), which is not "
+                 f"a Quest. Pass --serial explicitly if that is really the target.")
+    SERIAL = serial
+
+
+def packages():
+    out = adb("shell", "pm", "list", "packages", "-3")
+    return sorted(l.strip().replace("package:", "") for l in out.splitlines() if l.strip())
+
+
+def remote_size(path):
+    """Bytes at a remote path, 0 if absent. du is the only thing on the device
+    that answers for a directory."""
+    out = adb("shell", f"du -sb '{path}' 2>/dev/null || echo 0", check=False)
+    try:
+        return int(out.split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pull_title(pkg):
+    dest = os.path.join(ROOT, pkg)
+    os.makedirs(dest, exist_ok=True)
+
+    splits = [l.replace("package:", "").strip()
+              for l in adb("shell", "pm", "path", pkg).splitlines() if l.strip()]
+    if not splits:
+        print(f"  ! {pkg}: no APK path — not installed?")
+        return None
+
+    print(f"  {len(splits)} split(s)")
+    for remote in splits:
+        print(f"    {os.path.basename(remote)}")
+        adb("pull", remote, dest + "/")
+
+    for kind, remote in (("obb", f"/sdcard/Android/obb/{pkg}"),
+                         ("data", f"/sdcard/Android/data/{pkg}")):
+        size = remote_size(remote)
+        if size > 0:
+            print(f"    {kind}: {size / 1e9:.2f} GB")
+            adb("pull", remote, os.path.join(dest, kind), check=False)
+        else:
+            print(f"    {kind}: none")
+
+    # Record what the device said, so a later verify can tell a truncated pull
+    # from a title that genuinely had no OBB.
+    record = {
+        "pkg": pkg,
+        "splits": [os.path.basename(s) for s in splits],
+        "remote_obb_bytes": remote_size(f"/sdcard/Android/obb/{pkg}"),
+        "files": {},
+    }
+    for dirpath, _, names in os.walk(dest):
+        for name in names:
+            if name == "ARCHIVE.json":
+                continue
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, dest)
+            record["files"][rel] = {"bytes": os.path.getsize(full),
+                                    "sha256": sha256(full)}
+    with open(os.path.join(dest, "ARCHIVE.json"), "w") as f:
+        json.dump(record, f, indent=2)
+    return record
+
+
+def verify_title(pkg):
+    """Everything checkable without the device."""
+    dest = os.path.join(ROOT, pkg)
+    manifest = os.path.join(dest, "ARCHIVE.json")
+    problems = []
+
+    if not os.path.exists(manifest):
+        return [f"{pkg}: no ARCHIVE.json — pulled outside this tool?"]
+    with open(manifest) as f:
+        record = json.load(f)
+
+    for name in record["splits"]:
+        if not os.path.exists(os.path.join(dest, name)):
+            problems.append(f"{pkg}: split {name} missing")
+
+    for rel, meta in record["files"].items():
+        full = os.path.join(dest, rel)
+        if not os.path.exists(full):
+            problems.append(f"{pkg}: {rel} missing")
+        elif os.path.getsize(full) != meta["bytes"]:
+            problems.append(f"{pkg}: {rel} wrong size")
+        elif sha256(full) != meta["sha256"]:
+            problems.append(f"{pkg}: {rel} digest mismatch — corrupted since pull")
+
+    base = os.path.join(dest, "base.apk")
+    if os.path.exists(base):
+        try:
+            with zipfile.ZipFile(base) as z:
+                names = z.namelist()
+            # No arm64 slice means the title cannot run at all, and it is far
+            # better to learn that while the Quest is still on the desk.
+            if not any(n.startswith("lib/arm64-v8a/") for n in names):
+                if any(n.startswith("lib/armeabi-v7a/") for n in names):
+                    problems.append(f"{pkg}: 32-bit only — will not run (ARCH32)")
+                else:
+                    problems.append(f"{pkg}: no arm64 slice in base.apk")
+        except zipfile.BadZipFile:
+            problems.append(f"{pkg}: base.apk is not a readable zip — truncated pull")
+    else:
+        problems.append(f"{pkg}: no base.apk")
+
+    # A title whose device-side OBB was non-empty but which pulled nothing is the
+    # signature failure of an interrupted transfer.
+    #
+    # The threshold is not zero: du reports an empty directory as its inode
+    # size, 4096 bytes on ext4. Testing for >0 flagged every title that simply
+    # has no OBB — 42 of 53 here — which is how a verifier trains you to ignore
+    # it. Anything under a megabyte is an empty directory, not content.
+    if record.get("remote_obb_bytes", 0) > 1_000_000:
+        obb = os.path.join(dest, "obb")
+        pulled = sum(os.path.getsize(os.path.join(d, f))
+                     for d, _, fs in os.walk(obb) for f in fs) if os.path.isdir(obb) else 0
+        if pulled == 0:
+            problems.append(f"{pkg}: device had "
+                            f"{record['remote_obb_bytes'] / 1e9:.2f} GB of OBB, "
+                            f"none pulled")
+    return problems
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("packages", nargs="*")
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--verify", action="store_true", help="no device needed")
+    ap.add_argument("--serial", help="which device, when more than one is attached")
+    ap.add_argument("--include-system", action="store_true",
+                    help="do not skip Meta/system/service packages")
+    ap.add_argument("--keep", action="append", default=[], metavar="PKG",
+                    help="archive PKG even though its prefix looks like a system app")
+    args = ap.parse_args()
+    KEEP_EXACT.update(args.keep)
+
+    global SERIAL
+    SERIAL = args.serial or os.environ.get("ANDROID_SERIAL")
+
+    if args.verify:
+        targets = args.packages or sorted(
+            d for d in os.listdir(ROOT) if os.path.isdir(os.path.join(ROOT, d))
+        ) if os.path.isdir(ROOT) else []
+        if not targets:
+            sys.exit(f"nothing archived under {ROOT}/")
+        problems = []
+        for pkg in targets:
+            found = verify_title(pkg)
+            print(f"  {'FAIL' if found else 'ok  '}  {pkg}")
+            problems += found
+        for p in problems:
+            print(f"error: {p}", file=sys.stderr)
+        print(f"\n{len(targets)} title(s), {len(problems)} problem(s)")
+        return 1 if problems else 0
+
+    require_device()
+    installed = packages()
+
+    if args.list:
+        shown = [p for p in installed if args.include_system or not is_system(p)]
+        total = 0.0
+        print(f"{len(installed)} installed, {len(shown)} archivable\n")
+        for pkg in shown:
+            obb = remote_size(f"/sdcard/Android/obb/{pkg}")
+            total += obb
+            print(f"  {pkg:56} {obb / 1e9:6.2f} GB obb")
+        print(f"\n  {'OBB total':56} {total / 1e9:6.2f} GB")
+        if not args.include_system:
+            print(f"  {len(installed) - len(shown)} system/service package(s) "
+                  f"hidden (--include-system to show)")
+        return 0
+
+    if args.all:
+        targets = [p for p in installed if args.include_system or not is_system(p)]
+        skipped = len(installed) - len(targets)
+        if skipped:
+            print(f"{len(targets)} title(s) to archive, {skipped} system/service "
+                  f"package(s) skipped (--include-system to keep them)\n")
+    else:
+        targets = args.packages
+    if not targets:
+        ap.error("give package names, --all, or --list")
+
+    problems = []
+    for i, pkg in enumerate(targets, 1):
+        print(f"[{i}/{len(targets)}] {pkg}")
+        if pull_title(pkg) is None:
+            problems.append(f"{pkg}: pull failed")
+            continue
+        found = verify_title(pkg)
+        problems += found
+        print(f"  {'INCOMPLETE' if found else 'verified'}")
+
+    print()
+    for p in problems:
+        print(f"error: {p}", file=sys.stderr)
+    print(f"{len(targets)} title(s), {len(problems)} problem(s)")
+    if problems:
+        print("\nThe Quest is still attached. Fix these now — after it is gone, "
+              "they are unrecoverable.", file=sys.stderr)
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""Static shim gap sweep: what would each title call that Klepton cannot answer?
+
+Klepton's own work list is `build_run_host.sh <target> --gap`, which maps and
+relocates a guest on Apple silicon and prints every import the runtime missed.
+This is the same question asked without a Mac: read every guest library's
+dynamic imports out of the archived APKs, credit what the title's own
+libraries export to each other, and diff the rest against the names the
+runtime's resolver tiers can answer (libc/NDK/media/audio tables, EGL, the
+prefix-routed GL/Vulkan/OpenXR/OVRPlatform families, OVRPlugin, and
+metavision's VrApi shim).
+
+It is an approximation in one known direction: a name a table lists is counted
+as resolved even if the runtime only stubs it, and dlsym-only lookups (Unity's
+GL, FMOD's OpenSL) are invisible to an import scan. So "0 gaps" means "nothing
+missing at link time", not "runs"; a gap it reports is a real gap.
+
+    metavision-gaps                 per-title counts + the ranked work list
+    metavision-gaps --title PKG     one title's missing names, by library
+    metavision-gaps --json OUT      everything, machine-readable
+"""
+import argparse
+import io
+import json
+import re
+import sys
+import zipfile
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from elftools.elf.elffile import ELFFile
+
+ROOT = Path(__file__).resolve().parent.parent
+PULL = ROOT / "pull"
+RUNTIME = ROOT / "vendor" / "klepton" / "runtime"
+VRAPI = ROOT / "vrapi"
+SHIMS = ROOT / "shims" / "mv_shims.c"
+
+# Libraries Klepton REPLACES outright: the guest's copy is never loaded, so its
+# own imports are irrelevant, and calls into it land on the runtime's version.
+REPLACED = {"libOVRPlugin.so", "libovrplatformloader.so", "libopenxr_loader.so",
+            "libvrapi.so", "libvrintegrationloader.so"}
+# System libraries: imports from these are what the resolver tiers exist for.
+SYSTEM = {"libc.so", "libm.so", "libdl.so", "liblog.so", "libandroid.so", "libEGL.so",
+          "libGLESv1_CM.so", "libGLESv2.so", "libGLESv3.so", "libvulkan.so", "libOpenSLES.so",
+          "libaaudio.so", "libmediandk.so", "libcamera2ndk.so", "libjnigraphics.so",
+          "libz.so", "libstdc++.so", "libnativewindow.so", "libsync.so", "libbinder_ndk.so"}
+
+PREFIX_RULES = [
+    (re.compile(r"^gl[A-Z]"), "GLES via ANGLE"),
+    (re.compile(r"^vk[A-Z]"), "Vulkan via MoltenVK"),
+    (re.compile(r"^(SL_IID_|slCreateEngine$)"), "OpenSL ES"),
+    (re.compile(r"^(ovr_|ovrID)"), "OVRPlatform"),
+]
+
+ENTRY_RE = re.compile(r'\b[A-Z][A-Z0-9_]{0,15}\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+BRACE_RE = re.compile(r'\{\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*,')
+# Identifier-argument table macros that stringify (#n) into an entry:
+# KL_FWD(memcpy) in the generated libc table, X(xrCreateInstance) in OpenXR.
+IDENT_RE = re.compile(r'\b(?:KL_FWD|X)\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)')
+
+
+def shim_names():
+    """Names metavision's own shim layer answers (shims/mv_shims.c)."""
+    return set(re.findall(r'\bMV\(\s*"([A-Za-z_][A-Za-z0-9_]*)"', SHIMS.read_text())) if SHIMS.exists() else set()
+
+
+def upstream_names():
+    names = set()
+    for f in list(RUNTIME.rglob("*.c")) + list(RUNTIME.rglob("*.h")):
+        t = f.read_text(errors="replace")
+        names.update(ENTRY_RE.findall(t))
+        names.update(BRACE_RE.findall(t))
+        names.update(IDENT_RE.findall(t))
+    # metavision's VrApi shim: every vrapi_* function it defines.
+    for f in VRAPI.glob("*.c"):
+        names.update(re.findall(r"^[A-Za-z_][\w \*]*?\b(vrapi_\w+)\s*\(", f.read_text(), re.M))
+    return names
+
+
+def provided_names():
+    return upstream_names() | shim_names()
+
+
+def check_shims():
+    """A shim is consulted BEFORE every upstream tier, so one that names
+    something upstream already answers would silently replace it."""
+    up, mine = upstream_names(), shim_names()
+    shadow = sorted(n for n in mine if n in up or by_prefix(n))
+    if shadow:
+        sys.exit("shims shadow upstream names: " + ", ".join(shadow))
+    print(f"mv_shims: {len(mine)} names, none shadow upstream")
+
+
+def by_prefix(name):
+    for rx, why in PREFIX_RULES:
+        if rx.search(name):
+            return why
+    return None
+
+
+def read_libs(apk):
+    """{libname: (needed[], imports{}, exports{})} for every arm64 guest library."""
+    out = {}
+    with zipfile.ZipFile(apk) as z:
+        for n in z.namelist():
+            if not (n.startswith("lib/arm64-v8a/") and n.endswith(".so")):
+                continue
+            lib = n.rsplit("/", 1)[1]
+            try:
+                elf = ELFFile(io.BytesIO(z.read(n)))
+            except Exception:
+                continue
+            dyn = elf.get_section_by_name(".dynamic")
+            needed = [t.needed for t in dyn.iter_tags() if t.entry.d_tag == "DT_NEEDED"] if dyn else []
+            imports, exports = set(), set()
+            ds = elf.get_section_by_name(".dynsym")
+            if ds:
+                for s in ds.iter_symbols():
+                    if not s.name:
+                        continue
+                    bind = s["st_info"]["bind"]
+                    if s["st_shndx"] == "SHN_UNDEF":
+                        if bind != "STB_WEAK":          # weak misses are allowed to be NULL
+                            imports.add(s.name)
+                    elif bind in ("STB_GLOBAL", "STB_WEAK", "STB_GNU_UNIQUE"):
+                        exports.add(s.name)
+            out[lib] = (needed, imports, exports)
+    return out
+
+
+def sweep(pkgs, provided):
+    results = {}
+    for pkg in pkgs:
+        apk = PULL / pkg / "base.apk"
+        if not apk.exists():
+            continue
+        libs = read_libs(apk)
+        if not libs:
+            continue
+        guest_exports = set()
+        for lib, (_, _, ex) in libs.items():
+            if lib not in REPLACED:
+                guest_exports |= ex
+        missing = defaultdict(set)
+        for lib, (_, imps, _) in libs.items():
+            if lib in REPLACED:
+                continue
+            for name in imps:
+                if name in guest_exports or name in provided or by_prefix(name):
+                    continue
+                missing[lib].add(name)
+        results[pkg] = {lib: sorted(v) for lib, v in missing.items()}
+    return results
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--title")
+    ap.add_argument("--json")
+    ap.add_argument("--top", type=int, default=40)
+    ap.add_argument("--check-shims", action="store_true")
+    a = ap.parse_args()
+    if a.check_shims:
+        return check_shims()
+
+    provided = provided_names()
+    pkgs = [a.title] if a.title else sorted(p.name for p in PULL.iterdir() if p.is_dir())
+    res = sweep(pkgs, provided)
+
+    if a.json:
+        Path(a.json).write_text(json.dumps({"provided": len(provided), "titles": res}, indent=1))
+
+    if a.title:
+        for lib, names in sorted(res.get(a.title, {}).items()):
+            print(f"{lib}  ({len(names)})")
+            for n in names:
+                print(f"    {n}")
+        return
+
+    print(f"runtime answers {len(provided)} names by table, plus GL/Vulkan/OpenSL/OVRPlatform by prefix\n")
+    blocks = Counter()
+    for pkg, libs in sorted(res.items(), key=lambda kv: sum(map(len, kv[1].values()))):
+        names = set().union(*libs.values()) if libs else set()
+        blocks.update(names)
+        print(f"{len(names):5}  {pkg}")
+    print(f"\nwork list: missing names ranked by how many titles they block (top {a.top})")
+    for name, n in blocks.most_common(a.top):
+        print(f"{n:5}  {name}")
+    print(f"\n{len(blocks)} distinct missing names across {len(res)} titles", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

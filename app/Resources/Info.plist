@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>            <string>MetaVision</string>
+  <key>CFBundleIdentifier</key>      <string>com.metavision.launcher</string>
+  <key>CFBundleShortVersionString</key><string>0.9.4</string>
+
+  <!-- Exposes Documents/ in the visionOS Files app: this is the asset drive. -->
+  <key>UIFileSharingEnabled</key>              <true/>
+  <key>LSSupportsOpeningDocumentsInPlace</key> <true/>
+
+  <!-- Ingest listener binds on the local network only. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Receives title assets from your computer over Wi-Fi.</string>
+  <key>NSBonjourServices</key>
+  <array><string>_metavision._tcp</string></array>
+
+  <key>UIApplicationSceneManifest</key>
+  <dict>
+    <key>UIApplicationPreferredDefaultSceneSessionRole</key>
+    <string>UIWindowSceneSessionRoleApplication</string>
+  </dict>
+</dict>
+</plist>

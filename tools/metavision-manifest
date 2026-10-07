@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Merge triage records into manifest.json, validating against the schema the
+launcher decodes.
+
+Swift's JSONDecoder fails the whole document on one unknown enum case, so a
+typo here blanks the library rather than dropping a row. Validating on the
+authoring side keeps that failure on this machine.
+
+  metavision-manifest triage/*.json -o build/assets/manifest.json
+  metavision-manifest --check triage/manifest.sample.json
+"""
+import argparse, json, sys
+
+STATUS = {"OK", "WIP", "JIT", "ARCH32", "ISA", "ABANDON", "NOASSET"}
+XR     = {"OPENXR", "VRAPI", "NONE"}
+GAZE   = {"SHADER", "PINCH", "FOVEA", "NONE"}
+
+# Vulkan means the title submits a framebuffer, so there is no entity tree to
+# attach a hover effect to. FOVEA is the exception rather than a contradiction:
+# a streaming client consumes gaze inside the Foveated Streaming session, which
+# happens below the render API and never reaches the app either way.
+GFX_ALLOWS_GAZE = {"VULKAN": {"NONE", "FOVEA"}}
+
+
+def validate(titles):
+    errors = []
+    seen = set()
+    for i, t in enumerate(titles):
+        where = f"[{i}] {t.get('pkg', '<no pkg>')}"
+        if not t.get("pkg"):
+            errors.append(f"{where}: missing pkg")
+        elif t["pkg"] in seen:
+            errors.append(f"{where}: duplicate pkg")
+        else:
+            seen.add(t["pkg"])
+
+        for field, allowed in (("status", STATUS), ("xr", XR), ("gaze", GAZE)):
+            value = t.get(field)
+            if value is None:
+                if field == "status":
+                    errors.append(f"{where}: missing status")
+                continue
+            if value not in allowed:
+                errors.append(f"{where}: {field}={value!r} not in {sorted(allowed)}")
+
+        allowed_gaze = GFX_ALLOWS_GAZE.get(t.get("gfx"))
+        if allowed_gaze and t.get("gaze") not in allowed_gaze | {None}:
+            errors.append(
+                f"{where}: gfx=VULKAN submits a framebuffer, so gaze must be one "
+                f"of {sorted(allowed_gaze)}, not {t.get('gaze')!r}")
+
+        if t.get("status") in {"ARCH32", "ISA", "ABANDON", "NOASSET"} and not t.get("note"):
+            errors.append(f"{where}: status={t['status']} needs a note explaining why")
+    return errors
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("inputs", nargs="+")
+    ap.add_argument("-o", "--out")
+    ap.add_argument("--check", action="store_true", help="validate only")
+    args = ap.parse_args()
+
+    titles = []
+    for path in args.inputs:
+        with open(path) as f:
+            doc = json.load(f)
+        titles.extend(doc["titles"] if isinstance(doc, dict) else
+                      doc if isinstance(doc, list) else [doc])
+
+    errors = validate(titles)
+    if errors:
+        for e in errors:
+            print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    print(f"{len(titles)} titles valid")
+    if args.check:
+        return 0
+
+    out = json.dumps({"titles": titles}, indent=2)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(out + "\n")
+        print(f"wrote {args.out}")
+    else:
+        print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
