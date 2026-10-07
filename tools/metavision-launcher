@@ -4,11 +4,13 @@
 # Runs on the macOS build host after tools/metavision-overlay (with
 # MV_LAUNCHER=1, so the library screen is the root) and `make xros`:
 #
-#   1. translate every title into visionos/Frameworks/<target>/ (mkguest.sh)
+#   1. translate every title (mkguest.sh; its per-title build/guest/<target>/xros/
+#      frameworks are what gets embedded)
 #   2. generate the Xcode project for the "metavision" row, whose guest
 #      directory is pointed at the first title only so the generator finds one
 #   3. rewrite the project: drop that flat guest embed and add one
-#      "Embed <target>" copy phase per title into Frameworks/<target>/,
+#      "Embed <target>" copy phase per title into Frameworks/<target>/
+#      (plain .framework folders, not .xcframeworks — see below),
 #      code-signed on copy like everything else Xcode embeds
 #
 # Leaves visionos/metavision.xcodeproj ready for `xcodebuild archive`.
@@ -74,12 +76,17 @@ print(f"  removed the flat embed of {len(refs)} framework(s)")
 # 2 — one copy phase per title, into Frameworks/<target>/
 buildfiles, filerefs, phases, phase_ids, group_children = [], [], [], [], []
 for t in targets:
-    fws = sorted(f for f in os.listdir(os.path.join(here, "Frameworks", t)) if f.endswith(".xcframework"))
+    # The plain device-slice .framework folders mkguest.sh leaves in build/guest/,
+    # not the .xcframeworks: Xcode unpacks every xcframework into one shared
+    # products directory, where two titles' libunity collide ("Unexpected
+    # duplicate tasks") even though they are copied to different folders.
+    src = os.path.join("build", "guest", t, "xros")
+    fws = sorted(f for f in os.listdir(os.path.join(here, src)) if f.endswith(".framework"))
     files = []
     for fw in fws:
         ref, bld = oid(t, fw, "ref"), oid(t, fw, "bld")
-        filerefs.append(f'\t\t{ref} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; '
-                        f'name = "{t}/{fw}"; path = "Frameworks/{t}/{fw}"; sourceTree = "<group>"; }};\n')
+        filerefs.append(f'\t\t{ref} = {{isa = PBXFileReference; lastKnownFileType = wrapper.framework; '
+                        f'name = "{t}/{fw}"; path = "{src}/{fw}"; sourceTree = "<group>"; }};\n')
         buildfiles.append(f'\t\t{bld} /* {fw} in Embed {t} */ = {{isa = PBXBuildFile; fileRef = {ref}; '
                           f'settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};\n')
         files.append(f'\t\t\t\t{bld},\n')
