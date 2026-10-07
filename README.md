@@ -7,6 +7,14 @@ library — immersive art, meditation and consciousness built for Quest —
 to the Apple Vision Pro. Nothing in metavision is specific to the Cyberdelic library: it works on
 any Quest titles you own.
 
+**Accessibility.** Quest titles assume two hand controllers; metavision lets
+them be played with eyes, head and voice alone. With no hand in view, the
+controller is aimed by your head, snaps to where you look when you select
+(Dwell Control, Voice Control, or the word "select"), and its other buttons
+are spoken by name — "grab", "back", "menu", "recenter". It lives in the
+runtime every title shares, so every title gets it unchanged. See
+[docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md).
+
 Pull APKs from a Quest you own, triage them for compatibility, relink ARM64 ELF
 to Mach-O, and build a signed visionOS launcher that loads them.
 

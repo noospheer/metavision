@@ -236,30 +236,9 @@ Runtime switches for any app opened from the Home View go in
 
 ### Hands-free: eyes and voice
 
-Every build includes a hands-free pointer for titles that expect a
-controller. Whenever no hand (or PS VR2 Sense controller) is tracking the
-right controller, it is aimed by your head, snaps to where you were looking
-at each system select, and presses its trigger when you:
-
-- select with **Dwell Control** or **Voice Control** (visionOS Accessibility), or
-- say **"select"** (also "click", "okay"), recognised on the device.
-
-The other buttons are spoken by name:
-
-| Say | Does |
-|---|---|
-| select / click / okay | tap the right trigger |
-| grab / grip | tap the right grip |
-| hold … release / drop | hold trigger and grip until released (dragging, carrying) |
-| confirm / accept | tap A |
-| back / cancel | tap B |
-| menu / pause | tap Menu (left controller) |
-| recenter | recenter the view, like holding the Meta button on a Quest |
-
-The first launch asks for speech-recognition and microphone permission. Turn
-either part off with `MV_HANDS_FREE=0` or `MV_VOICE=0` in `klepton.env`. The
-launcher's library screen is standard SwiftUI, so Dwell Control and Voice
-Control ("show numbers") work there directly.
+Every build can be played without hands — head-aimed pointer, gaze-snapped
+selects, voice for the buttons. Setup, the full command list and what does
+not work yet: [ACCESSIBILITY.md](ACCESSIBILITY.md).
 
 ### CI details worth knowing
 

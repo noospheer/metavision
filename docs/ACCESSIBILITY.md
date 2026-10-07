@@ -1,0 +1,87 @@
+# Accessibility: playing without hands
+
+Quest titles assume two hand controllers. On a Vision Pro, metavision lets
+them be played with **eyes, head and voice alone** — no hand movement at all —
+and it does this once, in the runtime every title shares, so every title gets
+it without being changed.
+
+This matters most for people who cannot use their hands, and it suits the
+library metavision was started for: much of it is meditative and look-based.
+
+## How a title is controlled
+
+Whenever no hand (and no PS VR2 Sense controller) is tracking the right
+controller, metavision supplies it:
+
+- **Pointing.** The controller is aimed by your **head**. When you make a
+  system select, it snaps to **where you were looking** — visionOS reports the
+  gaze direction with every select, and only then (apps never see continuous
+  eye position).
+- **Selecting.** The trigger is pressed by any system select —
+  **Dwell Control** (hold your gaze), **Voice Control**, or a pinch — or by
+  saying **"select"**.
+- **Everything else, by voice.** Recognised on the device, no network:
+
+| Say | Does |
+|---|---|
+| select / click / okay | tap the right trigger |
+| grab / grip | tap the right grip |
+| hold … release / drop | hold trigger and grip until released (dragging, carrying) |
+| confirm / accept | tap A |
+| back / cancel | tap B |
+| menu / pause | tap Menu (left controller) |
+| recenter | recenter the view, like holding the Meta button on a Quest |
+
+Raise a hand and normal hand tracking takes over again; lower it and the
+hands-free pointer returns.
+
+## Setting it up
+
+1. Turn on visionOS accessibility features hands-free: say **"Siri, turn on
+   Voice Control"** or **"Siri, turn on Dwell Control"** (Settings →
+   Accessibility has both, plus Pointer Control for a head- or eye-driven
+   pointer in the rest of visionOS).
+2. The first launch of a metavision app asks for **speech recognition** and
+   **microphone** permission; allow both (look at *Allow* and dwell, or say
+   "tap Allow").
+3. In the metavision launcher, Voice Control works directly: "show numbers",
+   then "tap 3" to open a title.
+
+Fitting the headset and charging still need another person; everything after
+that does not.
+
+## Turning parts off
+
+For a title's app (or the launcher, with `--launcher`):
+
+```bash
+sudo tools/metavision-device env mv_<title> MV_VOICE=0        # no speech recognition
+sudo tools/metavision-device env mv_<title> MV_HANDS_FREE=0   # Klepton's own input only
+```
+
+## What does not work yet
+
+- **Moving around with a thumbstick**, and two-handed interactions.
+- **Titles that track real hands** (hand-gesture pieces) see no hands while you
+  play hands-free; that is a different input than a controller.
+- **Voice Control's numbers and grid** cannot reach inside a title: a Quest
+  title draws its menus as pixels in a 3D scene, so visionOS cannot see its
+  buttons. Aim with your head and say "select" instead.
+- Titles built only on **OpenXR** take controller input through a separate path
+  in the runtime; the hands-free pointer is confirmed only for OVRPlugin titles
+  (most Unity and Unreal titles).
+
+## Next
+
+- A **numbered aiming grid** for targets that are hard to reach with the head:
+  say "grid", then a number to jump the pointer there.
+- **Auto-start** for linear experiences, so they need no input at all.
+- **Per-title phrases** ("start experience") for titles with known menus.
+
+## How it is built
+
+`klepton-overlay/MetavisionHandsFree.swift` is copied into Klepton's app at
+build time; `tools/metavision-overlay` wires it into `KleptonControllers.swift`
+(the merge of hands and Sense controllers into synthetic Touch controllers)
+and lets the audio session record when voice is on, the same way Klepton's own
+microphone toggle does. Nothing in `vendor/klepton` is committed changed.
