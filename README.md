@@ -15,9 +15,11 @@ three input modes: Auto, Hands and Hands-free. See
 Pull APKs from a Quest you own, triage them for compatibility, relink ARM64 ELF
 to Mach-O, and build a signed visionOS launcher that loads them.
 
-**Read [METAVISION.md](METAVISION.md) before running anything**, and
+**Read [METAVISION.md](METAVISION.md) before running anything**,
 [docs/SETUP.md](docs/SETUP.md) for the accounts, signing and headset setup —
-every step, and every place it is easy to get stuck. The pipeline
+every step, and every place it is easy to get stuck — and
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) for what titles need and how to
+diagnose one that will not start. The pipeline
 only makes sense once you understand the constraint it is built around: on
 visionOS, executable code cannot be sideloaded, so titles are compiled into the
 app and only their assets are syncable.
