@@ -53,7 +53,7 @@ enum MetavisionHands {
                     // line from the wrist to the thumb knuckle, turned like it.
                     var k = sk.joint(.thumbKnuckle).anchorFromJointTransform
                     let w = sk.joint(.wrist).anchorFromJointTransform.columns.3
-                    k.columns.3 = simd_mix(w, k.columns.3, SIMD4(repeating: 0.4))
+                    k.columns.3 = simd_mix(w, k.columns.3, SIMD4<Float>(repeating: 0.4))
                     m = k
                 }
                 append(&model, m)
@@ -86,8 +86,12 @@ enum MetavisionHands {
         let k2 = o * sk.joint(.thumbKnuckle).anchorFromJointTransform.columns.3
         let origin = SIMD3<Float>((k1.x + k2.x) / 2, (k1.y + k2.y) / 2, (k1.z + k2.z) / 2)
 
-        var hp = SIMD3<Float>(0, 1.6, 0), hq = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
-        kl_ovrp_get_head_pose(&hp.x, &hp.y, &hp.z, &hq.vector.x, &hq.vector.y, &hq.vector.z, &hq.vector.w)
+        var px: Float = 0, py: Float = 1.6, pz: Float = 0
+        var qx: Float = 0, qy: Float = 0, qz: Float = 0, qw: Float = 1
+        kl_ovrp_get_head_pose(&px, &py, &pz, &qx, &qy, &qz, &qw)
+        let hp = SIMD3<Float>(px, py, pz)
+        var hq = simd_quatf(ix: qx, iy: qy, iz: qz, r: qw)
+        if !hq.real.isFinite { hq = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1) }
         let right = hq.act(SIMD3<Float>(1, 0, 0))
         let shoulder = hp + SIMD3<Float>(0, -0.15, 0) + right * (hand == 1 ? 0.17 : -0.17)
         var f = origin - shoulder

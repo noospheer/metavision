@@ -33,9 +33,10 @@ enum MetavisionAutoplay {
         let step = Int(t / 1.2)
         let phase = t - Double(step) * 1.2
 
-        var hp = SIMD3<Float>(0, 1.6, 0)
+        var px: Float = 0, py: Float = 1.6, pz: Float = 0
         var hx: Float = 0, hy: Float = 0, hz: Float = 0, hw: Float = 1
-        kl_ovrp_get_head_pose(&hp.x, &hp.y, &hp.z, &hx, &hy, &hz, &hw)
+        kl_ovrp_get_head_pose(&px, &py, &pz, &hx, &hy, &hz, &hw)
+        let hp = SIMD3<Float>(px, py, pz)
         var head = simd_quatf(ix: hx, iy: hy, iz: hz, r: hw)
         if !head.real.isFinite { head = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1) }
         // Level the head's heading: aim relative to where the user faces, not
@@ -67,7 +68,7 @@ enum MetavisionAutoplay {
 
         if step != lastStep {
             lastStep = step
-            NSLog("[mv-autoplay] t=%.1fs step %d: %@", t, step, what)
+            NSLog("[mv-autoplay] t=%.1fs step %ld: %@", t, step, what as NSString)
         }
         kl_ovrp_set_hand_motion(1, rp.x, rp.y, rp.z, rq.imag.x, rq.imag.y, rq.imag.z, rq.real, 0, 0, 0, 0, 0, 0)
         kl_ovrp_set_controller_input(1, rb, rb, rTrig, rGrip, rStick.x, rStick.y)

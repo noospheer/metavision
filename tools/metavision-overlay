@@ -216,7 +216,7 @@ struct MetavisionRoot: View {{
         if id == nil {{
             let env = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("klepton.env")
-            for line in ((try? String(contentsOf: env, encoding: .utf8)) ?? "").split(separator: "\n") {{
+            for line in ((try? String(contentsOf: env, encoding: .utf8)) ?? "").split(separator: "\\n") {{
                 let kv = line.split(separator: "=", maxSplits: 1).map {{ $0.trimmingCharacters(in: .whitespaces) }}
                 if kv.count == 2, kv[0] == "MV_AUTOSTART" {{ id = kv[1] }}
             }}
