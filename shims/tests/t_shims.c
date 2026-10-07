@@ -112,6 +112,8 @@ int main(void) {
     // OVRPlugin capability questions answer "no" through the plugin handle only
     int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetHandTrackingEnabled");
     char yes = 1; assert(q(&yes) == 0 && yes == 0);
+    int32_t (*dh)(int32_t *) = (int32_t (*)(int32_t *))dls(&g_fake_ovrp, "ovrp_GetDominantHand");
+    int32_t hand = 0; assert(dh(&hand) == 0 && hand == 2);
     assert(dls(&g_fake_ovrp, "ovrp_GetNodePoseState3") == (void *)0x9abc);   // Klepton's own: untouched
     assert(dls((void *)0x1234, "ovrp_GetHandTrackingEnabled") == (void *)0x9abc);
 

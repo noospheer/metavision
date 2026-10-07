@@ -364,12 +364,27 @@ static int32_t mv_ovrp_answer_no(char *out) {
     return OVRP_SUCCESS;
 }
 
+// Value questions with one honest answer on this device.
+// ovrpHandedness: 0 Unsupported, 1 LeftHanded, 2 RightHanded. Right, which is
+// also the controller the hands-free pointer supplies.
+static int32_t mv_ovrp_dominant_hand(int32_t *out) {
+    if (out) *out = 2;
+    return OVRP_SUCCESS;
+}
+
+static const struct { const char *name; void *fn; } k_ovrp_answers[] = {
+    { "ovrp_GetDominantHand", (void *)mv_ovrp_dominant_hand },
+};
+
 static void *mv_dlsym(void *handle, const char *name) {
     if (handle == &g_ossdk_handle)
         return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
-    if (name && kl_ovrp_is_handle(handle))
+    if (name && kl_ovrp_is_handle(handle)) {
         for (size_t i = 0; i < sizeof k_ovrp_no / sizeof k_ovrp_no[0]; i++)
             if (strcmp(name, k_ovrp_no[i]) == 0) return (void *)mv_ovrp_answer_no;
+        for (size_t i = 0; i < sizeof k_ovrp_answers / sizeof k_ovrp_answers[0]; i++)
+            if (strcmp(name, k_ovrp_answers[i].name) == 0) return k_ovrp_answers[i].fn;
+    }
     return klb_dlsym(handle, name);
 }
 
