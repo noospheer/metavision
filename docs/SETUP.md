@@ -236,6 +236,25 @@ Keep it on, on charge, for long copies — a large OBB takes 15–40 minutes ove
 Wi-Fi. `stage` reconnects by itself when it drops, and re-running it resumes. While worn, a USB-C PD
 charger of 30 W or more keeps it running indefinitely.
 
+### Unattended test pass
+
+`test` opens every title in the launcher in turn, lets each run (`--seconds`,
+default 40), closes it, then pulls all their logs; `tools/metavision-triage`
+then prints one line per title. The headset must be **worn** throughout —
+visionOS pauses apps nobody is looking through.
+
+It needs Apple's developer services, which need the **developer disk image**
+mounted, and visionOS's comes only from Xcode. Run the `ddi` workflow once
+(Actions → ddi → Run workflow), then:
+
+```bash
+gh run download <run id> --repo <you>/<name> --dir build/ddi-dl
+mkdir -p build/ddi && openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+  -pass file:build/guest-bundle.key -in build/ddi-dl/*/visionos-ddi.tar.gz.enc | tar xz -C build/ddi
+sudo tools/metavision-device test            # mounts the image when needed, then the pass
+tools/metavision-triage
+```
+
 When a title will not start, see [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ### One app for every title: the metavision launcher
