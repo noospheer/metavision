@@ -37,6 +37,7 @@ import asyncio
 import glob
 import json
 import os
+import posixpath
 import pwd
 import sys
 import time
@@ -313,6 +314,24 @@ async def cmd_stage(a):
         if local.is_file() and 0 < have < want:
             print(f"  {label:7} resuming at {have / 1e9:.2f} of {want / 1e9:.2f} GB -> {remote_path}", flush=True)
             await append_rest(afc, local, remote_path, have)
+            return
+        if local.is_dir() and have > 0:
+            # A folder that is partly there: finish it file by file.
+            print(f"  {label:7} resuming folder {have / 1e9:.2f} of {want / 1e9:.2f} GB -> {remote_path}", flush=True)
+            sent = 0
+            for f in sorted(p for p in local.rglob("*") if p.is_file()):
+                rp = f"{remote_path}/{f.relative_to(local).as_posix()}"
+                got, size = await remote_size(afc, rp), f.stat().st_size
+                if got == size:
+                    continue
+                await afc.makedirs(posixpath.dirname(rp))
+                if 0 < got < size:
+                    await append_rest(afc, f, rp, got)
+                else:
+                    await afc.set_file_contents(rp, f.read_bytes()) if size < (64 << 20) \
+                        else await afc.push(str(f), rp)
+                sent += 1
+            print(f"    {sent} file(s) completed", flush=True)
             return
         print(f"  {label:7} -> {remote_path}", flush=True)
         await afc.push(str(local), remote_parent)
