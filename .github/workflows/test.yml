@@ -1,0 +1,16 @@
+name: test
+
+# Everything that does not need a Mac: vrapi suites, the shim layer (host
+# build + "no shim shadows upstream"), manifest schema, tool syntax.
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - run: pip install pyelftools
+      - run: make test
