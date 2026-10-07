@@ -257,6 +257,10 @@ async def cmd_stage(a):
     if not (tree / "apktool.yml").exists() or not apk.exists():
         sys.exit(f"{a.target} is not staged: tools/metavision-targets stage")
     pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text()).group(1)
+    if a.all:
+        a.launcher = True
+    elif not a.target:
+        sys.exit("logs: name a title, or --all")
     bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
     obb_src = root / "pull" / pkg / "obb"
@@ -368,15 +372,45 @@ async def cmd_logs(a):
     bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
     out = Path(a.out or f"build/logs/{a.target}")
-    out.mkdir(parents=True, exist_ok=True)
+
+    async def pull(afc, src, dst):
+        dst.mkdir(parents=True, exist_ok=True)
+        for old in dst.glob("klepton-*.log"):
+            old.unlink()                      # a stale crash must not look current
+        try:
+            names = await afc.listdir(src)
+        except Exception:
+            return []
+        got = [n for n in names if n.endswith((".log", ".crash", ".ips"))]
+        for n in got:
+            (dst / n).write_bytes(await afc.get_file_contents(f"{src}/{n}"))
+        return got
 
     async def fn(rsd):
         afc = await HouseArrestService.create(rsd, bundle)
         try:
-            names = await afc.listdir("Documents")
-            got = [n for n in names if n.endswith((".log", ".txt", ".crash", ".ips"))]
-            for n in got:
-                (out / n).write_bytes(await afc.get_file_contents(f"Documents/{n}"))
+            if a.all:
+                # The launcher files each run under Documents/logs/<title>/; the
+                # newest run is still at the top, written by current-title.txt.
+                base = Path(a.out or "build/logs")
+                try:
+                    titles = [n for n in await afc.listdir("Documents/logs")
+                              if not n.endswith(".txt")]
+                except Exception:
+                    titles = []
+                for t in titles:
+                    got = await pull(afc, f"Documents/logs/{t}", base / t)
+                    print(f"{t:40} {', '.join(got) or '(none)'}")
+                try:
+                    cur = (await afc.get_file_contents("Documents/logs/current-title.txt")).decode().strip()
+                except Exception:
+                    cur = ""
+                if cur:
+                    got = await pull(afc, "Documents", base / cur)
+                    print(f"{cur:40} {', '.join(got) or '(none)'}  (latest run)")
+                return
+            out.mkdir(parents=True, exist_ok=True)
+            got = await pull(afc, "Documents", out)
             print(f"{len(got)} file(s) -> {out}: {', '.join(got) or '(none)'}")
         finally:
             await afc.close()
@@ -520,7 +554,9 @@ def main():
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true")
     p = sub.add_parser("env"); p.add_argument("target"); p.add_argument("vars", nargs="*", metavar="KEY=VALUE")
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true")
-    p = sub.add_parser("logs"); p.add_argument("target")
+    p = sub.add_parser("logs"); p.add_argument("target", nargs="?", default="")
+    p.add_argument("--all", action="store_true",
+                   help="every title's last run, filed by the launcher (implies --launcher)")
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true"); p.add_argument("--out")
     p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
     a = ap.parse_args()

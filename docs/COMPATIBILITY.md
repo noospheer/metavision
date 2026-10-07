@@ -30,6 +30,15 @@ On the headset: open the title, wait ~30 s, close it. Then on Linux:
 sudo tools/metavision-device logs mv_<title> --launcher     # -> build/logs/mv_<title>/
 ```
 
+**Many titles in one pass.** The launcher files each run's logs under the
+title that wrote them, at the moment the next title is picked. Open each title
+in turn (wait ~30 s, close metavision, reopen, pick the next), then:
+
+```bash
+sudo tools/metavision-device logs --all    # -> build/logs/<title>/ for every title run
+tools/metavision-triage                    # one line each: picture or black, and how it ended
+```
+
 `klepton-boot.log` is the runtime's log; `klepton-crash.log` is written only on
 a fault (an old one stays until the next fault — check its time). What to look
 for:

@@ -227,6 +227,7 @@ sudo tools/metavision-device install mv_<title>.ipa
 | `icons` | copy just the icons of titles staged earlier into the launcher |
 | `ls [--launcher]` | what is staged, with sizes |
 | `logs mv_<title> [--launcher]` | pull the boot log and crash report |
+| `logs --all` | every title's last run from the launcher; then `tools/metavision-triage` |
 | `env mv_<title> [--launcher] KEY=VALUE …` | runtime switches for the next launch; none clears them |
 
 **The headset sleeps as soon as it is taken off, and a copy in progress stops.**

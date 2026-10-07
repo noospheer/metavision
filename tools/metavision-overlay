@@ -169,6 +169,29 @@ enum MetavisionCatalog {{
             .appendingPathComponent(id).appendingPathComponent("icon.png").path
     }}
 
+    /// The runtime writes one Documents/klepton-boot.log (and klepton-crash.log
+    /// on a fault) and truncates it at every boot. Before a title boots, file
+    /// the previous run's logs under Documents/logs/<the title that wrote them>/,
+    /// so a pass through several titles leaves one log set per title.
+    static func fileLastRunLogs(next id: String) {{
+        let fm = FileManager.default
+        let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let logs = docs.appendingPathComponent("logs")
+        let marker = logs.appendingPathComponent("current-title.txt")
+        if let prev = try? String(contentsOf: marker, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines), !prev.isEmpty {{
+            let dir = logs.appendingPathComponent(prev)
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            for name in ["klepton-boot.log", "klepton-crash.log"] {{
+                let dst = dir.appendingPathComponent(name)
+                try? fm.removeItem(at: dst)     // a stale crash must not outlive a clean run
+                try? fm.moveItem(at: docs.appendingPathComponent(name), to: dst)
+            }}
+        }}
+        try? fm.createDirectory(at: logs, withIntermediateDirectories: true)
+        try? id.write(to: marker, atomically: true, encoding: .utf8)
+    }}
+
     /// Only the titles whose translations this bundle carries.
     static var embedded: [MetavisionTitle] {{
         let fw = Bundle.main.bundleURL.appendingPathComponent("Frameworks")
@@ -220,6 +243,7 @@ struct MetavisionLibrary: View {{
                 LazyVGrid(columns: columns, spacing: 16) {{
                     ForEach(titles) {{ t in
                         Button {{
+                            MetavisionCatalog.fileLastRunLogs(next: t.id)
                             setenv("KL_TARGET", t.id, 1)   // read by kl_app_configure at boot
                             chosen = t.id
                         }} label: {{

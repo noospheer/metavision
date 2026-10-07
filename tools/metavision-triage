@@ -1,42 +1,54 @@
-#!/usr/bin/env bash
-# metavision-triage <apk> — decide whether a title can run, emit one manifest record.
-# Gate order matters: ABI is terminal, so check it before anything expensive.
-set -euo pipefail
+#!/usr/bin/env python3
+"""One line per title from the logs pulled with `metavision-device logs --all`.
 
-APK="${1:?usage: metavision-triage <apk>}"
-PKG="$(basename "$(dirname "$APK")")"
-L="$(unzip -l "$APK")"
-has() { grep -q -- "$1" <<<"$L"; }
+    tools/metavision-triage [build/logs]
 
-# gate 1 — ABI. armeabi-v7a only is terminal: AArch32 does not execute on Apple silicon.
-if ! has 'lib/arm64-v8a/'; then
-  printf '{"pkg":"%s","status":"ARCH32","note":"32-bit only — AArch32 not executable at EL0"}\n' "$PKG"
-  exit 0
-fi
+For each title: when it last ran, whether frames reached the display, and how
+the run ended — the unimplemented entry point that stopped it, the fault and
+where, a library it could not load, or nothing (still running when closed).
+"""
+import re
+import sys
+from pathlib import Path
 
-# gate 2 — scripting backend
-if   has 'libil2cpp.so';        then BACKEND=IL2CPP
-elif has 'libmonobdwgc-2.0.so'; then BACKEND=MONO
-elif has 'libmain.so';          then BACKEND=NATIVE
-else                                 BACKEND=UNKNOWN; fi
+PICTURE = re.compile(r"(\d+) with a picture")
+FATAL = re.compile(r"fatal: (.*)")
+FAULT = re.compile(r"fault: signal (\d+) at (0x[0-9a-f]+), pc (\S+)")
+DLFAIL = re.compile(r'guest dlopen\("([^"]+)"\) FAILED')
+START = re.compile(r"^\[hb\] (\S+)")
+SHIM = re.compile(r"\[mv-shim\] (.*)")
 
-# gate 3 — XR runtime, picks the shim
-if   has 'libopenxr_loader.so'; then XR=OPENXR
-elif has 'libvrapi.so';         then XR=VRAPI
-else                                 XR=NONE; fi
 
-# gate 4 — graphics path. Vulkan means framebuffer submit, which means no gaze.
-if unzip -p "$APK" 'lib/arm64-v8a/*.so' 2>/dev/null | strings | grep -q vkCreateInstance
-  then GFX=VULKAN; GAZE=NONE
-  else GFX=GLES;   GAZE=PINCH; fi
+def triage(d: Path):
+    boot = d / "klepton-boot.log"
+    if not boot.is_file():
+        return None
+    text = boot.read_text(errors="replace")
+    lines = text.splitlines()
+    started = next((m.group(1) for m in map(START.match, lines[:5]) if m), "?")
+    pics = max((int(m.group(1)) for m in PICTURE.finditer(text)), default=0)
+    notes = sorted({m.group(1) for m in DLFAIL.finditer(text)})
+    ending = "running when closed"
+    if m := FATAL.search(text):
+        ending = "stopped: " + m.group(1).strip()
+    crash = d / "klepton-crash.log"
+    if crash.is_file() and (m := FAULT.search(crash.read_text(errors="replace"))):
+        ending = f"crashed: signal {m.group(1)} at {m.group(2)}, pc {m.group(3)}"
+    return started, pics, ending, notes
 
-# gate 5 — JIT canaries
-JIT=none
-for c in luajit libv8 hermes libmonobdwgc; do has "$c" && JIT="$c"; done
 
-STATUS=OK
-[ "$BACKEND" = MONO ] && STATUS=JIT
-[ "$JIT" != none ]    && STATUS=JIT
+def main():
+    base = Path(sys.argv[1] if len(sys.argv) > 1 else "build/logs")
+    rows = [(d.name, r) for d in sorted(base.iterdir()) if d.is_dir() and (r := triage(d))]
+    if not rows:
+        sys.exit(f"no logs under {base} — run `metavision-device logs --all` first")
+    w = max(len(n) for n, _ in rows)
+    for name, (started, pics, ending, notes) in rows:
+        state = "picture" if pics else "BLACK  "
+        print(f"{name:{w}}  {started:>8}  {state} {pics:>7} frames  {ending}")
+        for n in notes:
+            print(f"{'':{w}}  {'':>8}  could not load {n}")
 
-printf '{"pkg":"%s","status":"%s","backend":"%s","xr":"%s","gfx":"%s","gaze":"%s","jit":"%s"}\n' \
-  "$PKG" "$STATUS" "$BACKEND" "$XR" "$GFX" "$GAZE" "$JIT"
+
+if __name__ == "__main__":
+    main()
