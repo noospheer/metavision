@@ -22,6 +22,7 @@ support, with the workarounds visionOS currently needs (see docs/SETUP.md):
     sudo metavision-device stage mv_<title>  copy its APK, assets and OBB into the app
     sudo metavision-device logs mv_<title>   pull its boot log and crash reports
     sudo metavision-device ls --launcher     what is staged, with sizes
+    sudo metavision-device icons             copy staged titles' icons into the launcher
     sudo metavision-device env mv_<title> KL_OVRP_TRACE=1 ...
                                              runtime switches for the next launch
                                              (none: clear them)
@@ -221,6 +222,17 @@ async def cmd_install(a):
     await with_rsd(a, fn)
 
 
+def title_icon(tree):
+    """The largest PNG of the icon the manifest names (@mipmap/x or @drawable/x)."""
+    import re
+    m = re.search(r'<application[^>]*android:icon="@(\w+)/([\w.]+)"', (tree / "AndroidManifest.xml").read_text(errors="replace"))
+    if not m:
+        return None
+    kind, name = m.groups()
+    pngs = [p for d in (tree / "res").glob(f"{kind}*") for p in [d / f"{name}.png"] if p.exists()]
+    return max(pngs, key=lambda p: p.stat().st_size) if pngs else None
+
+
 async def cmd_stage(a):
     """Copy a title's data into its app's container, in the layout kl_app.c reads:
 
@@ -254,6 +266,9 @@ async def cmd_stage(a):
             await afc.makedirs(f"Documents/{t['tree']}")
             for m in ("apktool.yml", "AndroidManifest.xml"):
                 await afc.push(str(tree / m), f"Documents/{t['tree']}/{m}", progress_bar=False)
+            icon = title_icon(tree)
+            if icon:   # shown on the title's tile in the launcher's library
+                await afc.set_file_contents(f"Documents/{t['tree']}/icon.png", icon.read_bytes())
             print(f"  apk     -> Documents/{t['apk']}", flush=True)
             await afc.push(str(apk), f"Documents/{t['apk']}")
             if (tree / "assets").is_dir():
@@ -288,6 +303,35 @@ async def cmd_logs(a):
             for n in got:
                 (out / n).write_bytes(await afc.get_file_contents(f"Documents/{n}"))
             print(f"{len(got)} file(s) -> {out}: {', '.join(got) or '(none)'}")
+        finally:
+            await afc.close()
+    await with_rsd(a, fn)
+
+
+async def cmd_icons(a):
+    """Copy just each title's icon into the launcher (for titles staged earlier)."""
+    from pymobiledevice3.services.house_arrest import HouseArrestService
+    root = Path(__file__).resolve().parent.parent
+    guests = root / "build" / "guests"
+    rows = json.loads((guests / "targets.json").read_text())
+    bundle = a.bundle or "metavision.dev.klepton.target.metavision"
+
+    async def fn(rsd):
+        afc = await HouseArrestService.create(rsd, bundle)
+        try:
+            present = set(await afc.listdir("Documents"))
+            n = 0
+            for slug, t in rows.items():
+                if a.targets and slug not in a.targets:
+                    continue
+                if not a.targets and t["tree"] not in present:
+                    continue          # only titles already staged
+                icon = title_icon(guests / t["tree"])
+                if icon:
+                    await afc.makedirs(f"Documents/{t['tree']}")
+                    await afc.set_file_contents(f"Documents/{t['tree']}/icon.png", icon.read_bytes())
+                    n += 1
+            print(f"{n} icon(s) copied")
         finally:
             await afc.close()
     await with_rsd(a, fn)
@@ -396,6 +440,7 @@ def main():
     p.add_argument("--bundle", help="app bundle id (default: the title's own app)")
     p.add_argument("--launcher", action="store_true", help="stage into the metavision launcher's layout")
     p.add_argument("--skip-obb", action="store_true", help="leave OBBs alone (already copied)")
+    p = sub.add_parser("icons"); p.add_argument("targets", nargs="*"); p.add_argument("--bundle")
     p = sub.add_parser("ls"); p.add_argument("target", nargs="?", default="")
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true")
     p = sub.add_parser("env"); p.add_argument("target"); p.add_argument("vars", nargs="*", metavar="KEY=VALUE")
@@ -407,7 +452,7 @@ def main():
     if a.cmd == "register":
         return cmd_register(a)
     asyncio.run({"discover": cmd_discover, "pair": cmd_pair, "info": cmd_info,
-                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage, "logs": cmd_logs, "env": cmd_env, "ls": cmd_ls}[a.cmd](a))
+                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage, "logs": cmd_logs, "env": cmd_env, "ls": cmd_ls, "icons": cmd_icons}[a.cmd](a))
 
 
 if __name__ == "__main__":
