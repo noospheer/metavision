@@ -6,7 +6,8 @@
 // through kl_shim_override, which kl_shim_lookup consults before every tier,
 // so the submodule stays untouched and an upstream implementation can never
 // be shadowed by accident: mv_lookup only answers names in its own table, and
-// the table is checked against upstream by `make -C shims test`.
+// the table is checked against upstream by `make -C shims test` — apart from
+// the declared wrappers (dlopen, dlsym), which handle one case and forward.
 //
 // Conventions, inherited from the runtime:
 //   * errno: set Darwin's. bionic's __errno() is klb_errno, which translates
@@ -284,6 +285,55 @@ static void       *mv_AMediaCodec_createEncoderByType(const char *mime) { (void)
 // VrApi: a clock-level request is advice to the Quest's governor. Success.
 static int32_t mv_vrapi_SetClockLevels(void *ovr, int32_t cpu, int32_t gpu) { (void)ovr; (void)cpu; (void)gpu; return 0; }
 
+// ---------------------------------------------------------------- Quest system libraries
+// Some titles dlopen libraries that ship with the Quest's OS, not the APK. The
+// one that matters: Meta's Interaction SDK (in most Unity titles since 2023)
+// loads libossdk.oculus.so for telemetry, gets nothing here, and then calls a
+// method on the handler it never received (TelemetrySender's constructor,
+// SIGSEGV at 0x0) — on a Quest the library always exists, so nothing checks.
+//
+// The stand-in: dlopen("libossdk.oculus.so") answers a synthetic handle, and
+// every symbol looked up through it is a function returning a dummy object
+// whose methods all return that same dummy object — so a chain of calls off
+// the "handler" stays harmless, and nothing is ever sent anywhere.
+//
+// These two are WRAPPERS of Klepton's own dlopen/dlsym, not replacements:
+// every other name goes straight to klb_dlopen/klb_dlsym.
+void *klb_dlopen(const char *path, int flags);
+void *klb_dlsym(void *handle, const char *name);
+
+static void *g_dummy_vtbl[64];
+static struct { void **vtbl; uint64_t fields[31]; } g_dummy_obj;
+static char g_ossdk_handle;          // its address is the synthetic handle
+
+static void *mv_dummy_method(void) { return &g_dummy_obj; }
+
+static void mv_dummy_init(void) {
+    for (size_t i = 0; i < sizeof g_dummy_vtbl / sizeof g_dummy_vtbl[0]; i++)
+        g_dummy_vtbl[i] = (void *)mv_dummy_method;
+    g_dummy_obj.vtbl = g_dummy_vtbl;
+}
+
+static const char *base_name(const char *p) {
+    const char *b = strrchr(p, '/');
+    return b ? b + 1 : p;
+}
+
+static void *mv_dlopen(const char *path, int flags) {
+    if (path && strcmp(base_name(path), "libossdk.oculus.so") == 0) {
+        static int said;
+        if (!said++) fprintf(stderr, "  [mv-shim] %s -> stand-in (Quest OS telemetry; nothing is sent)\n", path);
+        return &g_ossdk_handle;
+    }
+    return klb_dlopen(path, flags);
+}
+
+static void *mv_dlsym(void *handle, const char *name) {
+    if (handle == &g_ossdk_handle)
+        return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
+    return klb_dlsym(handle, name);
+}
+
 // ---------------------------------------------------------------- table
 #define MV(name, fn) { name, (void *)(fn) }
 const mv_entry mv_shim_table[] = {
@@ -347,6 +397,8 @@ const mv_entry mv_shim_table[] = {
     MV("AMediaFormat_setBuffer", mv_AMediaFormat_setBuffer),
     MV("AMediaCodec_createEncoderByType", mv_AMediaCodec_createEncoderByType),
     MV("vrapi_SetClockLevels", mv_vrapi_SetClockLevels),
+    MV("dlopen", mv_dlopen),          // wrapper: one Quest OS library, then klb_dlopen
+    MV("dlsym", mv_dlsym),            // wrapper: the stand-in's symbols, then klb_dlsym
 };
 const size_t mv_shim_count = sizeof mv_shim_table / sizeof mv_shim_table[0];
 
@@ -367,6 +419,7 @@ static void *mv_override(const char *name) {
 }
 
 void mv_shims_install(void) {
+    mv_dummy_init();
     if (kl_shim_override == mv_override) return;
     g_prev_override = kl_shim_override;
     kl_shim_override = mv_override;

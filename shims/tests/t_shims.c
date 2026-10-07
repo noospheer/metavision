@@ -21,6 +21,10 @@ void *kl_shim_lookup(const char *name) {
     return NULL;
 }
 FILE *kl_host_file(void *g) { return (FILE *)g; }
+static int g_real_dlopen_calls;
+// Klepton's own dlopen: android_dlopen_ext reaches it through the dlopen wrapper.
+void *klb_dlopen(const char *p, int f) { (void)p; g_real_dlopen_calls++; g_dlopen_flags = f; return (void *)0x1234; }
+void *klb_dlsym(void *h, const char *n) { (void)h; (void)n; return (void *)0x9abc; }
 
 #define FN(t, n) ((t)mv_lookup(n))
 
@@ -44,7 +48,7 @@ int main(void) {
     long (*pt)(int, int, void *, void *) = FN(long (*)(int, int, void *, void *), "ptrace");
     errno = 0; assert(pt(0, 0, 0, 0) == -1 && errno == EPERM);
 
-    // android_dlopen_ext forwards flags unchanged to the guest dlopen
+    // android_dlopen_ext forwards flags unchanged to the guest dlopen (via the wrapper)
     void *(*dle)(const char *, int, const void *) = FN(void *(*)(const char *, int, const void *), "android_dlopen_ext");
     assert(dle("libfoo.so", 0x102, (void *)1) == (void *)0x1234 && g_dlopen_flags == 0x102);
 
@@ -88,6 +92,20 @@ int main(void) {
 
     // timezone is data
     assert(*(long *)mv_lookup("timezone") == 0);
+
+    // libossdk stand-in: synthetic handle, harmless handler chain, everything else forwarded
+    void *(*dlo)(const char *, int) = FN(void *(*)(const char *, int), "dlopen");
+    void *(*dls)(void *, const char *) = FN(void *(*)(void *, const char *), "dlsym");
+    void *h = dlo("libossdk.oculus.so", 0);
+    int before = g_real_dlopen_calls;
+    assert(h && g_real_dlopen_calls == before);       // the stand-in never reaches klb_dlopen
+    void *(*create)(void) = (void *(*)(void))dls(h, "createTelemetryHandler");
+    void **obj = create();                            // the handler
+    void *(*m0)(void *, const char *) = (void *(*)(void *, const char *))((void **)obj[0])[0];
+    void **again = m0(obj, "event");                  // a method on it: another dummy
+    assert(again && ((void **)again[0])[5] != NULL);  // and its methods are callable too
+    assert(dlo("/system/lib64/libfoo.so", 0) == (void *)0x1234 && g_real_dlopen_calls == before + 1);
+    assert(dls((void *)0x1234, "x") == (void *)0x9abc);
 
     printf("mv_shims: %zu shims, all checks passed\n", mv_shim_count);
     return 0;

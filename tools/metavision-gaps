@@ -86,10 +86,13 @@ def check_shims():
     """A shim is consulted BEFORE every upstream tier, so one that names
     something upstream already answers would silently replace it."""
     up, mine = upstream_names(), shim_names()
-    shadow = sorted(n for n in mine if n in up or by_prefix(n))
+    # Declared wrappers: they handle one case and forward everything else to
+    # upstream's own implementation (see shims/mv_shims.c).
+    wrappers = {"dlopen", "dlsym"}
+    shadow = sorted(n for n in mine if (n in up or by_prefix(n)) and n not in wrappers)
     if shadow:
         sys.exit("shims shadow upstream names: " + ", ".join(shadow))
-    print(f"mv_shims: {len(mine)} names, none shadow upstream")
+    print(f"mv_shims: {len(mine)} names, none shadow upstream (wrappers: {', '.join(sorted(wrappers & mine))})")
 
 
 def by_prefix(name):
