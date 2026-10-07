@@ -5,8 +5,7 @@ them be played with **eyes, head and voice alone** â€” no hand movement at all â
 and it does this once, in the runtime every title shares, so every title gets
 it without being changed.
 
-This matters most for people who cannot use their hands, and it suits the
-library metavision was started for: much of it is meditative and look-based.
+This matters most for people who cannot use their hands.
 
 ## Input modes
 
