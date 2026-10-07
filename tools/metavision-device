@@ -281,10 +281,38 @@ async def cmd_stage(a):
     def local_size(p):
         return p.stat().st_size if p.is_file() else sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
 
+    async def append_rest(afc, local, remote_path, have):
+        """Continue a partly copied file from byte `have` (AFC append mode)."""
+        total = local.stat().st_size
+        chunk = 4 << 20
+        h = await afc.fopen(remote_path, "a")
+        try:
+            with open(local, "rb") as f:
+                f.seek(have)
+                done, last = have, -1
+                while True:
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    await afc.fwrite(h, buf)
+                    done += len(buf)
+                    pct = done * 100 // total
+                    if pct != last and pct % 5 == 0:
+                        print(f"    {pct:3}%  {done / 1e9:.2f} / {total / 1e9:.2f} GB", flush=True)
+                        last = pct
+        finally:
+            await afc.fclose(h)
+
     async def push_unless_done(afc, local, remote_parent, remote_path, label):
-        """Resume-friendly: skip anything already on the headset at full size."""
-        if await remote_size(afc, remote_path) == local_size(local):
+        """Resume-friendly: skip anything already on the headset at full size,
+        and finish a large file that a dropped connection left part-way."""
+        have, want = await remote_size(afc, remote_path), local_size(local)
+        if have == want:
             print(f"  {label:7} already there, skipped", flush=True)
+            return
+        if local.is_file() and 0 < have < want:
+            print(f"  {label:7} resuming at {have / 1e9:.2f} of {want / 1e9:.2f} GB -> {remote_path}", flush=True)
+            await append_rest(afc, local, remote_path, have)
             return
         print(f"  {label:7} -> {remote_path}", flush=True)
         await afc.push(str(local), remote_parent)
