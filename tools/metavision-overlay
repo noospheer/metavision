@@ -206,8 +206,26 @@ enum MetavisionShell {{
 }}
 
 struct MetavisionRoot: View {{
-    @State private var chosen: String? = nil
+    @State private var chosen: String? = MetavisionRoot.autostart()
     @Environment(\.dismissWindow) private var dismissWindow
+
+    /// MV_AUTOSTART=<target> — from the launch environment or Documents/klepton.env
+    /// — opens that title directly, for unattended test passes.
+    static func autostart() -> String? {{
+        var id = ProcessInfo.processInfo.environment["MV_AUTOSTART"]
+        if id == nil {{
+            let env = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("klepton.env")
+            for line in ((try? String(contentsOf: env, encoding: .utf8)) ?? "").split(separator: "\n") {{
+                let kv = line.split(separator: "=", maxSplits: 1).map {{ $0.trimmingCharacters(in: .whitespaces) }}
+                if kv.count == 2, kv[0] == "MV_AUTOSTART" {{ id = kv[1] }}
+            }}
+        }}
+        guard let id, !id.isEmpty, MetavisionCatalog.embedded.contains(where: {{ $0.id == id }}) else {{ return nil }}
+        MetavisionCatalog.fileLastRunLogs(next: id)
+        setenv("KL_TARGET", id, 1)
+        return id
+    }}
 
     var body: some View {{
         if chosen != nil {{
