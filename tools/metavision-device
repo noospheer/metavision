@@ -21,6 +21,9 @@ support, with the workarounds visionOS currently needs (see docs/SETUP.md):
     sudo metavision-device install APP.ipa   install a signed build
     sudo metavision-device stage mv_<title>  copy its APK, assets and OBB into the app
     sudo metavision-device logs mv_<title>   pull its boot log and crash reports
+    sudo metavision-device env mv_<title> KL_OVRP_TRACE=1 ...
+                                             runtime switches for the next launch
+                                             (none: clear them)
     metavision-device register --udid U      add the headset to your Apple team
                                              (App Store Connect API key, see SETUP)
 
@@ -289,6 +292,26 @@ async def cmd_logs(a):
     await with_rsd(a, fn)
 
 
+async def cmd_env(a):
+    """Write Documents/klepton.env: the runtime's switches for a hand-launched app."""
+    from pymobiledevice3.services.house_arrest import HouseArrestService
+    bundle = a.bundle or ("metavision.launcher" if a.launcher else
+                          "metavision.dev.klepton.target." + a.target.replace("_", "-"))
+    for kv in a.vars:
+        if "=" not in kv:
+            sys.exit(f"not KEY=VALUE: {kv}")
+    body = "".join(f"{kv}\n" for kv in a.vars)
+
+    async def fn(rsd):
+        afc = await HouseArrestService.create(rsd, bundle)
+        try:
+            await afc.set_file_contents("Documents/klepton.env", body.encode())
+        finally:
+            await afc.close()
+        print("klepton.env:", " ".join(a.vars) or "(cleared)")
+    await with_rsd(a, fn)
+
+
 # ---------------------------------------------------------------- register
 def asc_token():
     try:
@@ -336,6 +359,8 @@ def main():
     p.add_argument("--bundle", help="app bundle id (default: the title's own app)")
     p.add_argument("--launcher", action="store_true", help="stage into the metavision launcher's layout")
     p.add_argument("--skip-obb", action="store_true", help="leave OBBs alone (already copied)")
+    p = sub.add_parser("env"); p.add_argument("target"); p.add_argument("vars", nargs="*", metavar="KEY=VALUE")
+    p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true")
     p = sub.add_parser("logs"); p.add_argument("target")
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true"); p.add_argument("--out")
     p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
@@ -343,7 +368,7 @@ def main():
     if a.cmd == "register":
         return cmd_register(a)
     asyncio.run({"discover": cmd_discover, "pair": cmd_pair, "info": cmd_info,
-                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage, "logs": cmd_logs}[a.cmd](a))
+                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage, "logs": cmd_logs, "env": cmd_env}[a.cmd](a))
 
 
 if __name__ == "__main__":
