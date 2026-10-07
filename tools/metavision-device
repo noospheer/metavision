@@ -459,7 +459,9 @@ async def cmd_ddi(a):
 
 async def cmd_test(a):
     """Unattended pass through the launcher's titles: open each one by itself
-    (MV_AUTOSTART), let it run, close it, then pull every title's logs. The
+    (MV_AUTOSTART) with scripted controller input (MV_AUTOPLAY: pointer sweeps,
+    trigger clicks, buttons, sticks), let it run, close it, then pull every
+    title's logs. The
     headset must be worn — visionOS pauses apps nobody is looking through."""
     from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
     from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
@@ -472,8 +474,12 @@ async def cmd_test(a):
         print(await mount_ddi(rsd, a.ddi), flush=True)
         async with DvtProvider(rsd) as dvt, ProcessControl(dvt) as pc:
             for i, n in enumerate(names, 1):
-                pid = await pc.launch(bundle, environment={"MV_AUTOSTART": n}, kill_existing=True)
-                print(f"[{i}/{len(names)}] {n}: running (pid {pid}), {a.seconds} s", flush=True)
+                env = {"MV_AUTOSTART": n}
+                if not a.no_play:
+                    env["MV_AUTOPLAY"] = "1"     # scripted controller input: menus pressed, scenes started
+                pid = await pc.launch(bundle, environment=env, kill_existing=True)
+                print(f"[{i}/{len(names)}] {n}: running (pid {pid}), {a.seconds} s"
+                      f"{'' if a.no_play else ', auto-play on'}", flush=True)
                 await asyncio.sleep(a.seconds)
                 try:
                     await pc.kill(pid)
@@ -693,7 +699,8 @@ def main():
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true"); p.add_argument("--out")
     p = sub.add_parser("ddi"); p.add_argument("--dir", default="build/ddi")
     p = sub.add_parser("test"); p.add_argument("targets", nargs="*")
-    p.add_argument("--seconds", type=int, default=40, help="how long each title runs")
+    p.add_argument("--seconds", type=int, default=90, help="how long each title runs")
+    p.add_argument("--no-play", action="store_true", help="no scripted input: just open each title")
     p.add_argument("--ddi", default="build/ddi"); p.add_argument("--bundle")
     p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
     a = ap.parse_args()
