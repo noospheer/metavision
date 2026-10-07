@@ -234,7 +234,8 @@ def title_icon(tree):
 
 
 async def cmd_stage(a):
-    """Copy a title's data into its app's container, in the layout kl_app.c reads:
+    """Copy a title's data into its app's container, in the layout kl_app.c reads.
+    Anything already there at full size is skipped, so re-running resumes:
 
         Documents/<tree>.apk                    the APK (Unity opens it as a zip)
         Documents/<tree>/assets/                decoded assets
@@ -260,6 +261,34 @@ async def cmd_stage(a):
     obb_src = root / "pull" / pkg / "obb"
     files_root = f"Documents/{t['tree']}/android-files" if a.launcher else "Documents/android-files"
 
+    async def remote_size(afc, path):
+        """Bytes under a remote path (file or tree); -1 when it is not there."""
+        try:
+            st = await afc.stat(path)
+        except Exception:
+            return -1
+        if st.get("st_ifmt") != "S_IFDIR":
+            return int(st.get("st_size", 0))
+        total = 0
+        async for root, _dirs, files in afc.walk(path):
+            for f in files:
+                try:
+                    total += int((await afc.stat(f"{root}/{f}")).get("st_size", 0))
+                except Exception:
+                    pass
+        return total
+
+    def local_size(p):
+        return p.stat().st_size if p.is_file() else sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+
+    async def push_unless_done(afc, local, remote_parent, remote_path, label):
+        """Resume-friendly: skip anything already on the headset at full size."""
+        if await remote_size(afc, remote_path) == local_size(local):
+            print(f"  {label:7} already there, skipped", flush=True)
+            return
+        print(f"  {label:7} -> {remote_path}", flush=True)
+        await afc.push(str(local), remote_parent)
+
     async def fn(rsd):
         afc = await HouseArrestService.create(rsd, bundle)
         try:
@@ -269,18 +298,17 @@ async def cmd_stage(a):
             icon = title_icon(tree)
             if icon:   # shown on the title's tile in the launcher's library
                 await afc.set_file_contents(f"Documents/{t['tree']}/icon.png", icon.read_bytes())
-            print(f"  apk     -> Documents/{t['apk']}", flush=True)
-            await afc.push(str(apk), f"Documents/{t['apk']}")
+            await push_unless_done(afc, apk, f"Documents/{t['apk']}", f"Documents/{t['apk']}", "apk")
             if (tree / "assets").is_dir():
-                print(f"  assets  -> Documents/{t['tree']}/assets", flush=True)
-                await afc.push(str(tree / "assets"), f"Documents/{t['tree']}")
+                await push_unless_done(afc, tree / "assets", f"Documents/{t['tree']}",
+                                       f"Documents/{t['tree']}/assets", "assets")
             obbs = sorted(obb_src.glob("*")) if obb_src.is_dir() and not a.skip_obb else []
             if obbs:
                 dest = f"{files_root}/{t['obb']}"
                 await afc.makedirs(dest)
                 for f in obbs:
-                    print(f"  obb     -> {dest}/{f.name} ({f.stat().st_size / 1e9:.2f} GB)", flush=True)
-                    await afc.push(str(f), f"{dest}/{f.name}")
+                    await push_unless_done(afc, f, f"{dest}/{f.name}", f"{dest}/{f.name}",
+                                           f"obb {f.stat().st_size / 1e9:.1f}G")
         finally:
             await afc.close()
         print(f"staged {a.target} into {bundle}")
