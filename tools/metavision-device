@@ -257,10 +257,6 @@ async def cmd_stage(a):
     if not (tree / "apktool.yml").exists() or not apk.exists():
         sys.exit(f"{a.target} is not staged: tools/metavision-targets stage")
     pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text()).group(1)
-    if a.all:
-        a.launcher = True
-    elif not a.target:
-        sys.exit("logs: name a title, or --all")
     bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
     obb_src = root / "pull" / pkg / "obb"
@@ -368,6 +364,10 @@ async def cmd_stage(a):
 
 async def cmd_logs(a):
     """Pull the runtime's boot log and crash reports out of a title's container."""
+    if a.all:
+        a.launcher = True
+    elif not a.target:
+        sys.exit("logs: name a title, or --all")
     from pymobiledevice3.services.house_arrest import HouseArrestService
     bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
