@@ -36,7 +36,10 @@ the right controller:
 - **Selecting.** The trigger is pressed by any system select —
   **Dwell Control** (hold your gaze), **Voice Control**, or a pinch — or by
   saying **"select"**.
-- **Everything else, by voice.** Recognised on the device, no network:
+- **Everything else, by voice.** Apple's speech recognition turns speech into
+  words — on the headset whenever it supports the language (English does),
+  over Apple's servers only if it cannot — and metavision maps a fixed set of
+  words to controller buttons. The title itself never hears audio:
 
 | Say | Does |
 |---|---|
