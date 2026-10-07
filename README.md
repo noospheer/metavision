@@ -4,7 +4,7 @@ Quest → Vision Pro title pipeline.
 
 metavision was started to bring the [Cyberdelic](https://www.cyberdelic.nexus/)
 library — immersive art, meditation and consciousness titles built for Quest —
-to the Apple Vision Pro. Nothing in it is specific to that library: it works on
+to the Apple Vision Pro. Nothing in metavision is specific to that library: it works on
 any Quest titles you own.
 
 Pull APKs from a Quest you own, triage them for compatibility, relink ARM64 ELF
