@@ -220,6 +220,9 @@ sudo tools/metavision-device install mv_<title>.ipa
 - Klepton syncs ANGLE with `DEPOT_TOOLS_UPDATE=0`, which also skips
   depot_tools' one-time bootstrap. A fresh runner fails in `gn` with
   `python3_bin_reldir.txt not found` unless `ensure_bootstrap` runs first.
+- Fetch MoltenVK (`make mvk`) before `make xros`, even for GLES-only titles:
+  the runtime's no-Vulkan stub lacks `kl_vulkan_display_luid` and
+  `kl_vulkan_capture_layers`, so the link fails without it.
 - The memory entitlements (`increased-memory-limit`,
   `extended-virtual-addressing`) need an **explicit** App ID per title, so a
   wildcard profile cannot sign these builds; automatic signing with the API key

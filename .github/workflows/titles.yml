@@ -111,6 +111,9 @@ jobs:
 
       - name: Runtime and translator
         run: |
+          # MoltenVK first: the runtime links only with it present (the no-Vulkan
+          # stub in kl_vulkan.c lacks symbols kl_ovrp.c references).
+          (cd "$K" && make mvk)
           (cd "$K" && make build/klepton-ld)
           (cd "$K" && make xros)
 
