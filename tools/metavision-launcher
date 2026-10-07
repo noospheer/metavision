@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# metavision-launcher — prepare the single metavision app: many titles, one bundle.
+#
+# Runs on the macOS build host after tools/metavision-overlay (with
+# MV_LAUNCHER=1, so the library screen is the root) and `make xros`:
+#
+#   1. translate every title into visionos/Frameworks/<target>/ (mkguest.sh)
+#   2. generate the Xcode project for the "metavision" row, whose guest
+#      directory is pointed at the first title only so the generator finds one
+#   3. rewrite the project: drop that flat guest embed and add one
+#      "Embed <target>" copy phase per title into Frameworks/<target>/,
+#      code-signed on copy like everything else Xcode embeds
+#
+# Leaves visionos/metavision.xcodeproj ready for `xcodebuild archive`.
+#
+# usage: tools/metavision-launcher TARGET...
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+V="$ROOT/vendor/klepton/visionos"
+[ $# -gt 0 ] || { sed -n '2,17p' "$0"; exit 2; }
+cd "$V"
+
+for t in "$@"; do
+    echo "== translate $t"
+    KLEPTON_TARGET=$t ./mkguest.sh | tail -2
+done
+./mkangle.sh | tail -1
+
+# The generator embeds the guest of the target it is generating for; give the
+# launcher row the first title's frameworks so it resolves, then replace that
+# embed below.
+python3 - "$V/targets.py" "$1" <<'PY'
+import sys
+p, first = sys.argv[1], sys.argv[2]
+s = open(p).read()
+anchor = "    TARGETS.setdefault(_k, _v)\n"
+line = (f"TARGETS['metavision'].update({{k: TARGETS[{first!r}][k] for k in "
+        f"('libs', 'srcdir', 'tree', 'apk', 'assets', 'obb', 'entry', 'kind')}})  # metavision-launcher\n")
+if "# metavision-launcher" in s:
+    s = "".join(l for l in s.splitlines(True) if "# metavision-launcher" not in l)
+assert anchor in s, "generated block not found in targets.py (run metavision-overlay first)"
+s = s.replace(anchor, anchor + line, 1)
+open(p, "w").write(s)
+PY
+rm -rf Frameworks/metavision
+ln -s "$1" Frameworks/metavision
+KLEPTON_TARGET=metavision python3 gen_xcodeproj.py | head -6
+
+python3 - "$V/metavision.xcodeproj/project.pbxproj" "$@" <<'EOF'
+import hashlib, os, re, sys
+pbx, targets = sys.argv[1], sys.argv[2:]
+s = open(pbx).read()
+here = os.path.dirname(os.path.dirname(pbx))
+
+def oid(*parts):
+    return hashlib.md5("/".join(("mv",) + parts).encode()).hexdigest()[:24].upper()
+
+def insert_before(marker, text):
+    global s
+    i = s.index(marker)
+    s = s[:i] + text + s[i:]
+
+# 1 — drop the generator's flat embed of Frameworks/metavision/*
+refs = dict(re.findall(r'\t\t(\w{24}) = \{isa = PBXFileReference;[^\n]*?path = "(Frameworks/metavision/[^"]+)"', s))
+blds = {b for b, r in re.findall(r'\t\t(\w{24}) /\* [^*]+ in Embed \*/ = \{isa = PBXBuildFile; fileRef = (\w{24});', s) if r in refs}
+for b in blds:
+    s = re.sub(r'\t+%s,\n' % b, "", s)                                  # from the Embed phase's files
+    s = re.sub(r'\t\t%s /\* [^\n]*\n' % b, "", s)                        # the build-file entry
+for r in refs:
+    s = re.sub(r'\t+%s,\n' % r, "", s)                                  # from the Frameworks group
+    s = re.sub(r'\t\t%s = \{isa = PBXFileReference;[^\n]*\n' % r, "", s)  # the file reference
+print(f"  removed the flat embed of {len(refs)} framework(s)")
+
+# 2 — one copy phase per title, into Frameworks/<target>/
+buildfiles, filerefs, phases, phase_ids, group_children = [], [], [], [], []
+for t in targets:
+    fws = sorted(f for f in os.listdir(os.path.join(here, "Frameworks", t)) if f.endswith(".xcframework"))
+    files = []
+    for fw in fws:
+        ref, bld = oid(t, fw, "ref"), oid(t, fw, "bld")
+        filerefs.append(f'\t\t{ref} = {{isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; '
+                        f'name = "{t}/{fw}"; path = "Frameworks/{t}/{fw}"; sourceTree = "<group>"; }};\n')
+        buildfiles.append(f'\t\t{bld} /* {fw} in Embed {t} */ = {{isa = PBXBuildFile; fileRef = {ref}; '
+                          f'settings = {{ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }}; }};\n')
+        files.append(f'\t\t\t\t{bld},\n')
+        group_children.append(f'\t\t\t\t{ref},\n')
+    pid = oid(t, "phase")
+    phase_ids.append(f'\t\t\t\t{pid},\n')
+    phases.append(f'\t\t{pid} /* Embed {t} */ = {{\n\t\t\tisa = PBXCopyFilesBuildPhase;\n'
+                  f'\t\t\tbuildActionMask = 2147483647;\n\t\t\tdstPath = "{t}";\n\t\t\tdstSubfolderSpec = 10;\n'
+                  f'\t\t\tfiles = (\n{"".join(files)}\t\t\t);\n\t\t\tname = "Embed {t}";\n'
+                  f'\t\t\trunOnlyForDeploymentPostprocessing = 0;\n\t\t}};\n')
+    print(f"  {t}: {len(fws)} framework(s) -> Frameworks/{t}/")
+
+insert_before("/* End PBXBuildFile section */", "".join(buildfiles))
+insert_before("/* End PBXFileReference section */", "".join(filerefs))
+insert_before("/* End PBXCopyFilesBuildPhase section */", "".join(phases))
+
+# the native target's buildPhases list, and the Frameworks group's children
+m = re.search(r'(isa = PBXNativeTarget;.*?buildPhases = \(\n)(.*?)(\t+\);)', s, re.S)
+s = s[:m.end(2)] + "".join(phase_ids) + s[m.end(2):]
+g = re.search(r'/\* Frameworks \*/ = \{\n\t\t\tisa = PBXGroup;\n\t\t\tchildren = \(\n', s)
+if g:
+    s = s[:g.end()] + "".join(group_children) + s[g.end():]
+
+open(pbx, "w").write(s)
+print(f"  {pbx}: {len(targets)} title(s) embedded")
+EOF
+rm -f Frameworks/metavision

@@ -218,6 +218,22 @@ openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass file:build/guest-bundle.k
 sudo tools/metavision-device install mv_<title>.ipa
 ```
 
+### One app for every title: the metavision launcher
+
+```bash
+gh workflow run titles -f targets="mv_<title> mv_<title> ..." -f launcher=true
+sudo tools/metavision-device install metavision.ipa
+sudo tools/metavision-device stage mv_<title> --launcher     # once per title
+```
+
+The launcher opens on a library of the titles it carries; choosing one boots
+it. A process boots one title, so close the app to choose another. Each title
+keeps its data under `Documents/<title>/` in the launcher's container.
+
+Runtime switches for any app opened from the Home View go in
+`Documents/klepton.env`: `sudo tools/metavision-device env mv_<title> KEY=VALUE ...`
+(add `--launcher` for the launcher), and `logs` pulls the boot log back.
+
 ### CI details worth knowing
 
 - Klepton's Makefile finds `angle-patches/` through `$(PWD)`; run its make from

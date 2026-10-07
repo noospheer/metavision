@@ -242,7 +242,7 @@ async def cmd_stage(a):
     if not (tree / "apktool.yml").exists() or not apk.exists():
         sys.exit(f"{a.target} is not staged: tools/metavision-targets stage")
     pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text()).group(1)
-    bundle = a.bundle or ("metavision.launcher" if a.launcher else
+    bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
     obb_src = root / "pull" / pkg / "obb"
     files_root = f"Documents/{t['tree']}/android-files" if a.launcher else "Documents/android-files"
@@ -274,7 +274,7 @@ async def cmd_stage(a):
 async def cmd_logs(a):
     """Pull the runtime's boot log and crash reports out of a title's container."""
     from pymobiledevice3.services.house_arrest import HouseArrestService
-    bundle = a.bundle or ("metavision.launcher" if a.launcher else
+    bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
     out = Path(a.out or f"build/logs/{a.target}")
     out.mkdir(parents=True, exist_ok=True)
@@ -295,7 +295,7 @@ async def cmd_logs(a):
 async def cmd_env(a):
     """Write Documents/klepton.env: the runtime's switches for a hand-launched app."""
     from pymobiledevice3.services.house_arrest import HouseArrestService
-    bundle = a.bundle or ("metavision.launcher" if a.launcher else
+    bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
                           "metavision.dev.klepton.target." + a.target.replace("_", "-"))
     for kv in a.vars:
         if "=" not in kv:

@@ -27,6 +27,10 @@ on:
         description: "Space-separated mv_ targets (tools/metavision-targets list)"
         required: true
         default: "mv_<title>"
+      launcher:
+        description: "One metavision app with all of them, instead of one app per title"
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -99,6 +103,8 @@ jobs:
           echo "bundled: $(tr '\n' ' ' < build/guests/BUNDLED)"
 
       - name: Overlay metavision onto Klepton
+        env:
+          MV_LAUNCHER: ${{ github.event.inputs.launcher == 'true' && '1' || '0' }}
         run: tools/metavision-overlay
 
       - name: Signing material
@@ -129,6 +135,7 @@ jobs:
           (cd "$K" && make xros)
 
       - name: Build each target
+        if: github.event.inputs.launcher != 'true'
         env:
           TARGETS: ${{ github.event.inputs.targets }}
           KLEPTON_TEAM: ${{ secrets.APPLE_TEAM_ID }}
@@ -173,6 +180,38 @@ jobs:
             echo "::endgroup::"
           done
           ls -la out
+
+      - name: Build the metavision launcher
+        if: github.event.inputs.launcher == 'true'
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
+          KLEPTON_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+          KLEPTON_BUNDLE_SCOPE: metavision
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          MV_GUEST_KEY: ${{ secrets.MV_GUEST_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          tools/metavision-launcher $TARGETS
+          cd "$K/visionos"
+          AUTH="-allowProvisioningUpdates -authenticationKeyPath $HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8 -authenticationKeyID $ASC_KEY_ID -authenticationKeyIssuerID $ASC_ISSUER_ID"
+          xcodebuild -project metavision.xcodeproj -scheme metavision -configuration Debug \
+            -destination 'generic/platform=visionOS' -archivePath build/metavision.xcarchive archive $AUTH
+          cat > build/export.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>debugging</string>
+            <key>teamID</key><string>$KLEPTON_TEAM</string>
+            <key>signingStyle</key><string>automatic</string>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath build/metavision.xcarchive \
+            -exportOptionsPlist build/export.plist -exportPath build/export-metavision $AUTH
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$MV_GUEST_KEY" \
+            -in build/export-metavision/*.ipa -out "$GITHUB_WORKSPACE/out/metavision.ipa.enc"
+          ls -la "$GITHUB_WORKSPACE/out"
 
       - uses: actions/upload-artifact@v4
         with:
