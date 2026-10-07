@@ -255,6 +255,31 @@ grep -q 'dev.klepton.guest.${KLT_NAME' "$M" || {
 }
 echo "overlay: library screen generated; guest framework IDs carry the target"
 
+# 5b — older Oculus XR Plugin (1.x, Unity 2019.4): its OculusUnity hands the
+# display surface to the native side through initComplete(Surface), not the
+# newer surfaceCreated(Surface) that Klepton's initOculus calls. Without a
+# surface the plugin never starts its display: ten OVRPlugin calls, then no
+# SetupDisplayObjects and no frames. Same signature, so fall back to it.
+J="$K/runtime/jni/kl_jni_services.c"
+if ! grep -q 'metavision: older Oculus XR Plugin' "$J"; then
+    python3 - "$J" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ('        if (img)\n'
+       '            fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_surfaceCreated");\n')
+new = ('        if (img) {\n'
+       '            fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_surfaceCreated");\n'
+       '            // metavision: older Oculus XR Plugin (1.x) names it initComplete(Surface)\n'
+       '            if (!fn && (fn = kl_sym(img, "Java_com_unity_oculus_OculusUnity_initComplete")))\n'
+       '                fprintf(stderr, "  [jni] older Oculus XR Plugin: surface handed over through initComplete\\n");\n'
+       '        }\n')
+if s.count(old) != 1:
+    sys.exit("overlay: kl_jni_services.c surfaceCreated anchor moved upstream")
+open(p, "w").write(s.replace(old, new))
+EOF
+fi
+echo "overlay: older Oculus XR Plugin surface handshake (initComplete)"
+
 # 6 — hands-free input (eyes and voice), klepton-overlay/MetavisionHandsFree.swift
 #
 # When no hand or Sense controller tracks the right controller, it becomes a
