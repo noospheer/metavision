@@ -19,6 +19,7 @@ support, with the workarounds visionOS currently needs (see docs/SETUP.md):
     sudo metavision-device devmode reveal    show Developer Mode in Settings
     sudo metavision-device devmode accept    confirm it after the restart
     sudo metavision-device install APP.ipa   install a signed build
+    sudo metavision-device stage mv_<title>  copy its APK, assets and OBB into the app
     metavision-device register --udid U      add the headset to your Apple team
                                              (App Store Connect API key, see SETUP)
 
@@ -215,6 +216,57 @@ async def cmd_install(a):
     await with_rsd(a, fn)
 
 
+async def cmd_stage(a):
+    """Copy a title's data into its app's container, in the layout kl_app.c reads:
+
+        Documents/<tree>.apk                    the APK (Unity opens it as a zip)
+        Documents/<tree>/assets/                decoded assets
+        Documents/<tree>/apktool.yml, AndroidManifest.xml
+        Documents/android-files/<obb path>/     OBB, single-title app
+        Documents/<tree>/android-files/<obb>/   OBB, inside the metavision launcher
+    """
+    import re
+    from pymobiledevice3.services.house_arrest import HouseArrestService
+
+    root = Path(__file__).resolve().parent.parent
+    guests = root / "build" / "guests"
+    rows = json.loads((guests / "targets.json").read_text())
+    if a.target not in rows:
+        sys.exit(f"unknown target {a.target}; see tools/metavision-targets list")
+    t = rows[a.target]
+    tree, apk = guests / t["tree"], guests / t["apk"]
+    if not (tree / "apktool.yml").exists() or not apk.exists():
+        sys.exit(f"{a.target} is not staged: tools/metavision-targets stage")
+    pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text()).group(1)
+    bundle = a.bundle or ("metavision.launcher" if a.launcher else
+                          "metavision.dev.klepton.target." + a.target.replace("_", "-"))
+    obb_src = root / "pull" / pkg / "obb"
+    files_root = f"Documents/{t['tree']}/android-files" if a.launcher else "Documents/android-files"
+
+    async def fn(rsd):
+        afc = await HouseArrestService.create(rsd, bundle)
+        try:
+            await afc.makedirs(f"Documents/{t['tree']}")
+            for m in ("apktool.yml", "AndroidManifest.xml"):
+                await afc.push(str(tree / m), f"Documents/{t['tree']}/{m}", progress_bar=False)
+            print(f"  apk     -> Documents/{t['apk']}", flush=True)
+            await afc.push(str(apk), f"Documents/{t['apk']}")
+            if (tree / "assets").is_dir():
+                print(f"  assets  -> Documents/{t['tree']}/assets", flush=True)
+                await afc.push(str(tree / "assets"), f"Documents/{t['tree']}")
+            obbs = sorted(obb_src.glob("*")) if obb_src.is_dir() and not a.skip_obb else []
+            if obbs:
+                dest = f"{files_root}/{t['obb']}"
+                await afc.makedirs(dest)
+                for f in obbs:
+                    print(f"  obb     -> {dest}/{f.name} ({f.stat().st_size / 1e9:.2f} GB)", flush=True)
+                    await afc.push(str(f), f"{dest}/{f.name}")
+        finally:
+            await afc.close()
+        print(f"staged {a.target} into {bundle}")
+    await with_rsd(a, fn)
+
+
 # ---------------------------------------------------------------- register
 def asc_token():
     try:
@@ -258,12 +310,16 @@ def main():
     sub.add_parser("info")
     p = sub.add_parser("devmode"); p.add_argument("action", choices=["reveal", "enable", "accept"])
     p = sub.add_parser("install"); p.add_argument("ipa")
+    p = sub.add_parser("stage"); p.add_argument("target")
+    p.add_argument("--bundle", help="app bundle id (default: the title's own app)")
+    p.add_argument("--launcher", action="store_true", help="stage into the metavision launcher's layout")
+    p.add_argument("--skip-obb", action="store_true", help="leave OBBs alone (already copied)")
     p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
     a = ap.parse_args()
     if a.cmd == "register":
         return cmd_register(a)
     asyncio.run({"discover": cmd_discover, "pair": cmd_pair, "info": cmd_info,
-                 "devmode": cmd_devmode, "install": cmd_install}[a.cmd](a))
+                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage}[a.cmd](a))
 
 
 if __name__ == "__main__":
