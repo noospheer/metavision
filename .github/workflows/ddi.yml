@@ -1,0 +1,34 @@
+# The visionOS developer disk image, for launching apps from Linux.
+#
+# Apple's developer services on a device (process launch, screenshots) need a
+# personalized developer disk image mounted, and Xcode is its only source. This
+# copies Xcode's visionOS one off the runner, encrypted with MV_GUEST_KEY like
+# every other private artifact; tools/metavision-device mounts it.
+name: ddi
+on: workflow_dispatch
+jobs:
+  ddi:
+    runs-on: macos-26
+    steps:
+      - name: Find the visionOS DDI
+        run: |
+          set -euo pipefail
+          xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
+          echo "Xcode: $(xcode-select -p)"
+          find /Library/Developer/DeveloperDiskImages "$(xcode-select -p)/.." -maxdepth 6 \
+               \( -iname '*xrOS*DDI*' -o -iname '*visionOS*DDI*' \) 2>/dev/null | tee found.txt
+          D=$(grep -m1 -iE 'xrOS_DDI$|visionOS_DDI$|DDI$' found.txt || head -1 found.txt)
+          [ -n "$D" ] || { echo "no visionOS DDI found"; find / -maxdepth 7 -iname '*DDI*' 2>/dev/null | head -40; exit 1; }
+          ls -laR "$D" | head -40
+          tar czf ddi.tar.gz -C "$(dirname "$D")" "$(basename "$D")"
+          ls -la ddi.tar.gz
+      - name: Encrypt
+        env:
+          MV_GUEST_KEY: ${{ secrets.MV_GUEST_KEY }}
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -pass env:MV_GUEST_KEY -in ddi.tar.gz -out visionos-ddi.tar.gz.enc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visionos-ddi-encrypted
+          path: visionos-ddi.tar.gz.enc
+          retention-days: 7
