@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Pair with, inspect and prepare an Apple Vision Pro from Linux.
+
+No Mac or Xcode involved: everything goes through pymobiledevice3's RemoteXPC
+support, with the workarounds visionOS currently needs (see docs/SETUP.md):
+
+  * Manual pairing shows a 6-digit PIN on the headset. pymobiledevice3 only
+    asks for a PIN on Apple TV and otherwise sends "000000", which the headset
+    rejects (KeyError 'PROOF'). This tool asks for it.
+  * visionOS 26+ omits peerDeviceInfo from the pairing handshake, which
+    pymobiledevice3 reads for the device identifier; the identifier is taken
+    from the pairing record instead.
+  * Over the tunnel, lockdown services carry a `.shim.remote` suffix
+    (AMFI is com.apple.amfi.lockdown.shim.remote); names are retried with it.
+
+    metavision-device discover               headsets in pairing mode (no root)
+    metavision-device pair                   pair; type the PIN the headset shows
+    sudo metavision-device info              UDID, model, OS (opens a tunnel: root)
+    sudo metavision-device devmode reveal    show Developer Mode in Settings
+    sudo metavision-device devmode accept    confirm it after the restart
+    sudo metavision-device install APP.ipa   install a signed build
+    metavision-device register --udid U      add the headset to your Apple team
+                                             (App Store Connect API key, see SETUP)
+
+Tunnel commands need root only to create the TUN interface; pairing records
+are read from the invoking user's data directory either way.
+"""
+import argparse
+import asyncio
+import glob
+import json
+import os
+import pwd
+import sys
+import time
+from pathlib import Path
+
+
+# ---- pairing records live in the invoking user's home, even under sudo ----
+def _user_data_home():
+    user = os.environ.get("SUDO_USER")
+    home = Path(pwd.getpwnam(user).pw_dir) if user else Path.home()
+    return home / ".local" / "share"
+
+
+os.environ.setdefault("XDG_DATA_HOME", str(_user_data_home()))
+
+try:
+    from pymobiledevice3.remote import tunnel_service as ts
+    from pymobiledevice3.remote.remote_service_discovery import RemoteServiceDiscoveryService
+except ImportError:
+    sys.exit("pymobiledevice3 is required: pip install pymobiledevice3")
+
+
+def records_dir():
+    for d in (Path(os.environ["XDG_DATA_HOME"]) / "pymobiledevice3",
+              _user_data_home().parent.parent / ".pymobiledevice3"):
+        if d.is_dir():
+            return d
+    return Path(os.environ["XDG_DATA_HOME"]) / "pymobiledevice3"
+
+
+def paired_identifier(explicit=None):
+    if explicit:
+        return explicit
+    ids = [Path(p).stem[len("remote_"):] for p in glob.glob(str(records_dir() / "remote_*.plist"))]
+    if not ids:
+        sys.exit("no pairing record found: run `metavision-device pair` first")
+    if len(ids) > 1:
+        sys.exit("several paired devices; pass --identifier one of: " + ", ".join(ids))
+    return ids[0]
+
+
+def patch_handshake(identifier):
+    """visionOS 26+ handshakes carry no peerDeviceInfo."""
+    orig_id = ts.RemotePairingProtocol.remote_identifier
+    orig_model = ts.RemotePairingProtocol.remote_device_model
+
+    def _id(self):
+        try:
+            return orig_id.fget(self)
+        except (KeyError, TypeError):
+            return identifier
+
+    def _model(self):
+        try:
+            return orig_model.fget(self)
+        except (KeyError, TypeError):
+            return "RealityDevice"
+
+    ts.RemotePairingProtocol.remote_identifier = property(_id)
+    ts.RemotePairingProtocol.remote_device_model = property(_model)
+
+
+def patch_shim_names():
+    """Retry lockdown service names with the RSD `.shim.remote` suffix."""
+    orig = RemoteServiceDiscoveryService.start_lockdown_service
+
+    async def start(self, name, *a, **kw):
+        services = self.peer_info.get("Services", {}) if self.peer_info else {}
+        if name not in services and f"{name}.shim.remote" in services:
+            name = f"{name}.shim.remote"
+        return await orig(self, name, *a, **kw)
+
+    RemoteServiceDiscoveryService.start_lockdown_service = start
+
+
+# ---------------------------------------------------------------- discover / pair
+async def manual_pairing_devices():
+    from pymobiledevice3.bonjour import browse_remotepairing_manual_pairing
+    seen = {}
+    for answer in await browse_remotepairing_manual_pairing():
+        ident = answer.properties["identifier"]
+        for addr in answer.addresses:
+            ip = addr.full_ip
+            # one entry per device; prefer IPv4 (link-local v6 needs a scope id)
+            if ident not in seen or (":" in seen[ident]["ip"] and ":" not in ip):
+                seen[ident] = {"identifier": ident, "name": answer.properties["name"], "ip": ip, "port": answer.port}
+    return list(seen.values())
+
+
+async def cmd_discover(a):
+    devs = await manual_pairing_devices()
+    if not devs:
+        print("none found: open Settings > General > Remote Devices on the headset, same network as this machine")
+    for d in devs:
+        print(f"{d['name']}  {d['ip']}:{d['port']}  {d['identifier']}")
+
+
+async def cmd_pair(a):
+    devs = await manual_pairing_devices()
+    if a.identifier:
+        devs = [d for d in devs if d["identifier"] == a.identifier]
+    if not devs:
+        sys.exit("no headset in pairing mode: open Settings > General > Remote Devices")
+    if len(devs) > 1:
+        sys.exit("several headsets in pairing mode; pass --identifier:\n" +
+                 "\n".join(f"  {d['identifier']}  {d['name']}" for d in devs))
+    d = devs[0]
+    print(f"pairing with {d['name']} at {d['ip']}")
+
+    orig = ts.RemotePairingProtocol._init_srp_context
+
+    def with_pin(self, res):
+        pin = res.pin
+        if not pin:
+            if a.pin_file:
+                print(f"waiting for the PIN in {a.pin_file}", flush=True)
+                while not os.path.exists(a.pin_file):
+                    time.sleep(0.5)
+                pin = Path(a.pin_file).read_text().strip()
+            else:
+                pin = input("PIN shown on the headset: ").strip()
+            res = res._replace(pin=pin)
+        return orig(self, res)
+
+    ts.RemotePairingProtocol._init_srp_context = with_pin
+    try:
+        async with ts.RemotePairingManualPairingService(d["identifier"], d["ip"], d["port"]) as s:
+            await s.connect(autopair=True)
+    except Exception as e:
+        if type(e).__name__ != "RemotePairingCompletedError":   # this is how success is reported
+            raise
+    print(f"paired: {d['identifier']}  (record in {records_dir()})")
+
+
+# ---------------------------------------------------------------- tunnel commands
+async def with_rsd(a, fn):
+    if os.geteuid() != 0:
+        sys.exit("this command opens a tunnel, which needs root: run it with sudo")
+    ident = paired_identifier(a.identifier)
+    patch_handshake(ident)
+    patch_shim_names()
+    svcs = await ts.get_remote_pairing_tunnel_services(5)
+    svcs = [s for s in svcs if ":" not in str(getattr(s, "hostname", ""))] or svcs
+    if not svcs:
+        sys.exit("headset not reachable: is it awake and on the same network?")
+    async with ts.start_tunnel_over_remotepairing(svcs[0], protocol=ts.TunnelProtocol.TCP) as t:
+        rsd = RemoteServiceDiscoveryService((t.address, t.port))
+        await rsd.connect()
+        try:
+            return await fn(rsd)
+        finally:
+            await rsd.close()
+
+
+async def cmd_info(a):
+    async def fn(rsd):
+        p = rsd.peer_info.get("Properties", {})
+        print(json.dumps({k: p.get(k) for k in ("UniqueDeviceID", "ProductType", "OSVersion", "BuildVersion", "DeviceClass")}, indent=2))
+    await with_rsd(a, fn)
+
+
+async def cmd_devmode(a):
+    from pymobiledevice3.services.amfi import AmfiService
+    action = {"reveal": AmfiService.DEVELOPER_MODE_REVEAL, "enable": AmfiService.DEVELOPER_MODE_ENABLE,
+              "accept": AmfiService.DEVELOPER_MODE_ACCEPT}[a.action]
+
+    async def fn(rsd):
+        svc = await rsd.start_lockdown_service(AmfiService.SERVICE_NAME)
+        resp = await svc.send_recv_plist({"action": action})
+        print(resp)
+        if a.action == "enable" and "passcode" in str(resp).lower():
+            print("expected with a passcode set: use `reveal`, or attempt an install, then turn it on in Settings")
+    await with_rsd(a, fn)
+
+
+async def cmd_install(a):
+    from pymobiledevice3.services.installation_proxy import InstallationProxyService
+
+    async def fn(rsd):
+        svc = InstallationProxyService(lockdown=rsd)
+        await svc.install_from_local(a.ipa)
+        print(f"installed {a.ipa}")
+    await with_rsd(a, fn)
+
+
+# ---------------------------------------------------------------- register
+def asc_token():
+    try:
+        import jwt
+    except ImportError:
+        sys.exit("pip install pyjwt cryptography")
+    key = Path(os.environ["MV_ASC_KEY_P8"]).read_text()
+    now = int(time.time())
+    return jwt.encode({"iss": os.environ["MV_ASC_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+                      key, algorithm="ES256", headers={"kid": os.environ["MV_ASC_KEY_ID"], "typ": "JWT"})
+
+
+def cmd_register(a):
+    import urllib.request
+    for v in ("MV_ASC_KEY_P8", "MV_ASC_KEY_ID", "MV_ASC_ISSUER_ID"):
+        if v not in os.environ:
+            sys.exit(f"set {v} (see docs/SETUP.md, App Store Connect API key)")
+    # The API has no visionOS platform value: a Vision Pro registers as IOS and
+    # comes back with deviceClass APPLE_VISION_PRO.
+    body = json.dumps({"data": {"type": "devices", "attributes": {"name": a.name, "platform": "IOS", "udid": a.udid}}}).encode()
+    req = urllib.request.Request("https://api.appstoreconnect.apple.com/v1/devices", data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {asc_token()}", "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as r:
+            d = json.load(r)["data"]["attributes"]
+            print(f"registered {d['name']}: {d['deviceClass']} {d['status']}")
+    except urllib.error.HTTPError as e:
+        msg = e.read().decode()
+        if "already exists" in msg or e.code == 409:
+            print("already registered (or rejected):", msg[:300])
+        else:
+            raise
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--identifier", help="pairing identifier, when more than one device is paired")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("discover")
+    p = sub.add_parser("pair"); p.add_argument("--pin-file", help="read the PIN from this file instead of a prompt")
+    sub.add_parser("info")
+    p = sub.add_parser("devmode"); p.add_argument("action", choices=["reveal", "enable", "accept"])
+    p = sub.add_parser("install"); p.add_argument("ipa")
+    p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
+    a = ap.parse_args()
+    if a.cmd == "register":
+        return cmd_register(a)
+    asyncio.run({"discover": cmd_discover, "pair": cmd_pair, "info": cmd_info,
+                 "devmode": cmd_devmode, "install": cmd_install}[a.cmd](a))
+
+
+if __name__ == "__main__":
+    main()

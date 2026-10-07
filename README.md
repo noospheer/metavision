@@ -5,7 +5,9 @@ Quest → Vision Pro title pipeline.
 Pull APKs from a Quest you own, triage them for compatibility, relink ARM64 ELF
 to Mach-O, and build a signed visionOS launcher that loads them.
 
-**Read [METAVISION.md](METAVISION.md) before running anything.** The pipeline
+**Read [METAVISION.md](METAVISION.md) before running anything**, and
+[docs/SETUP.md](docs/SETUP.md) for the accounts, signing and headset setup —
+every step, and every place it is easy to get stuck. The pipeline
 only makes sense once you understand the constraint it is built around: on
 visionOS, executable code cannot be sideloaded, so titles are compiled into the
 app and only their assets are syncable.
@@ -86,6 +88,10 @@ tools/metavision-guest-bundle mv_<title> ...  # -> build/guest-bundle.tar.gz.enc
 gh release upload guests build/guest-bundle.tar.gz.enc --repo <you>/<private-repo> --clobber
 gh workflow run titles -f targets="mv_<title> ..."
 ```
+
+Account, signing and headset setup, step by step: [docs/SETUP.md](docs/SETUP.md).
+`tools/metavision-signing` makes the certificate and sets every secret;
+`tools/metavision-device` pairs, registers and installs.
 
 `tools/build-klepton-ld-linux.sh` builds the translator here if you want to
 inspect translations locally. The workflow (`.github/workflows/titles.yml`)

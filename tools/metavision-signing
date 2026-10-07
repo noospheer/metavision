@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# metavision-signing — Apple signing material for CI, made on Linux.
+#
+# Xcode normally makes the certificate request and keeps the private key in
+# the macOS keychain. Here the key is made with openssl and never leaves
+# build/certs/ (mode 700); only the certificate comes back from Apple.
+#
+#   tools/metavision-signing csr                  key + certificate request -> upload to Apple
+#   tools/metavision-signing p12 development.cer  pair Apple's certificate with the key
+#   tools/metavision-signing asc-check            verify the App Store Connect API key
+#   tools/metavision-signing secrets --repo OWNER/REPO
+#                                                 set every CI secret from local files
+#
+# Inputs for asc-check / secrets, from the environment:
+#   MV_ASC_KEY_P8 (path to AuthKey_XXXX.p8)  MV_ASC_KEY_ID  MV_ASC_ISSUER_ID  MV_TEAM_ID
+#   MV_GUESTS_REPO (OWNER/private-repo)      MV_GUESTS_TOKEN (fine-grained, read-only)
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+C="$ROOT/build/certs"
+mkdir -p "$C" && chmod 700 "$C"
+die() { echo "signing: $*" >&2; exit 1; }
+
+case "${1:-}" in
+csr)
+    [ -f "$C/dev.key" ] || (umask 077; openssl genrsa -out "$C/dev.key" 2048 2>/dev/null)
+    # Apple ignores the subject's contents; any values work.
+    openssl req -new -key "$C/dev.key" -out "$C/dev.certSigningRequest" -subj "/CN=metavision CI/C=US"
+    cat <<EOF
+$C/dev.certSigningRequest
+
+Upload it: developer.apple.com/account > Certificates, IDs & Profiles >
+Certificates > + > "Apple Development" > upload > Download. Then:
+    tools/metavision-signing p12 ~/Downloads/development.cer
+EOF
+    ;;
+p12)
+    cer=${2:?usage: metavision-signing p12 development.cer}
+    [ -f "$C/dev.key" ] || die "no private key: run 'csr' first (the .cer only pairs with that key)"
+    openssl x509 -inform DER -in "$cer" -out "$C/dev.pem" 2>/dev/null || openssl x509 -in "$cer" -out "$C/dev.pem"
+    [ "$(openssl x509 -in "$C/dev.pem" -noout -modulus | sha256sum)" = "$(openssl rsa -in "$C/dev.key" -noout -modulus 2>/dev/null | sha256sum)" ] ||
+        die "certificate does not match build/certs/dev.key (was the request made on another machine?)"
+    openssl x509 -in "$C/dev.pem" -noout -subject -enddate
+    [ -f "$C/dev.p12.pass" ] || (umask 077; openssl rand -base64 24 > "$C/dev.p12.pass")
+    # 3DES/SHA1, not OpenSSL 3's AES default: `security import` on the macOS
+    # runner rejects the newer PKCS#12 encryption.
+    openssl pkcs12 -export -inkey "$C/dev.key" -in "$C/dev.pem" -name "metavision CI" \
+        -certpbe PBE-SHA1-3DES -keypbe PBE-SHA1-3DES -macalg sha1 \
+        -passout "file:$C/dev.p12.pass" -out "$C/dev.p12"
+    chmod 600 "$C/dev.p12"
+    echo "$C/dev.p12 (password in $C/dev.p12.pass)"
+    ;;
+asc-check)
+    : "${MV_ASC_KEY_P8:?}" "${MV_ASC_KEY_ID:?}" "${MV_ASC_ISSUER_ID:?}"
+    python3 - <<'EOF'
+import json, os, time, urllib.request
+try:
+    import jwt
+except ImportError:
+    raise SystemExit("pip install pyjwt cryptography")
+now = int(time.time())
+tok = jwt.encode({"iss": os.environ["MV_ASC_ISSUER_ID"], "iat": now, "exp": now + 600, "aud": "appstoreconnect-v1"},
+                 open(os.environ["MV_ASC_KEY_P8"]).read(), algorithm="ES256",
+                 headers={"kid": os.environ["MV_ASC_KEY_ID"], "typ": "JWT"})
+for path in ("certificates", "devices", "bundleIds"):
+    req = urllib.request.Request(f"https://api.appstoreconnect.apple.com/v1/{path}?limit=200",
+                                 headers={"Authorization": f"Bearer {tok}"})
+    with urllib.request.urlopen(req) as r:
+        data = json.load(r)["data"]
+    print(f"{path}: {len(data)}")
+    for d in data:
+        a = d["attributes"]
+        print("   ", " ".join(str(a.get(k)) for k in ("certificateType", "deviceClass", "status", "identifier", "expirationDate") if a.get(k)))
+EOF
+    ;;
+secrets)
+    [ "${2:-}" = --repo ] && [ -n "${3:-}" ] || die "usage: metavision-signing secrets --repo OWNER/REPO"
+    R=$3
+    : "${MV_ASC_KEY_P8:?}" "${MV_ASC_KEY_ID:?}" "${MV_ASC_ISSUER_ID:?}" "${MV_TEAM_ID:?}" "${MV_GUESTS_REPO:?}" "${MV_GUESTS_TOKEN:?}"
+    [ -f "$C/dev.p12" ] || die "no build/certs/dev.p12: run csr, then p12"
+    [ -f "$ROOT/build/guest-bundle.key" ] || die "no build/guest-bundle.key: run tools/metavision-guest-bundle once"
+    base64 -w0 "$C/dev.p12"              | gh secret set SIGNING_P12          --repo "$R"
+    gh secret set SIGNING_P12_PASSWORD   --repo "$R" < "$C/dev.p12.pass"
+    openssl rand -base64 24              | gh secret set KEYCHAIN_PASSWORD    --repo "$R"
+    gh secret set ASC_KEY_P8             --repo "$R" < "$MV_ASC_KEY_P8"
+    printf '%s' "$MV_ASC_KEY_ID"         | gh secret set ASC_KEY_ID           --repo "$R"
+    printf '%s' "$MV_ASC_ISSUER_ID"      | gh secret set ASC_ISSUER_ID        --repo "$R"
+    printf '%s' "$MV_TEAM_ID"            | gh secret set APPLE_TEAM_ID        --repo "$R"
+    printf '%s' "$MV_GUESTS_REPO"        | gh secret set MV_GUESTS_REPO       --repo "$R"
+    printf '%s' "$MV_GUESTS_TOKEN"       | gh secret set MV_GUESTS_TOKEN      --repo "$R"
+    gh secret set MV_GUEST_KEY           --repo "$R" < "$ROOT/build/guest-bundle.key"
+    gh secret list --repo "$R"
+    ;;
+*)
+    sed -n '2,17p' "$0"; exit 2 ;;
+esac

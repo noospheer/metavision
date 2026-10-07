@@ -27,3 +27,5 @@ exports/
 *.key
 *.enc
 *.p8
+*.certSigningRequest
+*.pass
