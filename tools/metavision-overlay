@@ -15,7 +15,8 @@
 #   4. kl_app.c     multi-guest bundles: titles load from Frameworks/<target>/
 #   5. launcher     generated library screen (root only with MV_LAUNCHER=1);
 #                   guest framework IDs carry the target
-#   6. guests       staged guest trees symlinked in (metavision-targets link)
+#   6. hands-free   eyes-and-voice pointer for titles (klepton-overlay/)
+#   7. guests       staged guest trees symlinked in (metavision-targets link)
 #
 # Idempotent; each step checks its anchor and fails loudly if upstream moved it.
 #
@@ -236,7 +237,76 @@ grep -q 'dev.klepton.guest.${KLT_NAME' "$M" || {
 }
 echo "overlay: library screen generated; guest framework IDs carry the target"
 
-# 6 — guests
+# 6 — hands-free input (eyes and voice), klepton-overlay/MetavisionHandsFree.swift
+#
+# When no hand or Sense controller tracks the right controller, it becomes a
+# pointer aimed by the head, snapped to the gaze ray of each system select
+# (Dwell Control, Voice Control, a pinch), and the spoken word "select" presses
+# its trigger. MV_HANDS_FREE=0 / MV_VOICE=0 (klepton.env) turn it off.
+cp "$ROOT/klepton-overlay/MetavisionHandsFree.swift" "$K/visionos/Sources/"
+grep -q '"MetavisionHandsFree.swift"' "$G" || {
+    grep -q '"MetavisionLibrary.swift"\]' "$G" || die "SWIFT list anchor (MetavisionLibrary) not found"
+    sed -i.bak 's|"MetavisionLibrary.swift"\]|"MetavisionLibrary.swift", "MetavisionHandsFree.swift"]|' "$G" && rm -f "$G.bak"
+}
+python3 - "$K/visionos" <<'EOF'
+import sys
+v = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:70]!r}")
+    open(path, "w").write(s.replace(old, new))
+
+# Voice needs .playAndRecord, chosen the same way Klepton's own mic toggle does.
+patch(f"{v}/Sources/KleptonAudio.swift",
+      "try Self.setCategoryForMic(session, KleptonMic.shared.settings.enabled)",
+      "try Self.setCategoryForMic(session, KleptonMic.shared.settings.enabled || MetavisionHandsFree.voiceWanted)  // metavision: hands-free voice",
+      "metavision: hands-free voice")
+
+C = f"{v}/Sources/KleptonControllers.swift"
+# Every select carries the gaze ray; keep it before the pinch-only filter.
+patch(C,
+      "        for e in events {\n            guard e.kind == .indirectPinch else { continue }\n",
+      "        for e in events {\n"
+      "            if let r = e.selectionRay {   // metavision: hands-free gaze\n"
+      "                MetavisionHandsFree.shared.noteSelection(\n"
+      "                    origin: SIMD3<Float>(Float(r.origin.x), Float(r.origin.y), Float(r.origin.z)),\n"
+      "                    direction: SIMD3<Float>(Float(r.direction.x), Float(r.direction.y), Float(r.direction.z)))\n"
+      "            }\n"
+      "            guard e.kind == .indirectPinch else { continue }\n",
+      "metavision: hands-free gaze")
+# No hand tracking the right controller: be the hands-free pointer.
+patch(C,
+      "            } else {\n                // Nothing tracked this hand.",
+      "            } else if hand == 1, !st.fromController, MetavisionHandsFree.shared.enabled,\n"
+      "                      let pose = MetavisionHandsFree.shared.pointerPose() {   // metavision: hands-free pointer\n"
+      "                st.position = pose.0; st.orientation = pose.1\n"
+      "                st.linearVelocity = .zero; st.angularVelocity = .zero\n"
+      "                lock.lock(); let sysDown = systemPinch[hand]; lock.unlock()\n"
+      "                let pressed = sysDown || MetavisionHandsFree.shared.voiceSelectActive\n"
+      "                st.indexTrigger = pressed ? 1 : 0\n"
+      "                if pressed {\n"
+      "                    st.buttons |= OVRPRawButton.rIndexTrigger; st.touches |= OVRPRawButton.rIndexTrigger\n"
+      "                }\n"
+      "            } else {\n                // Nothing tracked this hand.",
+      "metavision: hands-free pointer")
+
+# Speech recognition needs its own usage string.
+plist = f"{v}/Info.plist"
+s = open(plist).read()
+if "NSSpeechRecognitionUsageDescription" not in s:
+    anchor = "\t<key>NSMicrophoneUsageDescription</key>"
+    if s.count(anchor) != 1:
+        sys.exit("overlay: NSMicrophoneUsageDescription anchor not found in Info.plist")
+    s = s.replace(anchor, "\t<key>NSSpeechRecognitionUsageDescription</key>\n"
+                  "\t<string>Spoken commands such as \"select\" let you play without using your hands. Recognition happens on the device.</string>\n" + anchor)
+    open(plist, "w").write(s)
+EOF
+echo "overlay: hands-free pointer and voice select wired in"
+
+# 7 — guests
 if [ -f "$ROOT/build/guests/targets.json" ]; then
     python3 - "$ROOT/build/guests" "$K" <<'EOF'
 import json, os, sys

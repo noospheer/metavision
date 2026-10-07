@@ -234,6 +234,21 @@ Runtime switches for any app opened from the Home View go in
 `Documents/klepton.env`: `sudo tools/metavision-device env mv_<title> KEY=VALUE ...`
 (add `--launcher` for the launcher), and `logs` pulls the boot log back.
 
+### Hands-free: eyes and voice
+
+Every build includes a hands-free pointer for titles that expect a
+controller. Whenever no hand (or PS VR2 Sense controller) is tracking the
+right controller, it is aimed by your head, snaps to where you were looking
+at each system select, and presses its trigger when you:
+
+- select with **Dwell Control** or **Voice Control** (visionOS Accessibility), or
+- say **"select"** (also "click", "okay"), recognised on the device.
+
+The first launch asks for speech-recognition and microphone permission. Turn
+either part off with `MV_HANDS_FREE=0` or `MV_VOICE=0` in `klepton.env`. The
+launcher's library screen is standard SwiftUI, so Dwell Control and Voice
+Control ("show numbers") work there directly.
+
 ### CI details worth knowing
 
 - Klepton's Makefile finds `angle-patches/` through `$(PWD)`; run its make from
