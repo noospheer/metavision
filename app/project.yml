@@ -1,13 +1,13 @@
 # XcodeGen spec. The .xcodeproj is generated on the build host, so nothing
 # Mac-authored needs to live in the repo.
-name: MetaVision
+name: metavision
 options:
   bundleIdPrefix: com.metavision
   deploymentTarget:
     visionOS: "2.0"
 
 targets:
-  MetaVision:
+  metavision:
     type: application
     platform: visionOS
     sources:

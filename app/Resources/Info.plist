@@ -2,7 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key>            <string>MetaVision</string>
+  <key>CFBundleName</key>            <string>metavision</string>
   <key>CFBundleIdentifier</key>      <string>com.metavision.launcher</string>
   <key>CFBundleShortVersionString</key><string>0.9.4</string>
 

@@ -1,4 +1,4 @@
-# MetaVision
+# metavision
 
 Quest → Vision Pro title pipeline. Extract, triage, relink, install.
 
@@ -17,7 +17,7 @@ The consequence, and the thing to internalize before designing anything else:
 | **Code** (relinked `.framework`s) | Inside the app bundle | Compiled in, signed | **No** |
 | **Assets** (metadata, OBB, audio) | `Documents/` container | Sideloaded any time | **Yes** |
 
-So there is no "Vision drive" you drop titles onto. Adding a title means **rebuilding and reinstalling MetaVision**. What *is* drive-like is the asset container — and that's genuinely useful, because assets are 95% of the bytes.
+So there is no "Vision drive" you drop titles onto. Adding a title means **rebuilding and reinstalling metavision**. What *is* drive-like is the asset container — and that's genuinely useful, because assets are 95% of the bytes.
 
 Everything below follows from that split.
 
@@ -175,7 +175,7 @@ vendor/klepton/tools/klepton_ld \
   --gles-backend angle --vulkan-backend moltenvk
 ```
 
-The relinker and the runtime shims come from `vendor/klepton` (MIT). MetaVision
+The relinker and the runtime shims come from `vendor/klepton` (MIT). metavision
 adds the launcher, this pipeline, the code/asset split, and `vrapi/` — the
 Quest 1 era, which upstream does not implement.
 
@@ -190,7 +190,7 @@ Typical yield: **30–120 MB of frameworks per title.** That is the only part th
 Non-negotiable, for a practical reason: a 20-title bundle with assets embedded is 60 GB+, and installs at that size time out or fail mid-transfer.
 
 ```
-MetaVision.app/                      ← signed, rebuilt to add titles
+metavision.app/                      ← signed, rebuilt to add titles
 └── Frameworks/
     └── com.example.vrtitle/
         ├── libil2cpp.framework
@@ -213,7 +213,7 @@ Rule of thumb: if it's mapped executable, it's in the bundle. Everything else is
 ## Stage 6 — Install the app
 
 ```bash
-xcodebuild -scheme MetaVision -destination 'platform=visionOS,name=Vision Pro' \
+xcodebuild -scheme metavision -destination 'platform=visionOS,name=Vision Pro' \
            -allowProvisioningUpdates install
 ```
 
@@ -252,7 +252,7 @@ xcrun devicectl device copy to \
 
 **C. Local HTTP ingest — what you actually want for multi-GB.**
 
-Have MetaVision run a loopback-scoped HTTP endpoint on Wi-Fi while the library screen is open:
+Have metavision run a loopback-scoped HTTP endpoint on Wi-Fi while the library screen is open:
 
 ```bash
 tools/metavision-sync com.example.vrtitle vision.local

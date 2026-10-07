@@ -1,4 +1,4 @@
-# MetaVision
+# metavision
 
 Quest → Vision Pro title pipeline.
 
@@ -111,7 +111,7 @@ as a device on that account.
 ## What we build, and what upstream provides
 
 `vendor/klepton` (MIT) is ~94k lines and already covers libc, the NDK, JNI,
-OVRPlatform, OpenXR and the graphics path. MetaVision adds the four things it
+OVRPlatform, OpenXR and the graphics path. metavision adds the four things it
 does not have:
 
 1. **The launcher** — a library tree over the relinked catalogue

@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct MetaVisionApp: App {
+struct LauncherApp: App {
     @State private var store = LibraryStore()
     @State private var ingest = IngestServer()
 

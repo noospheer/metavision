@@ -46,21 +46,21 @@ jobs:
 
       - name: Archive
         run: |
-          xcodebuild -project app/MetaVision.xcodeproj \
-                     -scheme MetaVision \
+          xcodebuild -project app/metavision.xcodeproj \
+                     -scheme metavision \
                      -destination 'generic/platform=visionOS' \
-                     -archivePath build/MetaVision.xcarchive \
+                     -archivePath build/metavision.xcarchive \
                      archive
 
       - name: Export .ipa
         run: |
           xcodebuild -exportArchive \
-                     -archivePath build/MetaVision.xcarchive \
+                     -archivePath build/metavision.xcarchive \
                      -exportOptionsPlist app/ExportOptions.plist \
                      -exportPath build/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MetaVision-ipa
+          name: metavision-ipa
           path: build/*.ipa
           retention-days: 14

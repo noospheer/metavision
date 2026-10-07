@@ -235,7 +235,7 @@ static ssize_t mv_getline(char **line, size_t *cap, void *guest_fp) {
     return getline(line, cap, fp);
 }
 
-static const char *mv_getprogname(void) { return "MetaVision"; }
+static const char *mv_getprogname(void) { return "metavision"; }
 
 // recvmmsg/sendmmsg: struct msghdr differs between bionic and Darwin and
 // Klepton translates neither batch call. Callers (QUIC/WebRTC stacks) fall back
