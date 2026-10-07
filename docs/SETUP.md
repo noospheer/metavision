@@ -244,6 +244,18 @@ at each system select, and presses its trigger when you:
 - select with **Dwell Control** or **Voice Control** (visionOS Accessibility), or
 - say **"select"** (also "click", "okay"), recognised on the device.
 
+The other buttons are spoken by name:
+
+| Say | Does |
+|---|---|
+| select / click / okay | tap the right trigger |
+| grab / grip | tap the right grip |
+| hold … release / drop | hold trigger and grip until released (dragging, carrying) |
+| confirm / accept | tap A |
+| back / cancel | tap B |
+| menu / pause | tap Menu (left controller) |
+| recenter | recenter the view, like holding the Meta button on a Quest |
+
 The first launch asks for speech-recognition and microphone permission. Turn
 either part off with `MV_HANDS_FREE=0` or `MV_VOICE=0` in `klepton.env`. The
 launcher's library screen is standard SwiftUI, so Dwell Control and Voice

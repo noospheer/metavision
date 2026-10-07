@@ -14,6 +14,14 @@
 //             ray visionOS reports with that select instead
 //   * select: the system's select, or the spoken word "select" ("click",
 //             "okay"), recognised on device
+//   * voice:  the other buttons by name, on device:
+//               select | click | okay      tap the right trigger
+//               grab | grip                tap the right grip
+//               hold ... release | drop    hold trigger + grip until released
+//               confirm | accept           tap A
+//               back | cancel              tap B
+//               menu | pause               tap Menu (left controller)
+//               recenter                   recenter the view
 //
 // Switches (environment or Documents/klepton.env):
 //   MV_HANDS_FREE=0   leave Klepton's own behaviour untouched
@@ -29,17 +37,18 @@ final class MetavisionHandsFree {
     let enabled: Bool
     private let lock = NSLock()
     private var gaze: (origin: SIMD3<Float>, direction: SIMD3<Float>, at: TimeInterval)?
-    private var voiceSelectUntil: TimeInterval = 0
+    private var tapUntil: [String: TimeInterval] = [:]   // button -> release time
+    private var holding = false
 
     /// How long a select's gaze ray keeps aiming the pointer.
     private let gazeHold: TimeInterval = 0.6
-    /// How long a spoken "select" holds the trigger down.
+    /// How long a spoken tap holds its button down.
     private let voicePress: TimeInterval = 0.25
 
     private init() {
         enabled = Self.envOn("MV_HANDS_FREE", default: true)
         if enabled && Self.envOn("MV_VOICE", default: true) {
-            MetavisionVoice.shared.start { [weak self] in self?.voiceSelect() }
+            MetavisionVoice.shared.start { [weak self] cmd in self?.voice(cmd) }
         }
         NSLog("[mv] hands-free %@, voice %@", enabled ? "on" : "off",
               (enabled && Self.envOn("MV_VOICE", default: true)) ? "on" : "off")
@@ -64,16 +73,41 @@ final class MetavisionHandsFree {
         lock.unlock()
     }
 
-    private func voiceSelect() {
+    private func voice(_ cmd: MetavisionVoice.Command) {
         lock.lock()
-        voiceSelectUntil = now() + voicePress
+        switch cmd {
+        case .select:   tapUntil["trigger"] = now() + voicePress
+        case .grab:     tapUntil["grip"] = now() + voicePress
+        case .confirm:  tapUntil["a"] = now() + voicePress
+        case .back:     tapUntil["b"] = now() + voicePress
+        case .menu:     tapUntil["menu"] = now() + voicePress
+        case .hold:     holding = true
+        case .release:  holding = false
+        case .recenter: KleptonCompositor.pendingRecenter = true
+        }
         lock.unlock()
-        NSLog("[mv] voice: select")
+        NSLog("[mv] voice: %@", "\(cmd)")
     }
 
-    var voiceSelectActive: Bool {
+    /// What voice is pressing on one controller right now.
+    struct Pressed { var buttons: UInt32 = 0; var trigger = false; var grip = false }
+
+    func pressed(hand: Int) -> Pressed {
         lock.lock(); defer { lock.unlock() }
-        return now() < voiceSelectUntil
+        let t = now()
+        func down(_ k: String) -> Bool { (tapUntil[k] ?? 0) > t }
+        var p = Pressed()
+        if hand == 1 {
+            p.trigger = down("trigger") || holding
+            p.grip = down("grip") || holding
+            if p.trigger { p.buttons |= OVRPRawButton.rIndexTrigger }
+            if p.grip { p.buttons |= OVRPRawButton.rHandTrigger }
+            if down("a") { p.buttons |= OVRPRawButton.a }
+            if down("b") { p.buttons |= OVRPRawButton.b }
+        } else {
+            if down("menu") { p.buttons |= OVRPRawButton.start }
+        }
+        return p
     }
 
     /// The pointer controller's pose in the tracking space kl_ovrp uses for the
@@ -111,12 +145,21 @@ final class MetavisionVoice {
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
-    private var heard = 0
-    private var onSelect: (() -> Void)?
-    private static let selectWords: Set<String> = ["select", "click", "okay", "ok"]
+    enum Command: String { case select, grab, hold, release, confirm, back, menu, recenter }
+    private static let words: [String: Command] = [
+        "select": .select, "click": .select, "okay": .select, "ok": .select,
+        "grab": .grab, "grip": .grab,
+        "hold": .hold, "release": .release, "drop": .release,
+        "confirm": .confirm, "accept": .confirm,
+        "back": .back, "cancel": .back,
+        "menu": .menu, "pause": .menu,
+        "recenter": .recenter, "re-center": .recenter,
+    ]
+    private var heard = 0              // commands already acted on in this task
+    private var onCommand: ((Command) -> Void)?
 
-    func start(onSelect: @escaping () -> Void) {
-        self.onSelect = onSelect
+    func start(onCommand: @escaping (Command) -> Void) {
+        self.onCommand = onCommand
         SFSpeechRecognizer.requestAuthorization { status in
             guard status == .authorized else {
                 NSLog("[mv] voice: speech recognition not authorised (%d)", status.rawValue)
@@ -152,11 +195,14 @@ final class MetavisionVoice {
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
             if let result {
-                let words = result.bestTranscription.segments.map { $0.substring.lowercased() }
-                let count = words.filter { Self.selectWords.contains($0) }.count
-                while self.heard < count {
+                // Partial results re-deliver the whole utterance each time, so act
+                // only on commands beyond the ones already handled.
+                let cmds = result.bestTranscription.segments.compactMap {
+                    Self.words[$0.substring.lowercased().trimmingCharacters(in: .punctuationCharacters)]
+                }
+                while self.heard < cmds.count {
+                    self.onCommand?(cmds[self.heard])
                     self.heard += 1
-                    self.onSelect?()
                 }
             }
             // Recognition tasks end on their own (silence, time limit); start

@@ -242,7 +242,8 @@ echo "overlay: library screen generated; guest framework IDs carry the target"
 # When no hand or Sense controller tracks the right controller, it becomes a
 # pointer aimed by the head, snapped to the gaze ray of each system select
 # (Dwell Control, Voice Control, a pinch), and the spoken word "select" presses
-# its trigger. MV_HANDS_FREE=0 / MV_VOICE=0 (klepton.env) turn it off.
+# its trigger; the other buttons are spoken by name (see the Swift file).
+# MV_HANDS_FREE=0 / MV_VOICE=0 (klepton.env) turn it off.
 cp "$ROOT/klepton-overlay/MetavisionHandsFree.swift" "$K/visionos/Sources/"
 grep -q '"MetavisionHandsFree.swift"' "$G" || {
     grep -q '"MetavisionLibrary.swift"\]' "$G" || die "SWIFT list anchor (MetavisionLibrary) not found"
@@ -285,11 +286,17 @@ patch(C,
       "                st.position = pose.0; st.orientation = pose.1\n"
       "                st.linearVelocity = .zero; st.angularVelocity = .zero\n"
       "                lock.lock(); let sysDown = systemPinch[hand]; lock.unlock()\n"
-      "                let pressed = sysDown || MetavisionHandsFree.shared.voiceSelectActive\n"
-      "                st.indexTrigger = pressed ? 1 : 0\n"
-      "                if pressed {\n"
-      "                    st.buttons |= OVRPRawButton.rIndexTrigger; st.touches |= OVRPRawButton.rIndexTrigger\n"
-      "                }\n"
+      "                var v = MetavisionHandsFree.shared.pressed(hand: 1)\n"
+      "                if sysDown { v.trigger = true; v.buttons |= OVRPRawButton.rIndexTrigger }\n"
+      "                st.indexTrigger = v.trigger ? 1 : 0\n"
+      "                st.handTrigger = v.grip ? 1 : 0\n"
+      "                st.buttons |= v.buttons; st.touches |= v.buttons\n"
+      "            } else if hand == 0, !st.fromController, MetavisionHandsFree.shared.enabled {\n"
+      "                // metavision: hands-free left controller — voice's Menu button only;\n"
+      "                // its pose stays kl_ovrp's own synthesised one.\n"
+      "                let v = MetavisionHandsFree.shared.pressed(hand: 0)\n"
+      "                kl_ovrp_set_controller_input(0, v.buttons, v.buttons, 0, 0, 0, 0)\n"
+      "                continue\n"
       "            } else {\n                // Nothing tracked this hand.",
       "metavision: hands-free pointer")
 
