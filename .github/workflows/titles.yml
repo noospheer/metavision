@@ -55,9 +55,9 @@ jobs:
                       /Users/runner/Library/Android /usr/local/share/dotnet || true
           df -h /
 
-      - name: ANGLE cache
+      - name: ANGLE cache (restore)
         id: angle
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             vendor/klepton/vendor/out/xros
@@ -72,6 +72,17 @@ jobs:
           # depot_tools' one-time bootstrap; a fresh runner never had it.
           (cd "$K/vendor/depot_tools" && ./ensure_bootstrap)
           (cd "$K" && make angle-xros angle-xrsim)
+
+      # Saved straight away, not at job end: actions/cache only saves on a
+      # fully successful job, so any later failure would discard the build.
+      - name: ANGLE cache (save)
+        if: steps.angle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            vendor/klepton/vendor/out/xros
+            vendor/klepton/vendor/out/xrsim
+          key: ${{ steps.angle.outputs.cache-primary-key }}
 
       - name: Fetch and decrypt guest bundle
         env:
