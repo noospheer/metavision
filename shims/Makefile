@@ -8,9 +8,9 @@ test: build/t_shims
 	@build/t_shims
 	@../tools/metavision-gaps --check-shims
 
-build/t_shims: mv_shims.c mv_shims.h tests/t_shims.c
+build/t_shims: mv_shims.c mv_shims.h mv_hands.c mv_hands.h tests/t_shims.c
 	@mkdir -p build
-	$(CC) $(CFLAGS) -o $@ mv_shims.c tests/t_shims.c -lm
+	$(CC) $(CFLAGS) -o $@ mv_shims.c mv_hands.c tests/t_shims.c -lm
 
 clean:
 	rm -rf build

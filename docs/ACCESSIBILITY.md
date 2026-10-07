@@ -83,8 +83,9 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
 ## What does not work yet
 
 - **Moving around with a thumbstick**, and two-handed interactions.
-- **Titles that track real hands** (hand-gesture pieces) see no hands while you
-  play hands-free; that is a different input than a controller.
+- **Titles that track real hands** (hand-gesture pieces) get the Vision Pro's
+  hand tracking in Auto and Hands modes, but see no hands in Hands-free mode,
+  by design.
 - **Voice Control's numbers and grid** cannot reach inside a title: a Quest
   title draws its menus as pixels in a 3D scene, so visionOS cannot see its
   buttons. Aim with your head and say "select" instead.

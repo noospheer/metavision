@@ -8,6 +8,8 @@
 #include <string.h>
 #include <time.h>
 #include "../mv_shims.h"
+#include "../mv_hands.h"
+#include <math.h>
 
 // ---- Klepton stand-ins ----
 void *(*kl_shim_override)(const char *name);
@@ -33,6 +35,50 @@ int kl_ovrp_is_handle(const void *h) { return h == &g_fake_ovrp; }
 static void *barrier_worker(void *b) {
     int (*w)(void *) = FN(int (*)(void *), "pthread_barrier_wait");
     return (void *)(intptr_t)w(b);
+}
+
+// Hand tracking: enabled flag, skeleton only after the hand is seen, local
+// rotations and rest positions derived from wrist-frame bone poses.
+static void test_hands(void *(*dls)(void *, const char *)) {
+    int32_t (*en)(int32_t *) = (int32_t (*)(int32_t *))dls(&g_fake_ovrp, "ovrp_GetHandTrackingEnabled");
+    int32_t on = 0; assert(en(&on) == 0 && on == 1);
+    mv_hands_set_enabled(0); assert(en(&on) == 0 && on == 0); mv_hands_set_enabled(1);
+
+    int32_t (*sk)(int32_t, void *) = (int32_t (*)(int32_t, void *))dls(&g_fake_ovrp, "ovrp_GetSkeleton2");
+    int32_t (*hs)(int32_t, int32_t, void *) = (int32_t (*)(int32_t, int32_t, void *))dls(&g_fake_ovrp, "ovrp_GetHandState");
+    static unsigned char skel[0xc44], st[0x200];
+    assert(sk(1, skel) == -1000);              // not seen yet: OVRSkeleton retries
+
+    // Right hand: every bone at identity, 1 cm further along +X than its parent,
+    // except Index1 turned 90 degrees about Z.
+    float model[MV_HAND_BONES * 7] = {0};
+    static const int depth[MV_HAND_BONES] = {0,1,1,2,3,4,1,2,3,1,2,3,1,2,3,1,2,3,4,5,4,4,4,5};
+    for (int i = 0; i < MV_HAND_BONES; i++) { model[7*i+3] = 1; model[7*i+4] = 0.01f * depth[i]; }
+    float s45 = sqrtf(0.5f);
+    model[7*6+2] = s45; model[7*6+3] = s45;   // Index1
+    float root[7] = {0,0,0,1, 0.1f,1.2f,-0.3f}, pinch[5] = {0.95f,0.95f,0.2f,0,0};
+    mv_hands_publish(1, 1, model, root, NULL, pinch, 12.5);
+
+    assert(sk(1, skel) == 0);
+    int32_t *h = (int32_t *)skel; assert(h[0] == 1 && h[1] == MV_HAND_BONES && h[2] == 0);
+    unsigned char *b7 = skel + 0xc + 7 * 0x24;  // Index2: parent Index1
+    assert(*(int16_t *)(b7 + 4) == 6);
+    float *p7 = (float *)(b7 + 8 + 16);
+    // Index2 sits +X in world, which is -Y in Index1's turned frame.
+    assert(fabsf(p7[0]) < 1e-5f && fabsf(p7[1] + 0.01f) < 1e-5f);
+
+    assert(hs(0, 1, st) == 0);
+    assert(*(int32_t *)st == (1 | 2 | 128));
+    assert(((float *)(st + 4))[4] == 0.1f);               // root position x
+    float *r6 = (float *)(st + 0x20 + 6 * 16), *r7 = (float *)(st + 0x20 + 7 * 16);
+    assert(fabsf(r6[2] - s45) < 1e-5f);                   // Index1 relative to wrist: the turn
+    assert(fabsf(r7[2] + s45) < 1e-5f);                   // Index2 relative to Index1: undoes it
+    assert(*(uint32_t *)(st + 0x1a0) == 3);               // thumb + index pinching
+    assert(*(double *)(st + 0x1f8) == 12.5);
+    assert(hs(0, 0, st) == 0 && *(int32_t *)st == 0);     // left hand never seen
+    mv_hands_set_enabled(0);
+    assert(hs(0, 1, st) == 0 && *(int32_t *)st == 0);     // hands-free: hands ignored
+    mv_hands_set_enabled(1);
 }
 
 int main(void) {
@@ -110,8 +156,9 @@ int main(void) {
     assert(dls((void *)0x1234, "x") == (void *)0x9abc);
 
     // OVRPlugin capability questions answer "no" through the plugin handle only
-    int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetHandTrackingEnabled");
+    int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetBodyTrackingEnabled");
     char yes = 1; assert(q(&yes) == 0 && yes == 0);
+    test_hands(dls);
     int32_t (*dh)(int32_t *) = (int32_t (*)(int32_t *))dls(&g_fake_ovrp, "ovrp_GetDominantHand");
     int32_t hand = 0; assert(dh(&hand) == 0 && hand == 2);
     assert(dls(&g_fake_ovrp, "ovrp_GetNodePoseState3") == (void *)0x9abc);   // Klepton's own: untouched

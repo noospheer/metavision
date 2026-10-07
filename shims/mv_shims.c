@@ -31,6 +31,7 @@
 #include <math.h>
 
 #include "mv_shims.h"
+#include "mv_hands.h"
 
 // ---- Klepton runtime (vendor/klepton/runtime/klepton.h) ----
 void *kl_shim_lookup(const char *name);
@@ -353,7 +354,6 @@ static const char *const k_ovrp_no[] = {
     "ovrp_GetFaceTrackingSupported",
     "ovrp_GetFaceTrackingVisemesSupported",
     "ovrp_GetGPUUtilSupported",
-    "ovrp_GetHandTrackingEnabled",
     "ovrp_GetLocalDimmingSupported",
     "ovrp_GetMarkerTrackingSupported",
     "ovrp_GetSystemHmd3DofModeEnabled",
@@ -380,6 +380,8 @@ static void *mv_dlsym(void *handle, const char *name) {
     if (handle == &g_ossdk_handle)
         return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
     if (name && kl_ovrp_is_handle(handle)) {
+        void *h = mv_hands_ovrp(name);   // hand tracking: mv_hands.c
+        if (h) return h;
         for (size_t i = 0; i < sizeof k_ovrp_no / sizeof k_ovrp_no[0]; i++)
             if (strcmp(name, k_ovrp_no[i]) == 0) return (void *)mv_ovrp_answer_no;
         for (size_t i = 0; i < sizeof k_ovrp_answers / sizeof k_ovrp_answers[0]; i++)
