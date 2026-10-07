@@ -3,7 +3,7 @@
 Quest → Vision Pro title pipeline.
 
 metavision was started to bring the [Cyberdelic](https://www.cyberdelic.nexus/)
-library — immersive art, meditation and consciousness titles built for Quest —
+library — immersive art, meditation and consciousness, built for Quest —
 to the Apple Vision Pro. Nothing in metavision is specific to the Cyberdelic library: it works on
 any Quest titles you own.
 
