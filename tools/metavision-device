@@ -304,9 +304,15 @@ async def cmd_stage(a):
         """Bring a partly copied folder up to date: one listing per directory;
         a file present by name counts as done unless it is large (>8 MB), which
         is stat'ed and continued from its last byte when short."""
-        sent = 0
+        sent = checked = 0
+        total = sum(1 for p in local.rglob("*") if p.is_file())
         dirs = sorted({local} | {d for d in local.rglob("*") if d.is_dir()})
+        last = time.monotonic()
+        print(f"  {label:7} checking {total} files in {len(dirs)} folders -> {remote_path}", flush=True)
         for d in dirs:
+            if time.monotonic() - last > 3:
+                print(f"    {checked}/{total} checked, {sent} copied", flush=True)
+                last = time.monotonic()
             rel = d.relative_to(local).as_posix()
             rdir = remote_path if rel == "." else f"{remote_path}/{rel}"
             try:
@@ -315,6 +321,10 @@ async def cmd_stage(a):
                 there = set()
                 await afc.makedirs(rdir)
             for f in sorted(p for p in d.iterdir() if p.is_file()):
+                checked += 1
+                if time.monotonic() - last > 3:
+                    print(f"    {checked}/{total} checked, {sent} copied", flush=True)
+                    last = time.monotonic()
                 rp, size = f"{rdir}/{f.name}", f.stat().st_size
                 if f.name in there:
                     if size <= (8 << 20):
