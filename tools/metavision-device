@@ -253,6 +253,19 @@ async def cmd_stage(a):
     guests = root / "build" / "guests"
     rows = json.loads((guests / "targets.json").read_text())
     names = list(rows) if a.all else a.targets
+    if a.all and a.launcher:
+        # Only titles the launcher build carries: data for a title it left
+        # out (it did not translate) would be copied for nothing.
+        ipa = root / "build" / "ipa" / "metavision.ipa"
+        if ipa.exists():
+            import zipfile
+            built = {m.group(1) for n in zipfile.ZipFile(ipa).namelist()
+                     if (m := re.match(r"Payload/[^/]+/Frameworks/(mv_[^/]+)/", n))}
+            if built:
+                skipped = [n for n in names if n not in built]
+                names = [n for n in names if n in built]
+                if skipped:
+                    print(f"not in {ipa.name}, skipped: {' '.join(skipped)}")
     if not names:
         sys.exit("stage: name titles, or --all")
     for n in names:
