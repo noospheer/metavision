@@ -73,6 +73,35 @@ Until it runs, the runtime prints `ABI DECLARED, NOT VERIFIED` at startup. That
 is accurate, not a warning to dismiss — the ABI is declared from public
 documentation because Meta's headers are not redistributable.
 
+## Building without a Mac
+
+Everything up to `xcodebuild` runs on Linux. The signed build runs on a GitHub
+macOS runner, and guest code reaches it only encrypted:
+
+```bash
+tools/metavision-targets list                 # what each archived title becomes
+tools/metavision-targets stage && tools/metavision-targets emit
+tools/metavision-gaps                         # link-time gaps, ranked by titles blocked
+tools/metavision-guest-bundle mv_<title> ...  # -> build/guest-bundle.tar.gz.enc
+gh release upload guests build/guest-bundle.tar.gz.enc --repo <you>/<private-repo> --clobber
+gh workflow run titles -f targets="mv_<title> ..."
+```
+
+`tools/build-klepton-ld-linux.sh` builds the translator here if you want to
+inspect translations locally. The workflow (`.github/workflows/titles.yml`)
+needs these repository secrets:
+
+| Secret | What |
+|---|---|
+| `MV_GUESTS_REPO`, `MV_GUESTS_TOKEN` | the private repo holding the bundle, and a token that can read its releases |
+| `MV_GUEST_KEY` | the bundle passphrase (`build/guest-bundle.key`); built `.ipa`s are encrypted with it too |
+| `SIGNING_P12`, `SIGNING_P12_PASSWORD`, `KEYCHAIN_PASSWORD` | an Apple Development certificate, base64 |
+| `ASC_KEY_P8`, `ASC_KEY_ID`, `ASC_ISSUER_ID`, `APPLE_TEAM_ID` | an App Store Connect API key, for automatic signing |
+
+The API key is what lets the runner create each title's App ID and profile;
+it requires a paid Apple Developer membership. The headset must be registered
+as a device on that account.
+
 ## What we build, and what upstream provides
 
 `vendor/klepton` (MIT) is ~94k lines and already covers libc, the NDK, JNI,

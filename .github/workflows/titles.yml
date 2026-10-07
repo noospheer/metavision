@@ -3,8 +3,9 @@ name: titles
 # Build signed visionOS apps for generated Klepton targets — one app per title.
 #
 # Inputs come from three places, and none of them is the repo:
-#   * guest code   — MV_GUEST_BUNDLE_URL: tools/metavision-guest-bundle output,
-#                    AES-256 encrypted with MV_GUEST_KEY. Hosted privately.
+#   * guest code   — tools/metavision-guest-bundle output, AES-256 encrypted
+#                    with MV_GUEST_KEY, attached to the `guests` release of a
+#                    PRIVATE repo (MV_GUESTS_REPO, read with MV_GUESTS_TOKEN)
 #   * signing      — a development certificate (.p12) and an App Store Connect
 #                    API key, so automatic signing can create each title's
 #                    explicit App ID + profile (the memory entitlements need
@@ -15,7 +16,7 @@ name: titles
 # because a built app embeds the translated guest code.
 #
 # Secrets:
-#   MV_GUEST_BUNDLE_URL  MV_GUEST_KEY
+#   MV_GUESTS_REPO  MV_GUESTS_TOKEN  MV_GUEST_KEY
 #   SIGNING_P12  SIGNING_P12_PASSWORD  KEYCHAIN_PASSWORD
 #   ASC_KEY_P8  ASC_KEY_ID  ASC_ISSUER_ID  APPLE_TEAM_ID
 
@@ -69,11 +70,12 @@ jobs:
 
       - name: Fetch and decrypt guest bundle
         env:
-          URL: ${{ secrets.MV_GUEST_BUNDLE_URL }}
+          GH_TOKEN: ${{ secrets.MV_GUESTS_TOKEN }}
+          REPO: ${{ secrets.MV_GUESTS_REPO }}
           KEY: ${{ secrets.MV_GUEST_KEY }}
         run: |
           mkdir -p build
-          curl -fsSL "$URL" -o /tmp/guests.enc
+          gh release download guests --repo "$REPO" --pattern 'guest-bundle.tar.gz.enc' --output /tmp/guests.enc
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "pass:$KEY" -in /tmp/guests.enc |
             tar -xz -C build
           mv build/guests/klepton-targets.py build/klepton-targets.py
