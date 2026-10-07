@@ -64,6 +64,14 @@ OVRPlugin call in order — the step where a title stops is the last one.
 
 ## Open issues
 
+- **GPU compute in OpenGL ES titles.** Klepton runs GLES titles on ANGLE's
+  Metal backend, which is GLES 3.0: no compute shaders. A GLES-only title that
+  uses them — Unity VFX Graph particles, GPU skinning, compute effects — runs
+  with those effects missing; its log shows `GLSL compilation failed` and
+  `Kernel at index (N) is invalid` (triage lists both). Titles that ship Vulkan
+  (their manifest declares `android.hardware.vulkan`) run on MoltenVK, which
+  has compute. The fix is GLES 3.1 compute in the GL path.
+
 - **Squashed picture** in at least one title: frames render, the
   view looks compressed. Under test: foveated rendering (`KL_VRR=0`), then a
   unified eye frustum (`KL_OVRP_UNIFY_FRUSTUM=1`).
