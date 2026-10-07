@@ -5,8 +5,17 @@
 //
 // Klepton builds its synthetic Touch controllers from tracked hands. With no
 // hand in view the guest gets no controller pose, so a title's laser points
-// nowhere and a select lands on nothing. This supplies the right controller
-// whenever no hand (and no Sense controller) is tracking it:
+// nowhere and a select lands on nothing. Three input modes:
+//
+//   auto       (default) hands when a hand is in view, hands-free when not
+//   hands      Klepton's own behaviour only; no speech recognition
+//   handsfree  always hands-free, ignoring tracked hands — for involuntary
+//              movement, tremor or spasticity, where a hand the headset sees
+//              would otherwise take control or click by accident
+//
+// The mode is chosen in the launcher (remembered), by voice ("auto mode",
+// "hands mode", "hands-free mode"), or with MV_INPUT_MODE. Hands-free supplies
+// the right controller whenever no Sense controller tracks it:
 //
 //   * pose:   a pointer just below and right of the head, aimed along the
 //             head's forward direction; for a moment after any system select
@@ -22,10 +31,12 @@
 //               back | cancel              tap B
 //               menu | pause               tap Menu (left controller)
 //               recenter                   recenter the view
+//               auto | hands | hands-free mode   switch input mode
 //
 // Switches (environment or Documents/klepton.env):
-//   MV_HANDS_FREE=0   leave Klepton's own behaviour untouched
-//   MV_VOICE=0        no speech recognition (no microphone/speech prompts)
+//   MV_INPUT_MODE=auto|hands|handsfree   overrides the remembered mode
+//   MV_VOICE=0                           no speech recognition in any mode
+//   MV_HANDS_FREE=0                      same as MV_INPUT_MODE=hands (older name)
 import AVFoundation
 import Foundation
 import Speech
@@ -34,8 +45,10 @@ import simd
 final class MetavisionHandsFree {
     static let shared = MetavisionHandsFree()
 
-    let enabled: Bool
+    enum Mode: String, CaseIterable { case auto, hands, handsfree }
+
     private let lock = NSLock()
+    private var currentMode: Mode
     private var gaze: (origin: SIMD3<Float>, direction: SIMD3<Float>, at: TimeInterval)?
     private var tapUntil: [String: TimeInterval] = [:]   // button -> release time
     private var holding = false
@@ -45,20 +58,60 @@ final class MetavisionHandsFree {
     /// How long a spoken tap holds its button down.
     private let voicePress: TimeInterval = 0.25
 
+    private static let defaultsKey = "metavision.inputMode"
+
+    /// The mode the app starts in: MV_INPUT_MODE, else the remembered choice, else auto.
+    static var startupMode: Mode {
+        if let v = env("MV_INPUT_MODE"), let m = Mode(rawValue: v.lowercased().replacingOccurrences(of: "-", with: "")) { return m }
+        if !envOn("MV_HANDS_FREE", default: true) { return .hands }
+        if let v = UserDefaults.standard.string(forKey: defaultsKey), let m = Mode(rawValue: v) { return m }
+        return .auto
+    }
+
     private init() {
-        enabled = Self.envOn("MV_HANDS_FREE", default: true)
-        if enabled && Self.envOn("MV_VOICE", default: true) {
+        currentMode = Self.startupMode
+        applyVoice()
+        NSLog("[mv] input mode %@", currentMode.rawValue)
+    }
+
+    var mode: Mode {
+        lock.lock(); defer { lock.unlock() }
+        return currentMode
+    }
+
+    /// Change the mode now and remember it (launcher picker, voice).
+    func setMode(_ m: Mode) {
+        lock.lock(); currentMode = m; lock.unlock()
+        Self.remember(m)
+        applyVoice()
+        NSLog("[mv] input mode -> %@", m.rawValue)
+    }
+
+    /// For the launcher, before any title (and so before `shared`) exists.
+    static func remember(_ m: Mode) { UserDefaults.standard.set(m.rawValue, forKey: defaultsKey) }
+
+    /// Hands-free branches may supply controllers (auto and handsfree).
+    var enabled: Bool { mode != .hands }
+    /// Tracked hands are not used at all (handsfree).
+    var ignoresHands: Bool { mode == .handsfree }
+
+    private func applyVoice() {
+        if mode != .hands && Self.envOn("MV_VOICE", default: true) {
             MetavisionVoice.shared.start { [weak self] cmd in self?.voice(cmd) }
+        } else {
+            MetavisionVoice.shared.stop()
         }
-        NSLog("[mv] hands-free %@, voice %@", enabled ? "on" : "off",
-              (enabled && Self.envOn("MV_VOICE", default: true)) ? "on" : "off")
     }
 
     /// Read by KleptonAudio (via the overlay) before it configures the session.
-    static var voiceWanted: Bool { envOn("MV_HANDS_FREE", default: true) && envOn("MV_VOICE", default: true) }
+    static var voiceWanted: Bool { startupMode != .hands && envOn("MV_VOICE", default: true) }
+
+    static func env(_ name: String) -> String? {
+        ProcessInfo.processInfo.environment[name] ?? getenv(name).map { String(cString: $0) }
+    }
 
     static func envOn(_ name: String, default def: Bool) -> Bool {
-        guard let v = ProcessInfo.processInfo.environment[name] ?? getenv(name).map({ String(cString: $0) }) else { return def }
+        guard let v = env(name) else { return def }
         return !(v == "0" || v.lowercased() == "false" || v.lowercased() == "off")
     }
 
@@ -84,8 +137,15 @@ final class MetavisionHandsFree {
         case .hold:     holding = true
         case .release:  holding = false
         case .recenter: KleptonCompositor.pendingRecenter = true
+        case .modeAuto, .modeHands, .modeHandsFree: break
         }
         lock.unlock()
+        switch cmd {
+        case .modeAuto:      setMode(.auto)
+        case .modeHands:     setMode(.hands)
+        case .modeHandsFree: setMode(.handsfree)
+        default: break
+        }
         NSLog("[mv] voice: %@", "\(cmd)")
     }
 
@@ -145,8 +205,11 @@ final class MetavisionVoice {
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
-    enum Command: String { case select, grab, hold, release, confirm, back, menu, recenter }
-    private static let words: [String: Command] = [
+    enum Command: String {
+        case select, grab, hold, release, confirm, back, menu, recenter
+        case modeAuto, modeHands, modeHandsFree
+    }
+    private static let words_: [String: Command] = [
         "select": .select, "click": .select, "okay": .select, "ok": .select,
         "grab": .grab, "grip": .grab,
         "hold": .hold, "release": .release, "drop": .release,
@@ -157,9 +220,44 @@ final class MetavisionVoice {
     ]
     private var heard = 0              // commands already acted on in this task
     private var onCommand: ((Command) -> Void)?
+    private var running = false
+
+    /// Words, in order, to commands: single command words, and "<x> mode" phrases.
+    static func commands(in words: [String]) -> [Command] {
+        var out: [Command] = []
+        for (i, w) in words.enumerated() {
+            if w == "mode" {
+                let p1 = i > 0 ? words[i - 1] : "", p2 = i > 1 ? words[i - 2] : ""
+                if p1 == "hands-free" || p1 == "handsfree" || (p1 == "free" && (p2 == "hands" || p2 == "hand")) {
+                    out.append(.modeHandsFree)
+                } else if p1 == "hands" || p1 == "hand" {
+                    out.append(.modeHands)
+                } else if p1 == "auto" || p1 == "automatic" {
+                    out.append(.modeAuto)
+                }
+            } else if let c = words_[w] {
+                out.append(c)
+            }
+        }
+        return out
+    }
+
+    func stop() {
+        DispatchQueue.main.async {
+            guard self.running else { return }
+            self.running = false
+            self.engine.stop()
+            self.engine.inputNode.removeTap(onBus: 0)
+            self.request?.endAudio()
+            self.task?.cancel()
+            self.task = nil; self.request = nil
+            NSLog("[mv] voice: stopped")
+        }
+    }
 
     func start(onCommand: @escaping (Command) -> Void) {
         self.onCommand = onCommand
+        guard !running else { return }
         SFSpeechRecognizer.requestAuthorization { status in
             guard status == .authorized else {
                 NSLog("[mv] voice: speech recognition not authorised (%d)", status.rawValue)
@@ -170,6 +268,7 @@ final class MetavisionVoice {
     }
 
     private func begin() {
+        running = true
         guard let recognizer, recognizer.isAvailable else {
             NSLog("[mv] voice: recogniser unavailable"); return
         }
@@ -197,9 +296,10 @@ final class MetavisionVoice {
             if let result {
                 // Partial results re-deliver the whole utterance each time, so act
                 // only on commands beyond the ones already handled.
-                let cmds = result.bestTranscription.segments.compactMap {
-                    Self.words[$0.substring.lowercased().trimmingCharacters(in: .punctuationCharacters)]
+                let words = result.bestTranscription.segments.map {
+                    $0.substring.lowercased().trimmingCharacters(in: CharacterSet.punctuationCharacters.subtracting(CharacterSet(charactersIn: "-")))
                 }
+                let cmds = Self.commands(in: words)
                 while self.heard < cmds.count {
                     self.onCommand?(cmds[self.heard])
                     self.heard += 1
@@ -207,7 +307,7 @@ final class MetavisionVoice {
             }
             // Recognition tasks end on their own (silence, time limit); start
             // another so the command words keep working.
-            if error != nil || (result?.isFinal ?? false) {
+            if self.running && (error != nil || (result?.isFinal ?? false)) {
                 self.restart()
             }
         }
@@ -220,6 +320,6 @@ final class MetavisionVoice {
         request?.endAudio()
         task?.cancel()
         task = nil; request = nil
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self.begin() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { if self.running { self.begin() } }
     }
 }

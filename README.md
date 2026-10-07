@@ -11,8 +11,10 @@ any Quest titles you own.
 them be played with eyes, head and voice alone. With no hand in view, the
 controller is aimed by your head, snaps to where you look when you select
 (Dwell Control, Voice Control, or the word "select"), and its other buttons
-are spoken by name — "grab", "back", "menu", "recenter". It lives in the
-runtime every title shares, so every title gets it unchanged. See
+are spoken by name — "grab", "back", "menu", "recenter". Three input modes —
+Auto, Hands and Hands-free (which ignores tracked hands, for involuntary
+movement) — are chosen in the launcher or by voice. It lives in the runtime
+every title shares, so every title gets it unchanged. See
 [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md).
 
 Pull APKs from a Quest you own, triage them for compatibility, relink ARM64 ELF

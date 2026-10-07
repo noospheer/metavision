@@ -183,12 +183,30 @@ struct MetavisionRoot: View {{
 
 struct MetavisionLibrary: View {{
     @Binding var chosen: String?
+    @State private var mode: String =
+        UserDefaults.standard.string(forKey: "metavision.inputMode") ?? MetavisionHandsFree.Mode.auto.rawValue
     private let titles = MetavisionCatalog.embedded
     private let columns = [GridItem(.adaptive(minimum: 240), spacing: 16)]
 
     var body: some View {{
         NavigationStack {{
             ScrollView {{
+                // Input mode, remembered; the title starts in it. Auto switches on
+                // whether a hand is in view, Hands never goes hands-free, Hands-free
+                // ignores tracked hands entirely (see docs/ACCESSIBILITY.md).
+                Picker("Input", selection: $mode) {{
+                    Text("Auto").tag(MetavisionHandsFree.Mode.auto.rawValue)
+                    Text("Hands").tag(MetavisionHandsFree.Mode.hands.rawValue)
+                    Text("Hands-free").tag(MetavisionHandsFree.Mode.handsfree.rawValue)
+                }}
+                .pickerStyle(.segmented)
+                .accessibilityLabel("Input mode")
+                .onChange(of: mode) {{ _, m in
+                    if let mm = MetavisionHandsFree.Mode(rawValue: m) {{ MetavisionHandsFree.remember(mm) }}
+                }}
+                .padding(.horizontal)
+                .padding(.top)
+
                 if titles.isEmpty {{
                     Text("This build carries no titles.").padding()
                 }}
@@ -243,7 +261,8 @@ echo "overlay: library screen generated; guest framework IDs carry the target"
 # pointer aimed by the head, snapped to the gaze ray of each system select
 # (Dwell Control, Voice Control, a pinch), and the spoken word "select" presses
 # its trigger; the other buttons are spoken by name (see the Swift file).
-# MV_HANDS_FREE=0 / MV_VOICE=0 (klepton.env) turn it off.
+# Modes auto / hands / handsfree (launcher picker, voice, MV_INPUT_MODE);
+# handsfree ignores tracked hands entirely.
 cp "$ROOT/klepton-overlay/MetavisionHandsFree.swift" "$K/visionos/Sources/"
 grep -q '"MetavisionHandsFree.swift"' "$G" || {
     grep -q '"MetavisionLibrary.swift"\]' "$G" || die "SWIFT list anchor (MetavisionLibrary) not found"
@@ -278,6 +297,12 @@ patch(C,
       "            }\n"
       "            guard e.kind == .indirectPinch else { continue }\n",
       "metavision: hands-free gaze")
+# Hands-free mode ignores tracked hands entirely (involuntary movement).
+patch(C,
+      "            } else if let anchor = (hand == 0 ? leftHand : rightHand) {\n",
+      "            } else if !MetavisionHandsFree.shared.ignoresHands,   // metavision: input modes\n"
+      "                      let anchor = (hand == 0 ? leftHand : rightHand) {\n",
+      "metavision: input modes")
 # No hand tracking the right controller: be the hands-free pointer.
 patch(C,
       "            } else {\n                // Nothing tracked this hand.",
