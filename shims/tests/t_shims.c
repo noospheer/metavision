@@ -25,6 +25,8 @@ static int g_real_dlopen_calls;
 // Klepton's own dlopen: android_dlopen_ext reaches it through the dlopen wrapper.
 void *klb_dlopen(const char *p, int f) { (void)p; g_real_dlopen_calls++; g_dlopen_flags = f; return (void *)0x1234; }
 void *klb_dlsym(void *h, const char *n) { (void)h; (void)n; return (void *)0x9abc; }
+static char g_fake_ovrp;
+int kl_ovrp_is_handle(const void *h) { return h == &g_fake_ovrp; }
 
 #define FN(t, n) ((t)mv_lookup(n))
 
@@ -106,6 +108,12 @@ int main(void) {
     assert(again && ((void **)again[0])[5] != NULL);  // and its methods are callable too
     assert(dlo("/system/lib64/libfoo.so", 0) == (void *)0x1234 && g_real_dlopen_calls == before + 1);
     assert(dls((void *)0x1234, "x") == (void *)0x9abc);
+
+    // OVRPlugin capability questions answer "no" through the plugin handle only
+    int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetHandTrackingEnabled");
+    char yes = 1; assert(q(&yes) == 0 && yes == 0);
+    assert(dls(&g_fake_ovrp, "ovrp_GetNodePoseState3") == (void *)0x9abc);   // Klepton's own: untouched
+    assert(dls((void *)0x1234, "ovrp_GetHandTrackingEnabled") == (void *)0x9abc);
 
     printf("mv_shims: %zu shims, all checks passed\n", mv_shim_count);
     return 0;

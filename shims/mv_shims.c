@@ -328,9 +328,48 @@ static void *mv_dlopen(const char *path, int flags) {
     return klb_dlopen(path, flags);
 }
 
+// ---- OVRPlugin capability questions Klepton does not answer
+// Klepton stops a title, by name, at any OVRPlugin entry point it lacks — the
+// right default, since a guessed answer can be worse than a clear stop. These
+// are the exception: "is <feature> enabled / supported?" with the plugin's
+// usual shape, ovrpResult f(ovrpBool *out). "No" is true on this device
+// (no body/face tracking through OVRPlugin, no Quest-only display features),
+// and it is what sends a title down its controller path. The list is the
+// archive's referenced names minus Klepton's own (tools/metavision-gaps --ovrp).
+int kl_ovrp_is_handle(const void *h);
+static const char *const k_ovrp_no[] = {
+    "ovrp_GetBodyTrackingEnabled",
+    "ovrp_GetBodyTrackingSupported",
+    "ovrp_GetDynamicObjectKeyboardSupported",
+    "ovrp_GetDynamicObjectTrackerSupported",
+    "ovrp_GetEnvironmentDepthHandRemovalSupported",
+    "ovrp_GetEnvironmentDepthSupported",
+    "ovrp_GetEnvironmentRaycastSupported",
+    "ovrp_GetEyeOcclusionMeshEnabled",
+    "ovrp_GetEyeTextureArrayEnabled",
+    "ovrp_GetFaceTracking2Enabled",
+    "ovrp_GetFaceTracking2Supported",
+    "ovrp_GetFaceTrackingEnabled",
+    "ovrp_GetFaceTrackingSupported",
+    "ovrp_GetFaceTrackingVisemesSupported",
+    "ovrp_GetGPUUtilSupported",
+    "ovrp_GetHandTrackingEnabled",
+    "ovrp_GetLocalDimmingSupported",
+    "ovrp_GetMarkerTrackingSupported",
+    "ovrp_GetSystemHmd3DofModeEnabled",
+};
+#define OVRP_SUCCESS 0
+static int32_t mv_ovrp_answer_no(char *out) {
+    if (out) *out = 0;
+    return OVRP_SUCCESS;
+}
+
 static void *mv_dlsym(void *handle, const char *name) {
     if (handle == &g_ossdk_handle)
         return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
+    if (name && kl_ovrp_is_handle(handle))
+        for (size_t i = 0; i < sizeof k_ovrp_no / sizeof k_ovrp_no[0]; i++)
+            if (strcmp(name, k_ovrp_no[i]) == 0) return (void *)mv_ovrp_answer_no;
     return klb_dlsym(handle, name);
 }
 

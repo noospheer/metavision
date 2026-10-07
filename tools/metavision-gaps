@@ -95,6 +95,32 @@ def check_shims():
     print(f"mv_shims: {len(mine)} names, none shadow upstream (wrappers: {', '.join(sorted(wrappers & mine))})")
 
 
+def ovrp_gaps():
+    """OVRPlugin names are resolved by dlsym at run time (libOculusXRPlugin, and
+    Unity scripts' DllImports, whose names live in global-metadata.dat), so an
+    import scan cannot see them. Read the names out of those files instead."""
+    rx = re.compile(rb"ovrp_[A-Za-z0-9_]{3,60}")
+    used = defaultdict(set)
+    for d in sorted(p for p in PULL.iterdir() if p.is_dir()):
+        sources = [d / "base.apk"] + sorted((d / "obb").glob("*.obb"))
+        for src in sources:
+            try:
+                z = zipfile.ZipFile(src)
+            except Exception:
+                continue
+            for n in z.namelist():
+                if n.endswith(("libOculusXRPlugin.so", "global-metadata.dat")):
+                    for m in rx.findall(z.read(n)):
+                        used[m.decode()].add(d.name)
+    known = set(re.findall(r'"(ovrp_[A-Za-z0-9_]+)"', (RUNTIME / "xr" / "kl_ovrp.c").read_text()))
+    known |= set(re.findall(r'"(ovrp_[A-Za-z0-9_]+)"', SHIMS.read_text())) if SHIMS.exists() else set()
+    missing = sorted((n for n in used if n not in known), key=lambda n: (-len(used[n]), n))
+    print(f"{len(used)} OVRPlugin names referenced, {len(missing)} not implemented "
+          f"(runtime + shims); by titles referencing them:")
+    for n in missing:
+        print(f"{len(used[n]):5}  {n}")
+
+
 def by_prefix(name):
     for rx, why in PREFIX_RULES:
         if rx.search(name):
@@ -163,9 +189,13 @@ def main():
     ap.add_argument("--json")
     ap.add_argument("--top", type=int, default=40)
     ap.add_argument("--check-shims", action="store_true")
+    ap.add_argument("--ovrp", action="store_true",
+                    help="OVRPlugin entry points titles reference that the runtime does not implement")
     a = ap.parse_args()
     if a.check_shims:
         return check_shims()
+    if a.ovrp:
+        return ovrp_gaps()
 
     provided = provided_names()
     pkgs = [a.title] if a.title else sorted(p.name for p in PULL.iterdir() if p.is_dir())
