@@ -5,7 +5,8 @@
 # vendor/klepton so that its own build picks up what metavision adds. The
 # submodule in the repo is never committed with these changes.
 #
-#   1. targets.py   <- build/klepton-targets.py (upstream table + generated rows)
+#   1. targets.py   <- build/klepton-targets.py (upstream table + generated rows),
+#                   and runtime/kl_target_table.h regenerated from it
 #   2. Makefile     RUNTIME_SHIP gains shims/mv_shims.c, so the shim layer is
 #                   compiled into libklepton.a with the runtime's own flags
 #   3. gen_xcodeproj.py  the app links with -u _mv_shims_install: the shims are
@@ -27,6 +28,10 @@ die() { echo "overlay: $*" >&2; exit 1; }
 [ -f "$ROOT/build/klepton-targets.py" ] || die "build/klepton-targets.py missing: run tools/metavision-targets emit"
 cp "$ROOT/build/klepton-targets.py" "$K/visionos/targets.py"
 echo "overlay: targets.py <- generated table ($(python3 "$K/visionos/targets.py" --list | grep -c '^mv_') mv_ targets)"
+# ...and the runtime's own copy of it. kl_target_table.h is committed upstream,
+# so without this the app knows no mv_ target and stops at "missing guest target".
+(cd "$K" && python3 visionos/targets.py --c-table > runtime/kl_target_table.h)
+echo "overlay: runtime/kl_target_table.h regenerated ($(grep -c 'KL_TARGET_ROW("mv_' "$K/runtime/kl_target_table.h") mv_ rows)"
 
 # 2 — shims into the shipping runtime
 if ! grep -q 'mv_shims.c' "$K/Makefile"; then
