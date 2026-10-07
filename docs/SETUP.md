@@ -193,6 +193,11 @@ the first install attempt of a development build (§5) makes it appear. Turn it
 on, restart, and confirm the prompt after the restart (or
 `sudo tools/metavision-device devmode accept`).
 
+Over the tunnel, lockdown services are published with a `.shim.remote`
+suffix (AMFI is `com.apple.amfi.lockdown.shim.remote`), so stock
+pymobiledevice3's `amfi` commands fail with "No such service"; the tool
+retries names with the suffix.
+
 `devmode enable` will answer `Device has a passcode set`: remote enabling is
 refused whenever a passcode exists, and a Vision Pro always has one.
 
