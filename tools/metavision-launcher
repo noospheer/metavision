@@ -22,10 +22,23 @@ V="$ROOT/vendor/klepton/visionos"
 [ $# -gt 0 ] || { sed -n '2,17p' "$0"; exit 2; }
 cd "$V"
 
+# A title that cannot be translated is left out with its reason, so one odd
+# library does not cost the whole library its build.
+ok=(); skipped=()
 for t in "$@"; do
     echo "== translate $t"
-    KLEPTON_TARGET=$t ./mkguest.sh | tail -2
+    if KLEPTON_TARGET=$t ./mkguest.sh > "/tmp/mkguest-$t.log" 2>&1; then
+        tail -2 "/tmp/mkguest-$t.log"
+        ok+=("$t")
+    else
+        echo "!! $t left out — it did not translate:"
+        grep -E 'klepton-ld|error|not an ELF' "/tmp/mkguest-$t.log" | tail -4 | sed 's/^/     /'
+        skipped+=("$t")
+    fi
 done
+[ ${#ok[@]} -gt 0 ] || { echo "no title translated" >&2; exit 1; }
+set -- "${ok[@]}"
+[ ${#skipped[@]} = 0 ] || echo "LEFT OUT (${#skipped[@]}): ${skipped[*]}"
 ./mkangle.sh | tail -1
 
 # The generator embeds the guest of the target it is generating for; give the
