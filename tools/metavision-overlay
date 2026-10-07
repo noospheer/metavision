@@ -199,12 +199,30 @@ enum MetavisionCatalog {{
     }}
 }}
 
+/// Set by the compositor on the first frame that reaches the display.
+enum MetavisionShell {{
+    nonisolated(unsafe) static var drawing = false
+    static let windowID = "metavision-main"
+}}
+
 struct MetavisionRoot: View {{
     @State private var chosen: String? = nil
+    @Environment(\.dismissWindow) private var dismissWindow
 
     var body: some View {{
         if chosen != nil {{
+            // The boot window has done its job once the title is drawing: close
+            // it then, not earlier, so a title that stops before its first
+            // picture still shows why. MV_KEEP_BOOT_WINDOW=1 keeps it.
             BootView()
+                .task {{
+                    guard ProcessInfo.processInfo.environment["MV_KEEP_BOOT_WINDOW"] != "1" else {{ return }}
+                    while !MetavisionShell.drawing {{
+                        try? await Task.sleep(for: .milliseconds(250))
+                    }}
+                    try? await Task.sleep(for: .seconds(1))
+                    dismissWindow(id: MetavisionShell.windowID)
+                }}
         }} else {{
             MetavisionLibrary(chosen: $chosen)
         }}
@@ -286,9 +304,9 @@ grep -q '"MetavisionLibrary.swift"' "$G" || {
 }
 if [ "${MV_LAUNCHER:-0}" = 1 ]; then
     A="$K/visionos/Sources/KleptonApp.swift"
-    grep -q 'WindowGroup { MetavisionRoot() }' "$A" || {
+    grep -q 'MetavisionRoot()' "$A" || {
         [ "$(grep -c 'WindowGroup { BootView() }' "$A")" = 1 ] || die "KleptonApp.swift root anchor not found"
-        sed -i.bak 's|WindowGroup { BootView() }|WindowGroup { MetavisionRoot() }|' "$A" && rm -f "$A.bak"
+        sed -i.bak 's|WindowGroup { BootView() }|WindowGroup(id: MetavisionShell.windowID) { MetavisionRoot() }|' "$A" && rm -f "$A.bak"
     }
     echo "overlay: launcher root = metavision library"
 fi
@@ -347,6 +365,13 @@ def patch(path, old, new, marker):
     if s.count(old) != 1:
         sys.exit(f"overlay: anchor moved upstream in {path}: {old[:70]!r}")
     open(path, "w").write(s.replace(old, new))
+
+# The launcher closes its boot window once a title is drawing.
+patch(f"{v}/Sources/KleptonCompositor.swift",
+      "                autoreleasepool { presented += renderFrame() }\n",
+      "                autoreleasepool { presented += renderFrame() }\n"
+      "                if presented > 0 && !MetavisionShell.drawing { MetavisionShell.drawing = true }  // metavision: first picture\n",
+      "metavision: first picture")
 
 # Voice needs .playAndRecord, chosen the same way Klepton's own mic toggle does.
 patch(f"{v}/Sources/KleptonAudio.swift",
