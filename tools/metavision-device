@@ -235,33 +235,29 @@ def title_icon(tree):
 
 
 async def cmd_stage(a):
-    """Copy a title's data into its app's container, in the layout kl_app.c reads.
-    Anything already there at full size is skipped, so re-running resumes:
-
+    """Copy titles' data into their app's container, in the layout kl_app.c reads:
         Documents/<tree>.apk                    the APK (Unity opens it as a zip)
         Documents/<tree>/assets/                decoded assets
         Documents/<tree>/apktool.yml, AndroidManifest.xml
         Documents/android-files/<obb path>/     OBB, single-title app
         Documents/<tree>/android-files/<obb>/   OBB, inside the metavision launcher
+    Re-running resumes: a finished title carries Documents/<tree>/.mv-staged (a
+    fingerprint of what was copied) and is skipped with one read; an unfinished
+    one skips complete files and continues part-copied ones from their last
+    byte. One connection serves every title, and a dropped connection is
+    re-opened and the copy carried on, up to --retries times.
     """
     import re
     from pymobiledevice3.services.house_arrest import HouseArrestService
-
     root = Path(__file__).resolve().parent.parent
     guests = root / "build" / "guests"
     rows = json.loads((guests / "targets.json").read_text())
-    if a.target not in rows:
-        sys.exit(f"unknown target {a.target}; see tools/metavision-targets list")
-    t = rows[a.target]
-    tree, apk = guests / t["tree"], guests / t["apk"]
-    if not (tree / "apktool.yml").exists() or not apk.exists():
-        sys.exit(f"{a.target} is not staged: tools/metavision-targets stage")
-    pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text()).group(1)
-    bundle = a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
-                          "metavision.dev.klepton.target." + a.target.replace("_", "-"))
-    obb_src = root / "pull" / pkg / "obb"
-    files_root = f"Documents/{t['tree']}/android-files" if a.launcher else "Documents/android-files"
-
+    names = list(rows) if a.all else a.targets
+    if not names:
+        sys.exit("stage: name titles, or --all")
+    for n in names:
+        if n not in rows:
+            sys.exit(f"unknown target {n}; see tools/metavision-targets list")
     async def remote_size(afc, path):
         """Bytes under a remote path (file or tree); -1 when it is not there."""
         try:
@@ -336,30 +332,87 @@ async def cmd_stage(a):
         print(f"  {label:7} -> {remote_path}", flush=True)
         await afc.push(str(local), remote_parent)
 
-    async def fn(rsd):
-        afc = await HouseArrestService.create(rsd, bundle)
+    def plan(name):
+        t = rows[name]
+        tree, apk = guests / t["tree"], guests / t["apk"]
+        if not (tree / "apktool.yml").exists() or not apk.exists():
+            sys.exit(f"{name} is not staged: tools/metavision-targets stage")
+        pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text()).group(1)
+        obb_src = root / "pull" / pkg / "obb"
+        obbs = sorted(obb_src.glob("*")) if obb_src.is_dir() and not a.skip_obb else []
+        assets = tree / "assets"
+        afiles = [f for f in assets.rglob("*") if f.is_file()] if assets.is_dir() else []
+        # What a finished copy holds; any change to the source re-checks it.
+        stamp = json.dumps({"apk": apk.stat().st_size, "assets": [len(afiles), sum(f.stat().st_size for f in afiles)],
+                            "obb": {f.name: f.stat().st_size for f in obbs}}, sort_keys=True)
+        return t, tree, apk, obbs, stamp
+
+    def bundle_for(name):
+        return a.bundle or ("metavision.dev.klepton.target.metavision" if a.launcher else
+                            "metavision.dev.klepton.target." + name.replace("_", "-"))
+
+    async def stage_one(afc, name):
+        t, tree, apk, obbs, stamp = plan(name)
+        marker = f"Documents/{t['tree']}/.mv-staged"
         try:
-            await afc.makedirs(f"Documents/{t['tree']}")
-            for m in ("apktool.yml", "AndroidManifest.xml"):
-                await afc.push(str(tree / m), f"Documents/{t['tree']}/{m}", progress_bar=False)
-            icon = title_icon(tree)
-            if icon:   # shown on the title's tile in the launcher's library
-                await afc.set_file_contents(f"Documents/{t['tree']}/icon.png", icon.read_bytes())
-            await push_unless_done(afc, apk, f"Documents/{t['apk']}", f"Documents/{t['apk']}", "apk")
-            if (tree / "assets").is_dir():
-                await push_unless_done(afc, tree / "assets", f"Documents/{t['tree']}",
-                                       f"Documents/{t['tree']}/assets", "assets")
-            obbs = sorted(obb_src.glob("*")) if obb_src.is_dir() and not a.skip_obb else []
-            if obbs:
-                dest = f"{files_root}/{t['obb']}"
-                await afc.makedirs(dest)
-                for f in obbs:
-                    await push_unless_done(afc, f, f"{dest}/{f.name}", f"{dest}/{f.name}",
-                                           f"obb {f.stat().st_size / 1e9:.1f}G")
+            if (await afc.get_file_contents(marker)).decode() == stamp:
+                print(f"{name}: already complete, skipped", flush=True)
+                return
+        except Exception:
+            pass
+        print(f"{name}:", flush=True)
+        files_root = f"Documents/{t['tree']}/android-files" if a.launcher else "Documents/android-files"
+        await afc.makedirs(f"Documents/{t['tree']}")
+        for m in ("apktool.yml", "AndroidManifest.xml"):
+            await afc.set_file_contents(f"Documents/{t['tree']}/{m}", (tree / m).read_bytes())
+        icon = title_icon(tree)
+        if icon:   # shown on the title's tile in the launcher's library
+            await afc.set_file_contents(f"Documents/{t['tree']}/icon.png", icon.read_bytes())
+        await push_unless_done(afc, apk, f"Documents/{t['apk']}", f"Documents/{t['apk']}", "apk")
+        if (tree / "assets").is_dir():
+            await push_unless_done(afc, tree / "assets", f"Documents/{t['tree']}",
+                                   f"Documents/{t['tree']}/assets", "assets")
+        if obbs:
+            dest = f"{files_root}/{t['obb']}"
+            await afc.makedirs(dest)
+            for f in obbs:
+                await push_unless_done(afc, f, f"{dest}/{f.name}", f"{dest}/{f.name}",
+                                       f"obb {f.stat().st_size / 1e9:.1f}G")
+        await afc.set_file_contents(marker, stamp.encode())
+        print(f"{name}: complete", flush=True)
+
+    todo = list(names)
+
+    async def fn(rsd):
+        afcs = {}
+        try:
+            while todo:
+                b = bundle_for(todo[0])
+                if b not in afcs:
+                    afcs[b] = await HouseArrestService.create(rsd, b)
+                await stage_one(afcs[b], todo[0])
+                todo.pop(0)
         finally:
-            await afc.close()
-        print(f"staged {a.target} into {bundle}")
-    await with_rsd(a, fn)
+            for x in afcs.values():
+                try:
+                    await x.close()
+                except Exception:
+                    pass
+
+    for attempt in range(a.retries + 1):
+        try:
+            await with_rsd(a, fn)
+            break
+        except (ConnectionError, OSError, asyncio.TimeoutError, Exception) as e:
+            if isinstance(e, SystemExit) or not todo:
+                raise
+            if attempt == a.retries:
+                print(f"\ngave up after {a.retries} reconnects; run again to continue. Not finished: {' '.join(todo)}")
+                sys.exit(1)
+            print(f"\n--- connection dropped ({type(e).__name__}); reconnecting in 10 s "
+                  f"({attempt + 1}/{a.retries}), continuing at {todo[0]}", flush=True)
+            await asyncio.sleep(10)
+    print(f"\nALL DONE: {len(names)} title(s)")
 
 
 async def cmd_logs(a):
@@ -545,7 +598,9 @@ def main():
     sub.add_parser("info")
     p = sub.add_parser("devmode"); p.add_argument("action", choices=["reveal", "enable", "accept"])
     p = sub.add_parser("install"); p.add_argument("ipa")
-    p = sub.add_parser("stage"); p.add_argument("target")
+    p = sub.add_parser("stage"); p.add_argument("targets", nargs="*")
+    p.add_argument("--all", action="store_true", help="every generated title")
+    p.add_argument("--retries", type=int, default=20, help="reconnects after a dropped connection")
     p.add_argument("--bundle", help="app bundle id (default: the title's own app)")
     p.add_argument("--launcher", action="store_true", help="stage into the metavision launcher's layout")
     p.add_argument("--skip-obb", action="store_true", help="leave OBBs alone (already copied)")

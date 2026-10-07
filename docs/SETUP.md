@@ -223,7 +223,7 @@ sudo tools/metavision-device install mv_<title>.ipa
 | Command (`sudo tools/metavision-device …`) | Does |
 |---|---|
 | `install APP.ipa` | install or update an app (staged data survives) |
-| `stage mv_<title> [--launcher]` | copy a title's APK, assets, OBB and icon into the app — **re-run to resume**: anything already there at full size is skipped |
+| `stage mv_<title>… \| --all [--launcher]` | copy titles' APK, assets, OBB and icon into the app over one connection. A finished title is marked and skipped with one read; part-copied files continue from their last byte; a dropped connection reconnects and carries on (`--retries`, default 20) |
 | `icons` | copy just the icons of titles staged earlier into the launcher |
 | `ls [--launcher]` | what is staged, with sizes |
 | `logs mv_<title> [--launcher]` | pull the boot log and crash report |
@@ -233,7 +233,7 @@ sudo tools/metavision-device install mv_<title>.ipa
 **The headset sleeps as soon as it is taken off, and a copy in progress stops.**
 There is no setting to keep it awake (visionOS 2 removed the old workarounds).
 Keep it on, on charge, for long copies — a large OBB takes 15–40 minutes over
-Wi-Fi — and re-run `stage` if it drops; it resumes. While worn, a USB-C PD
+Wi-Fi. `stage` reconnects by itself when it drops, and re-running it resumes. While worn, a USB-C PD
 charger of 30 W or more keeps it running indefinitely.
 
 When a title will not start, see [COMPATIBILITY.md](COMPATIBILITY.md).
