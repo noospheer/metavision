@@ -624,7 +624,41 @@ patch(I,
       "        kl_jni_throw(\"java/io/FileNotFoundException\");\n"
       "        return (klj_val){.l = NULL};      // guest catches IOException\n",
       "metavision: Android throws here")
-print("overlay: Java exceptions (pending throwable, Throw/ThrowNew, missing asset and zip)")
+# ...and what a guest does with a caught one: Unity asks it for its text
+# (toString / getMessage) and copies the answer. Answer with the class name in
+# Java's dotted spelling, as an exception with no message prints.
+A = f"{rt}/jni/kl_jni_android.c"
+patch(A,
+      "static klj_val klj_Object_getClass(void *env, void *self, const klj_val *a, int n) {\n",
+      "// metavision: Object.toString / Throwable.getMessage — the class name, dotted;\n"
+      "// a String is its own text.\n"
+      "static klj_val mv_Object_toString(void *env, void *self, const klj_val *a, int n) {\n"
+      "    (void)env; (void)a; (void)n;\n"
+      "    klj_object *o = klj_as_object(self);\n"
+      "    const char *cls = o && o->cls ? o->cls : \"java/lang/Object\";\n"
+      "    if (!strcmp(cls, \"java/lang/String\")) return (klj_val){.l = self};\n"
+      "    char dotted[256];\n"
+      "    size_t i = 0;\n"
+      "    for (; cls[i] && i < sizeof dotted - 1; i++) dotted[i] = cls[i] == '/' ? '.' : cls[i];\n"
+      "    dotted[i] = 0;\n"
+      "    return (klj_val){.l = kl_jni_new_string(dotted)};\n"
+      "}\n"
+      "static klj_val mv_Object_noop(void *env, void *self, const klj_val *a, int n) {\n"
+      "    (void)env; (void)self; (void)a; (void)n;\n"
+      "    return (klj_val){0};\n"
+      "}\n\n"
+      "static klj_val klj_Object_getClass(void *env, void *self, const klj_val *a, int n) {\n",
+      "metavision: Object.toString")
+patch(A,
+      '    {"java/lang/Object", "getClass", "()Ljava/lang/Class;", klj_Object_getClass},\n',
+      '    {"java/lang/Object", "getClass", "()Ljava/lang/Class;", klj_Object_getClass},\n'
+      '    {"java/lang/Object", "toString", "()Ljava/lang/String;", mv_Object_toString},   // metavision: toString\n'
+      '    {"java/lang/Throwable", "toString", "()Ljava/lang/String;", mv_Object_toString},\n'
+      '    {"java/lang/Throwable", "getMessage", "()Ljava/lang/String;", mv_Object_toString},\n'
+      '    {"java/lang/Throwable", "getLocalizedMessage", "()Ljava/lang/String;", mv_Object_toString},\n'
+      '    {"java/lang/Throwable", "printStackTrace", "()V", mv_Object_noop},\n',
+      "metavision: toString")
+print("overlay: Java exceptions (pending throwable, Throw/ThrowNew, missing asset and zip; toString/getMessage)")
 EOF
 
 # 10 — dl_iterate_phdr names: full paths, as Android gives. Klepton hands the
