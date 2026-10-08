@@ -254,11 +254,25 @@ async def cmd_tunnel(a):
                 os.chmod(TUNNEL_FILE, 0o644)
                 print(f"{time.strftime('%H:%M:%S')} tunnel up: {t.address} port {t.port} "
                       "(leave this running; Ctrl+C closes it)", flush=True)
+                misses = 0
                 while True:          # a cheap check that it still carries traffic
                     await asyncio.sleep(20)
                     rsd = RemoteServiceDiscoveryService((t.address, t.port))
-                    await asyncio.wait_for(rsd.connect(), 20)
-                    await rsd.close()
+                    try:
+                        await asyncio.wait_for(rsd.connect(), 30)
+                        misses = 0
+                    except Exception:
+                        # One slow answer is not a dead tunnel (a busy headset, a
+                        # big transfer); tearing it down would cut what runs on it.
+                        misses += 1
+                        print(f"{time.strftime('%H:%M:%S')} tunnel check missed ({misses}/3)", flush=True)
+                        if misses >= 3:
+                            raise
+                    finally:
+                        try:
+                            await rsd.close()
+                        except Exception:
+                            pass
         except (KeyboardInterrupt, asyncio.CancelledError):
             break
         except Exception as e:
