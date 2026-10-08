@@ -99,7 +99,14 @@ def triage(d: Path):
     if crash.is_file() and (m := FAULT.search(crash.read_text(errors="replace"))):
         ending = f"crashed: signal {m.group(1)} at {m.group(2)}, pc {m.group(3)}"
     for ips in sorted(d.glob("*.ips")):
-        ending = "crashed: " + ips_summary(ips)
+        try:
+            bug = json.loads(ips.read_text(errors="replace").split("\n", 1)[0]).get("bug_type")
+        except Exception:
+            bug = None
+        if bug in ("309", "109", None):           # a crash (or unreadable: assume one)
+            ending = "crashed: " + ips_summary(ips)
+        else:                                     # 202 cpu_resource and co.: a diagnostic
+            notes.append(f"system diagnostic report ({bug}): {ips.name.split('-')[0]}")
     serious = sum(n for k, n in errs.items() if SERIOUS.search(k))
     return started, pics, ending, notes, serious
 
