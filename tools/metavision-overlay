@@ -544,3 +544,226 @@ if "metavision: measured rows" not in s:
     print(f"overlay: texture-unit cap rows for {rows.count(chr(10)) + 1 if rows else 0} Unity build(s)")
 EOF
 fi
+
+# 9 — Java exceptions. Klepton's JNI never has one pending, so a call that
+# throws on Android (AssetManager.open of a missing asset, new ZipFile of a
+# missing OBB) returns null with nothing to check, and the guest reads through
+# it: a Scanner over null, strlen(NULL), a crash. Give each thread a pending
+# throwable, the ExceptionCheck/Occurred/Clear/Throw/ThrowNew that read and set
+# it, and raise it where Android would. Any Java call clears a stale one first
+# (calling into Java with one pending is already illegal on Android).
+python3 - "$K/runtime" <<'EOF'
+import sys
+rt = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+
+J = f"{rt}/kl_jni.c"
+patch(J,
+      "static void *klj_ExceptionOccurred(void *env) { (void)env; return NULL; }\n"
+      "static void  klj_ExceptionDescribe(void *env) { (void)env; }\n"
+      "static void  klj_ExceptionClear(void *env)    { (void)env; }\n"
+      " kl_jint klj_ExceptionCheck(void *env)  { (void)env; return 0; }\n",
+      "// metavision: Java exceptions — one pending throwable per thread.\n"
+      "static __thread void *klj_pending;\n"
+      "void kl_jni_throw(const char *cls) {\n"
+      "    klj_pending = kl_jni_new_object(cls);\n"
+      "    KLJ_LOG(\"throw %s\", cls);\n"
+      "}\n"
+      "static void *klj_ExceptionOccurred(void *env) { (void)env; return klj_pending; }\n"
+      "static void  klj_ExceptionDescribe(void *env) {\n"
+      "    (void)env;\n"
+      "    if (klj_pending) KLJ_LOG(\"ExceptionDescribe: %s\", klj_as_object(klj_pending) ? klj_as_object(klj_pending)->cls : \"?\");\n"
+      "}\n"
+      "static void  klj_ExceptionClear(void *env)    { (void)env; klj_pending = NULL; }\n"
+      " kl_jint klj_ExceptionCheck(void *env)  { (void)env; return klj_pending != NULL; }\n"
+      "static kl_jint klj_Throw(void *env, void *obj) { (void)env; klj_pending = obj; return 0; }\n"
+      "static kl_jint klj_ThrowNew(void *env, void *clazz, const char *msg) {\n"
+      "    (void)env; (void)msg;\n"
+      "    kl_jni_throw(clazz ? klj_class_name(clazz) : \"java/lang/RuntimeException\");\n"
+      "    return 0;\n"
+      "}\n",
+      "metavision: Java exceptions")
+patch(J,
+      "    ENV(ExceptionCheck,       klj_ExceptionCheck);\n",
+      "    ENV(ExceptionCheck,       klj_ExceptionCheck);\n"
+      "    ENV(Throw,                klj_Throw);      // metavision: Java exceptions (slots)\n"
+      "    ENV(ThrowNew,             klj_ThrowNew);\n",
+      "metavision: Java exceptions (slots)")
+patch(J,
+      "                               kl_va *va, const klj_jvalue *args) {\n"
+      "    klj_val zero = {0};\n",
+      "                               kl_va *va, const klj_jvalue *args) {\n"
+      "    klj_val zero = {0};\n"
+      "    klj_pending = NULL;   // metavision: a new Java call starts with none pending\n",
+      "metavision: a new Java call starts")
+
+S = f"{rt}/jni/kl_jni_services.c"
+patch(S,
+      "    if (!f) return (klj_val){.l = NULL};   // guest catches IOException\n\n"
+      "    fseek(f, 0, SEEK_END);\n",
+      "    if (!f) {   // metavision: Android throws here, and the guest catches it\n"
+      "        extern void kl_jni_throw(const char *);\n"
+      "        kl_jni_throw(\"java/io/FileNotFoundException\");\n"
+      "        return (klj_val){.l = NULL};\n"
+      "    }\n\n"
+      "    fseek(f, 0, SEEK_END);\n",
+      "metavision: Android throws here")
+
+I = f"{rt}/jni/kl_jni_io.c"
+patch(I,
+      "        free(z->e); free(z);\n"
+      "        return (klj_val){.l = NULL};      // guest catches IOException\n",
+      "        free(z->e); free(z);\n"
+      "        extern void kl_jni_throw(const char *);   // metavision: Android throws here\n"
+      "        kl_jni_throw(\"java/io/FileNotFoundException\");\n"
+      "        return (klj_val){.l = NULL};      // guest catches IOException\n",
+      "metavision: Android throws here")
+print("overlay: Java exceptions (pending throwable, Throw/ThrowNew, missing asset and zip)")
+EOF
+
+# 10 — dl_iterate_phdr names: full paths, as Android gives. Klepton hands the
+# guest each image's bare soname; Unity 2018's il2cpp open()s that name to read
+# its own ELF header and mmaps the result unchecked, so a relative name that
+# does not open is a read through MAP_FAILED. The image's real file (the
+# translated binary) opens, maps, and fails the ELF magic check cleanly.
+python3 - "$K/runtime/kl_dl.c" <<'EOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "metavision: full image paths" not in s:
+    old = "        info.dlpi_name  = g_imgs[i].soname;\n"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: dlpi_name")
+    s = s.replace(old,
+        "        info.dlpi_name  = mv_image_path(i);   // metavision: full image paths\n")
+    old = "int kl_dl_iterate_phdr(int (*cb)(void *, size_t, void *), void *data) {\n"
+    s = s.replace(old,
+        "// metavision: the file each image was loaded from, as a full path (Android's\n"
+        "// dlpi_name), found once with the host's dladdr; the soname if it has none.\n"
+        "static const char *mv_image_path(int i) {\n"
+        "    static const char *paths[KL_MAX_IMAGES];\n"
+        "    if (i < 0 || i >= KL_MAX_IMAGES) return g_imgs[i].soname;\n"
+        "    if (!paths[i]) {\n"
+        "        Dl_info di;\n"
+        "        const char *p = NULL;\n"
+        "        if (dladdr(kl_base(g_imgs[i].img), &di) && di.dli_fname && di.dli_fname[0] == '/')\n"
+        "            p = strdup(di.dli_fname);\n"
+        "        paths[i] = p ? p : g_imgs[i].soname;\n"
+        "    }\n"
+        "    return paths[i];\n"
+        "}\n\n" + old, 1)
+    if "#include <dlfcn.h>" not in s:
+        s = "#include <dlfcn.h>   // metavision: dladdr\n" + s
+    open(path, "w").write(s)
+    print("overlay: dl_iterate_phdr gives full image paths")
+EOF
+
+# 11 — socket()/socketpair() with Linux's SOCK_NONBLOCK|SOCK_CLOEXEC in the type.
+# Darwin has no such type bits and refuses the call, so a library that opens
+# sockets the modern Linux way (Rust's std/tokio always does) gets an error it
+# treats as fatal. Strip them and apply them with fcntl, as accept4/pipe2 do.
+python3 - "$K/runtime/libc/kl_shim.c" <<'EOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "metavision: Linux socket type flags" not in s:
+    def rep(old, new):
+        global s
+        if s.count(old) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+        s = s.replace(old, new)
+    rep("static int kl_socket(int domain, int type, int protocol) {\n",
+        "// metavision: Linux socket type flags — SOCK_NONBLOCK (0x800) and\n"
+        "// SOCK_CLOEXEC (0x80000) ride in `type` on Linux; Darwin refuses them there.\n"
+        "static int mv_sock_flags(int *type) {\n"
+        "    int f = *type & (0x800 | 0x80000);\n"
+        "    *type &= ~(0x800 | 0x80000);\n"
+        "    return f;\n"
+        "}\n"
+        "static int mv_apply_sock_flags(int fd, int f) {\n"
+        "    if (fd < 0 || !f) return fd;\n"
+        "    if (f & 0x80000) fcntl(fd, F_SETFD, FD_CLOEXEC);\n"
+        "    if (f & 0x800)   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);\n"
+        "    return fd;\n"
+        "}\n"
+        "static int kl_socketpair(int domain, int type, int protocol, int sv[2]) {\n"
+        "    int f = mv_sock_flags(&type);\n"
+        "    if (domain == 10) domain = AF_INET6;\n"
+        "    int r = socketpair(domain, type, protocol, sv);\n"
+        "    if (r == 0) { mv_apply_sock_flags(sv[0], f); mv_apply_sock_flags(sv[1], f); }\n"
+        "    return r;\n"
+        "}\n\n"
+        "static int kl_socket(int domain, int type, int protocol) {\n"
+        "    int mv_flags = mv_sock_flags(&type);   // applied to the fd at the end\n")
+    rep("        return fd;\n    }\n    int fd = socket(domain, type, protocol);\n",
+        "        return mv_apply_sock_flags(fd, mv_flags);\n    }\n    int fd = socket(domain, type, protocol);\n"
+        "    mv_apply_sock_flags(fd, mv_flags);\n")
+    rep("    E(\"socket\", kl_socket),\n",
+        "    E(\"socket\", kl_socket), E(\"socketpair\", kl_socketpair),   // metavision: socketpair flags\n")
+    open(path, "w").write(s)
+    print("overlay: socket()/socketpair() take Linux's SOCK_NONBLOCK|SOCK_CLOEXEC")
+EOF
+
+# 12 — Class.forName(String). Klepton binds only the three-argument form; a
+# guest reaching it through Unity's reflection (AndroidJavaClass, e.g. FMOD's
+# `new AndroidJavaClass("org.fmod.FMOD")`) asks for the one-argument form, gets
+# null, and throws a NullReferenceException every frame.
+python3 - "$K/runtime/jni/kl_jni_lang.c" <<'EOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+old = ('    {"java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", klj_Class_forName},\n')
+if "metavision: forName(String)" not in s:
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: forName")
+    s = s.replace(old, old +
+        '    {"java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", klj_Class_forName},   // metavision: forName(String)\n'
+        '    {"java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Object;", klj_Class_forName},  // ...as Unity\'s reflection spells it\n')
+    open(path, "w").write(s)
+    print("overlay: Class.forName(String)")
+EOF
+
+# 13 — System.loadLibrary(name), and FMOD's Java half. loadLibrary is the plain
+# Java form of the UnityPlayer.loadLibrary Klepton already serves (guest dlopen
+# of lib<name>.so, then JNI_OnLoad). FMOD's org.fmod.FMOD.init(context) only
+# keeps the context, and getAssetManager() hands its native side the context's
+# AssetManager, from which it loads sound banks packed in the app's assets.
+python3 - "$K/runtime/jni" <<'EOF'
+import sys
+d = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+old = '    {"java/lang/System", "load", "(Ljava/lang/String;)V", klj_System_load},\n'
+patch(f"{d}/kl_jni_net.c", old, old +
+      '    {"java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", klj_UnityPlayer_loadLibrary},   // metavision: loadLibrary\n',
+      "metavision: loadLibrary")
+S = f"{d}/kl_jni_services.c"
+old = '    {"android/content/Context", "getAssets", "()Landroid/content/res/AssetManager;", klj_Context_getAssets},\n'
+patch(S, old, old +
+      '    {"org/fmod/FMOD", "getAssetManager", "()Landroid/content/res/AssetManager;", klj_Context_getAssets},   // metavision: FMOD\n'
+      '    {"org/fmod/FMOD", "init", "(Landroid/content/Context;)V", mv_FMOD_init},\n'
+      '    {"org/fmod/FMOD", "init", "(Lcom.unity3d.player.UnityPlayerActivity;)V", mv_FMOD_init},\n'
+      '    {"org/fmod/FMOD", "init", "(Lcom/unity3d/player/UnityPlayerActivity;)V", mv_FMOD_init},\n'
+      '    {"org/fmod/FMOD", "close", "()V", mv_FMOD_init},\n',
+      "metavision: FMOD")
+patch(S, "static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {\n",
+      "// metavision: FMOD.init(context)/close() — the context is ours already; nothing to keep.\n"
+      "static klj_val mv_FMOD_init(void *env, void *self, const klj_val *a, int n) {\n"
+      "    (void)env; (void)self; (void)a; (void)n;\n"
+      "    return (klj_val){0};\n"
+      "}\n\n"
+      "static klj_val klj_Context_getAssets(void *env, void *self, const klj_val *a, int n) {\n",
+      "metavision: FMOD.init(context)")
+print("overlay: System.loadLibrary, FMOD's Java half")
+EOF
