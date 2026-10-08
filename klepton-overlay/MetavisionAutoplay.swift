@@ -17,6 +17,17 @@
 //
 // Either way it aims at a grid of directions around the head's forward view, a
 // click at each, with other buttons and both thumbsticks on their own periods.
+//
+// The head moves too (MV_AUTOPLAY_HEAD=0 holds it still): the pose the title
+// sees looks left and right, up and down, turns right round once a minute,
+// steps forward, back and sideways and crouches — for titles that react to
+// where the user looks or goes. The display is not moved, so anyone wearing
+// the headset during a pass sees the picture swing.
+//
+// In hands-free mode the commands are spoken: synthesised speech replaces the
+// microphone's input (MetavisionVoice.say), so the recogniser itself is
+// tested; the log records each phrase said and each command heard. Without
+// speech permission (or MV_AUTOPLAY_SPEECH=0) they are handed over directly.
 // Every action is logged ([mv-autoplay]) so a fault lines up with what was
 // pressed just before it.
 //
@@ -36,6 +47,16 @@ enum MetavisionAutoplay {
     private static var start: Double = 0
     private static var lastStep = -1
     private static var lastPath = ""
+    static let movesHead: Bool = enabled && (getenv("MV_AUTOPLAY_HEAD").map { String(cString: $0) != "0" } ?? true)
+    static let speaks: Bool = enabled && (getenv("MV_AUTOPLAY_SPEECH").map { String(cString: $0) != "0" } ?? true)
+    private static var headStart: Double = 0
+    private static var headNow_ = ""
+    private static let headLock = NSLock()
+    /// Written on the render thread, read on the controller thread.
+    private static var headNow: String {
+        get { headLock.lock(); defer { headLock.unlock() }; return headNow_ }
+        set { headLock.lock(); headNow_ = newValue; headLock.unlock() }
+    }
 
     // 5 x 3 grid, degrees from the head's forward: centre first, where menus usually are.
     private static let aims: [(Float, Float)] = {
@@ -84,8 +105,41 @@ enum MetavisionAutoplay {
             : controllersAndHands(step: step, phase: phase, now: now, head: hp, heading: heading, aim: aim)
         if step != lastStep {
             lastStep = step
-            NSLog("[mv-autoplay] t=%.1fs step %ld: aim %ld,%ld%@", t, step, Int(yaw), Int(pitch), what as NSString)
+            NSLog("[mv-autoplay] t=%.1fs step %ld: aim %ld,%ld%@%@", t, step, Int(yaw), Int(pitch), what as NSString,
+                  headNow as NSString)
         }
+    }
+
+    // MARK: head motion
+
+    /// The head pose the title is given: the real one, moved by the script.
+    /// Called by KleptonCompositor where it publishes the head (patched in by
+    /// tools/metavision-overlay); returns the pose unchanged when not moving.
+    static func moveHead(_ pose: (SIMD3<Float>, simd_quatf)) -> (SIMD3<Float>, simd_quatf) {
+        guard movesHead else { return pose }
+        let now = ProcessInfo.processInfo.systemUptime
+        if headStart == 0 { headStart = now; NSLog("[mv-autoplay] head motion on") }
+        let t = Float(now - headStart)
+        let tau: Float = 2 * .pi
+        let m = t.truncatingRemainder(dividingBy: 60)
+        func ramp(_ a: Float, _ b: Float) -> Float { min(1, max(0, (m - a) / (b - a))) }
+        // Look around; once a minute (40-50 s) turn right round and back.
+        let turn = ramp(40, 42) - ramp(48, 50)
+        let yaw = 75 * sinf(tau * t / 16) * (1 - turn) + 180 * turn
+        let pitch = 25 * sinf(tau * t / 7)
+        // Walk about a metre each way, sidestep, and crouch at 20-26 s.
+        let fwd = 0.6 * sinf(tau * t / 30), side = 0.3 * sinf(tau * t / 22)
+        let crouch = 0.35 * (ramp(20, 21) - ramp(25, 26))
+
+        let (p, q) = pose
+        let f = q.act(SIMD3<Float>(0, 0, -1))
+        let heading = simd_quatf(angle: atan2f(-f.x, -f.z), axis: SIMD3<Float>(0, 1, 0))
+        let ry = simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
+        let rx = simd_quatf(angle: pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
+        let np = p + heading.act(SIMD3<Float>(side, -crouch, -fwd))
+        headNow = String(format: "; head yaw %.0f pitch %.0f, at %+.2f,%+.2f%@", yaw, pitch, side, -fwd,
+                         crouch > 0.1 ? ", crouching" : "")
+        return (np, ry * q * rx)
     }
 
     // MARK: hands mode — controllers and Meta hand skeletons
@@ -178,8 +232,13 @@ enum MetavisionAutoplay {
         if step % 29 == 17 { cmds.append(.menu) }
         if step % 17 == 11 { cmds.append(.hold) }
         if step % 17 == 13 { cmds.append(.release) }
-        for c in cmds { hf.inject(c) }
-        what += " + say " + cmds.map { $0.rawValue }.joined(separator: ", ")
+        let words = cmds.map { $0.rawValue }.joined(separator: ", ")
+        if speaks && MetavisionVoice.shared.say(words) {
+            what += " + say \"" + words + "\""
+        } else {
+            for c in cmds { hf.inject(c) }
+            what += " + command " + words
+        }
         return what
     }
 }

@@ -248,6 +248,17 @@ hands-free, auto), each for `--seconds` (default 75), with **scripted input**
 | `handsfree` | no controllers or hands: a gaze ray at each grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
 | `auto` | the two alternating every 20 s, as a hand entering and leaving view |
 
+In every mode the **head moves** as well (`MV_AUTOPLAY_HEAD=0` holds it
+still): the pose the title sees looks around, turns right round once a minute,
+steps about and crouches. In hands-free the commands are **spoken** —
+synthesised speech replaces the microphone's input, so the recogniser is
+tested too (`MV_AUTOPLAY_SPEECH=0` hands them over directly); triage reports
+phrases said against commands recognised. Speech recognition must have been
+allowed once (choose Hands-free in the launcher and accept the prompts).
+Real eye tracking, Dwell Control and the system pinch cannot be scripted:
+visionOS gives apps a gaze ray only with a system select, and that ray is what
+the script supplies.
+
 After each run the title's boot log, the runtime's crash log and any system
 crash report (`.ips`) are pulled to `build/test/<run>/<title>/<mode>/` and
 judged by `tools/metavision-triage`: **pass**, **errors** (exceptions,

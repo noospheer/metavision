@@ -58,6 +58,10 @@ def triage(d: Path):
         notes.append(f"Unity error x{n}: {k}")
     if HANDS in text:
         notes.append("uses hand tracking")
+    said = len(re.findall(r'\[mv-autoplay\][^\n]* say "', text))
+    if said:
+        heard = len(re.findall(r"\[mv\] voice: (?:select|grab|hold|release|confirm|back|menu|recenter)\b", text))
+        notes.append(f"speech: {said} phrase(s) said, {heard} command(s) recognised")
     plays = PLAY.findall(text)
     if plays:
         notes.append(f"auto-play reached {plays[-1]}")

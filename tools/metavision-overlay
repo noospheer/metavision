@@ -207,7 +207,7 @@ enum MetavisionShell {{
 
 struct MetavisionRoot: View {{
     @State private var chosen: String? = MetavisionRoot.autostart()
-    @Environment(\.dismissWindow) private var dismissWindow
+    @Environment(\\.dismissWindow) private var dismissWindow
 
     /// MV_AUTOSTART=<target> — from the launch environment or Documents/klepton.env
     /// — opens that title directly, for unattended test passes.
@@ -397,6 +397,20 @@ patch(f"{v}/Sources/KleptonControllers.swift",
       "        reportPinch()\n",
       "        reportPinch()\n        MetavisionAutoplay.drive()   // metavision: autoplay\n",
       "metavision: autoplay")
+
+# Auto-play's head motion: the head pose the title is given (not the display's).
+patch(f"{v}/Sources/KleptonCompositor.swift",
+      "            let (p, q) = Self.decompose(\n"
+      "                Self.headFrom(anchor.originFromAnchorTransform, midpoint: eyeMidpointInDevice))\n",
+      "            let (p, q) = MetavisionAutoplay.moveHead(Self.decompose(   // metavision: autoplay head\n"
+      "                Self.headFrom(anchor.originFromAnchorTransform, midpoint: eyeMidpointInDevice)))\n",
+      "metavision: autoplay head")
+# ...and no per-instant prediction while it moves: that would be the real head.
+patch(f"{v}/Sources/KleptonCompositor.swift",
+      "        guard let out, let tracker = KleptonCompositor.headAtTracker else { return 0 }\n",
+      "        guard !MetavisionAutoplay.movesHead,   // metavision: autoplay head prediction\n"
+      "              let out, let tracker = KleptonCompositor.headAtTracker else { return 0 }\n",
+      "metavision: autoplay head prediction")
 
 # The launcher closes its boot window once a title is drawing.
 patch(f"{v}/Sources/KleptonCompositor.swift",

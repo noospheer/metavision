@@ -222,6 +222,12 @@ final class MetavisionVoice {
         "recenter": .recenter, "re-center": .recenter,
     ]
     private var heard = 0              // commands already acted on in this task
+    // Auto-play's speech: synthesised samples that replace the microphone's.
+    private let synth = AVSpeechSynthesizer()
+    private let feedLock = NSLock()
+    private var feed: [Float] = []
+    private var tapFormat: AVAudioFormat?
+    private var converter: AVAudioConverter?
     private var onCommand: ((Command) -> Void)?
     private var running = false
 
@@ -286,7 +292,9 @@ final class MetavisionVoice {
 
         let input = engine.inputNode
         input.removeTap(onBus: 0)
-        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buf, _ in
+        tapFormat = input.outputFormat(forBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { [weak self] buf, _ in
+            self?.overwrite(buf)
             req.append(buf)
         }
         engine.prepare()
@@ -315,6 +323,52 @@ final class MetavisionVoice {
             }
         }
         NSLog("[mv] voice: listening (on device: %@)", req.requiresOnDeviceRecognition ? "yes" : "no")
+    }
+
+    /// Speak `text` into the recogniser in place of the microphone (auto-play):
+    /// the words go through the same tap, request and recogniser as a voice.
+    /// False when nothing is listening, so the caller can hand commands over.
+    func say(_ text: String) -> Bool {
+        guard running, let fmt = tapFormat, fmt.commonFormat == .pcmFormatFloat32,
+              let mono = AVAudioFormat(standardFormatWithSampleRate: fmt.sampleRate, channels: 1) else { return false }
+        let u = AVSpeechUtterance(string: text)
+        u.voice = AVSpeechSynthesisVoice(language: "en-US")
+        synth.write(u) { [weak self] buffer in
+            guard let self, let pcm = buffer as? AVAudioPCMBuffer, pcm.frameLength > 0 else { return }
+            if self.converter?.inputFormat != pcm.format {
+                self.converter = AVAudioConverter(from: pcm.format, to: mono)
+            }
+            guard let conv = self.converter else { return }
+            let cap = AVAudioFrameCount(Double(pcm.frameLength) * mono.sampleRate / pcm.format.sampleRate) + 256
+            guard let out = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: cap) else { return }
+            var given = false
+            var err: NSError?
+            conv.convert(to: out, error: &err) { _, status in
+                if given { status.pointee = .noDataNow; return nil }
+                given = true; status.pointee = .haveData; return pcm
+            }
+            guard err == nil, let ch = out.floatChannelData else { return }
+            let samples = Array(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)))
+            self.feedLock.lock(); self.feed += samples; self.feedLock.unlock()
+        }
+        return true
+    }
+
+    /// Replace a microphone buffer with queued synthetic speech, if any.
+    private func overwrite(_ buf: AVAudioPCMBuffer) {
+        feedLock.lock(); defer { feedLock.unlock() }
+        guard !feed.isEmpty, let ch = buf.floatChannelData else { return }
+        let n = Int(buf.frameLength), k = min(n, feed.count)
+        let chans = Int(buf.format.channelCount), st = buf.stride
+        for i in 0..<n {
+            let v: Float = i < k ? feed[i] : 0
+            if buf.format.isInterleaved {
+                for c in 0..<chans { ch[0][i * st + c] = v }
+            } else {
+                for c in 0..<chans { ch[c][i] = v }
+            }
+        }
+        feed.removeFirst(k)
     }
 
     private func restart() {
