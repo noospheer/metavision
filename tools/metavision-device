@@ -669,7 +669,8 @@ async def cmd_test(a):
     run.mkdir(parents=True, exist_ok=True)
     save = lambda: (run / "state.json").write_text(json.dumps(state, indent=1))
     save()
-    todo = [k for k, v in state["items"].items() if not v.get("verdict")]
+    todo = [k for k, v in state["items"].items() if not v.get("verdict")
+            and (not a.targets or k.split("@")[0] in a.targets)]   # resuming: just these titles
     total = len(state["items"])
     print(f"{run.relative_to(root)}: {len(todo)} of {total} run(s) to go, "
           f"{state['seconds']} s each (about {len(todo) * (state['seconds'] + 15) // 60} min)", flush=True)
