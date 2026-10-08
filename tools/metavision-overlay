@@ -492,3 +492,55 @@ for slug in json.load(open(os.path.join(guests, "targets.json"))):
 print(f"overlay: linked {n} staged guest paths")
 EOF
 fi
+
+# 8 — Unity's texture-unit cap, for every bundled Unity build. Unity caps units
+# at 32 while Quest shaders bind samplers at 32-35, so it refuses those binds and
+# the samplers read unit 0: text in boxes, wrong textures. Klepton raises the cap
+# only for builds measured by hand; tools/metavision-unitycaps measures every
+# bundled libunity, and each row applies only where the guard's code bytes match.
+if [ -d "$ROOT/build/guests" ]; then
+    ROWS=$("${MV_PYTHON:-python3}" "$ROOT/tools/metavision-unitycaps" --c --quiet "$ROOT/build/guests") || {
+        echo "overlay: metavision-unitycaps failed (pip install capstone pyelftools); texture-unit cap left alone" >&2
+        ROWS=""; }
+    python3 - "$K/runtime/guest/kl_guestpoke.c" "$ROWS" <<'EOF'
+import sys
+path, rows = sys.argv[1], sys.argv[2]
+s = open(path).read()
+if "metavision: measured rows" not in s:
+    def rep(old, new):
+        global s
+        if s.count(old) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+        s = s.replace(old, new)
+    rep("#define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])\n",
+        "#define POKE_NROWS (sizeof k_poke_caps / sizeof k_poke_caps[0])\n\n"
+        "// metavision: measured rows (tools/metavision-unitycaps), one per bundled\n"
+        "// libunity build: the guard's address and its three instruction words, the\n"
+        "// singleton slot, the cap field, and the raise (bounded by Unity's own cache).\n"
+        "struct mv_cap_row { uint32_t guard; uint32_t words[3]; uint32_t singleton, field; int raise; };\n"
+        "static const struct mv_cap_row k_mv_caps[] = {\n" + rows + "\n    { 0, { 0, 0, 0 }, 0, 0, 0 }\n};\n")
+    rep("    const struct poke_cap_row *row = NULL;\n"
+        "    for (size_t i = 0; ver && i < POKE_NROWS; i++)\n",
+        "    const struct poke_cap_row *row = NULL;\n"
+        "    static struct poke_cap_row mv_row;   // metavision: a measured row for THIS libunity\n"
+        "    if (!pv) {\n"
+        "        kl_image *mu = kl_find_image(\"libunity.so\");\n"
+        "        const uint8_t *mb = mu ? (const uint8_t *)kl_base(mu) : NULL;\n"
+        "        for (size_t i = 0; mb && k_mv_caps[i].guard; i++) {\n"
+        "            const struct mv_cap_row *m = &k_mv_caps[i];\n"
+        "            if ((size_t)m->guard + sizeof m->words > kl_span(mu) ||\n"
+        "                memcmp(mb + m->guard, m->words, sizeof m->words) != 0) continue;\n"
+        "            if (m->raise > 1) {\n"
+        "                mv_row = (struct poke_cap_row){ ver ? ver : \"?\", m->singleton, m->field, 1 };\n"
+        "                row = &mv_row; poke_n = m->raise;\n"
+        "                if (first) fprintf(stderr, \"  [poke] texture-unit cap: measured row for this \"\n"
+        "                                \"libunity (guard %#x), raise to %d\\n\", m->guard, m->raise);\n"
+        "            }\n"
+        "            break;\n"
+        "        }\n"
+        "    }\n"
+        "    for (size_t i = 0; !row && ver && i < POKE_NROWS; i++)\n")
+    open(path, "w").write(s)
+    print(f"overlay: texture-unit cap rows for {rows.count(chr(10)) + 1 if rows else 0} Unity build(s)")
+EOF
+fi

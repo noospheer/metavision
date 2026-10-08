@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""Find Unity's texture-unit cap in every title's libunity.so, for the runtime
+to raise.
+
+    tools/metavision-unitycaps [build/guests]        a table, one row per Unity build
+    tools/metavision-unitycaps --c [build/guests]    the same as C rows for
+                                                     Klepton's k_poke_caps
+    --quiet                                          no title names (CI logs are public)
+
+Unity's GLES device caps texture units at min(GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS,
+32), a constant, while shaders built for Quest bind samplers at units 32 and
+up. Unity refuses those binds itself ("OpenGL Error: Invalid texture unit!",
+tens of thousands a minute), and the samplers read whatever unit 0 holds:
+text in boxes, wrong textures. Klepton raises the cap with a store into the
+caps object, but only for builds whose offsets someone measured by hand.
+
+This takes those measurements from the binary, for any build, with the same
+recipe Klepton documents:
+
+  1. the string "OpenGL Error: Invalid texture unit!" and the adrp/add that
+     builds it — the reject block;
+  2. the guard just before it: `ldr wC, [xS, #FIELD] / cmp wC, wUNIT /
+     b.ls <reject>`, where xS comes from a getter (`bl G`, G = `adrp/ldr x0`)
+     or inline (`adrp xS / ldr xS, [xS, #lo]`) — the SINGLETON slot and FIELD;
+  3. how many units Unity's own per-unit state cache holds, from the same
+     function: `mov wK, #stride / umaddl xA, wUNIT, wK, xD` with the array at
+     `[xA, #BASE]`, ended by the next field `[xD, #END]` it reads —
+     (END - BASE) / stride slots. The raise never exceeds it: a unit past the
+     cache would be a write past the end of Unity's own array.
+
+A build where any step does not match is reported and left out, never guessed.
+Each row carries the guard's address and its three instruction words: the
+runtime applies a row only to a libunity whose code at that address is exactly
+those words, so a row can never be aimed at a different build — whatever its
+version string says, or whether it has one.
+"""
+import re
+import sys
+from pathlib import Path
+
+from capstone import CS_ARCH_ARM64, CS_MODE_ARM, Cs
+from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
+from elftools.elf.elffile import ELFFile
+
+MSG = b"OpenGL Error: Invalid texture unit!\0"
+VER = re.compile(rb"(20\d\d\.\d+\.\d+[fpab]\d+(?:-[A-Za-z0-9.-]+)?)_[0-9a-f]{8,}\0")
+WANT = 64          # the vendored ANGLE's combined limit
+
+
+class Image:
+    def __init__(self, path):
+        self.data = Path(path).read_bytes()
+        self.elf = ELFFile(open(path, "rb"))
+        self.segs = [(s["p_vaddr"], s["p_offset"], s["p_filesz"]) for s in self.elf.iter_segments()
+                     if s["p_type"] == "PT_LOAD"]
+        self.cs = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+        self.cs.detail = True
+
+    def off(self, va):
+        for v, o, n in self.segs:
+            if v <= va < v + n:
+                return o + va - v
+        return None
+
+    def va(self, off):
+        for v, o, n in self.segs:
+            if o <= off < o + n:
+                return v + off - o
+        return None
+
+    def insns(self, va, count):
+        o = self.off(va)
+        return list(self.cs.disasm(self.data[o:o + 4 * count], va)) if o is not None else []
+
+    def text(self):
+        s = self.elf.get_section_by_name(".text")
+        return s["sh_addr"], s["sh_offset"], s["sh_size"]
+
+
+def adrp_add_refs(img, target):
+    """Sites that build `target` with adrp + add (the reject block's message)."""
+    page, lo = target & ~0xFFF, target & 0xFFF
+    addr, off, size = img.text()
+    words = memoryview(img.data)[off:off + size].cast("I")
+    out = []
+    for i, w in enumerate(words):
+        if (w & 0x9F000000) != 0x90000000:          # ADRP
+            continue
+        rd = w & 0x1F
+        pc = addr + 4 * i
+        imm = (((w >> 29) & 3) | (((w >> 5) & 0x7FFFF) << 2))
+        if imm & (1 << 20):
+            imm -= 1 << 21
+        if (pc & ~0xFFF) + (imm << 12) != page:
+            continue
+        for j in range(i + 1, min(i + 8, len(words))):
+            a = words[j]
+            if (a & 0xFF800000) == 0x91000000 and ((a >> 5) & 0x1F) == rd and ((a >> 10) & 0xFFF) == lo:
+                out.append(addr + 4 * j)
+                break
+    return out
+
+
+def getter_slot(img, g):
+    """G: adrp x8, P / ldr x0, [x8, #lo] / ret -> P + lo."""
+    ins = img.insns(g, 4)
+    if len(ins) < 2 or ins[0].mnemonic != "adrp" or ins[1].mnemonic != "ldr":
+        return None
+    page = ins[0].operands[1].imm
+    m = ins[1].operands[1]
+    if m.type != ARM64_OP_MEM or ins[1].operands[0].reg != img.cs.reg_id("x0") if hasattr(img.cs, "reg_id") else False:
+        pass
+    return page + m.mem.disp if m.type == ARM64_OP_MEM else None
+
+
+def measure(path):
+    img = Image(path)
+    i = img.data.find(MSG)
+    if i < 0:
+        return None, "no reject string"
+    msg = img.va(i)
+    refs = adrp_add_refs(img, msg)
+    if not refs:
+        return None, "reject string never built"
+    for ref in refs:
+        # The guard: walk back from the reject block for `b.ls <block>`.
+        back = img.insns(ref - 4 * 400, 400)
+        for k in range(len(back) - 1, 2, -1):
+            b = back[k]
+            if b.mnemonic not in ("b.ls", "b.hs") or b.operands[0].type != ARM64_OP_IMM:
+                continue
+            if not (ref - 0x60 <= b.operands[0].imm <= ref):
+                continue
+            cmp, ld = back[k - 1], back[k - 2]
+            if cmp.mnemonic != "cmp" or ld.mnemonic != "ldr" or ld.operands[1].type != ARM64_OP_MEM:
+                continue
+            field = ld.operands[1].mem.disp
+            base = ld.operands[1].mem.base
+            unit = cmp.operands[1].reg if b.mnemonic == "b.ls" else cmp.operands[0].reg
+            prev = back[k - 3]
+            slot = None
+            if prev.mnemonic == "bl":
+                slot = getter_slot(img, prev.operands[0].imm)
+            else:   # inline: adrp xS / ldr xS, [xS, #lo] somewhere just before
+                for p in range(k - 3, max(0, k - 12), -1):
+                    q = back[p]
+                    if q.mnemonic == "ldr" and q.operands[0].reg == base and q.operands[1].type == ARM64_OP_MEM:
+                        for r in range(p - 1, max(0, p - 6), -1):
+                            if back[r].mnemonic == "adrp" and back[r].operands[0].reg == q.operands[1].mem.base:
+                                slot = back[r].operands[1].imm + q.operands[1].mem.disp
+                                break
+                        break
+            if slot is None:
+                continue
+            cap = cache_slots(img, b.address + 4, unit)
+            o = img.off(ld.address)
+            words = tuple(int.from_bytes(img.data[o + 4 * n:o + 4 * n + 4], "little") for n in range(3))
+            return {"singleton": slot, "field": field, "cache": cap, "guard": ld.address, "words": words}, None
+    return None, "guard not recognised"
+
+
+def cache_slots(img, start, unit):
+    """Unity's per-unit cache after the guard: units it can hold, or None."""
+    ins = img.insns(start, 80)
+    stride = dev = base = None
+    names = {}
+    for x in ins:
+        if x.mnemonic == "mov" and len(x.operands) == 2 and x.operands[1].type == ARM64_OP_IMM:
+            names[x.operands[0].reg] = x.operands[1].imm
+        if x.mnemonic in ("umaddl", "smaddl", "madd") and stride is None:
+            ops = x.operands
+            if len(ops) == 4 and ops[2].reg in names:
+                stride, dev, arr = names[ops[2].reg], ops[3].reg, ops[0].reg
+                for y in ins[ins.index(x) + 1:]:
+                    if y.mnemonic == "ldr" and len(y.operands) > 1 and y.operands[1].type == ARM64_OP_MEM \
+                            and y.operands[1].mem.base == arr:
+                        base = y.operands[1].mem.disp
+                        break
+                break
+    if not stride or base is None:
+        return None
+    # The cache ends where the next field read off the device begins.
+    ends = sorted(x.operands[1].mem.disp for x in ins
+                  if x.mnemonic in ("ldr", "str") and len(x.operands) > 1 and x.operands[1].type == ARM64_OP_MEM
+                  and x.operands[1].mem.base == dev and x.operands[1].mem.disp > base)
+    if not ends:
+        return None
+    return (ends[0] - base) // stride
+
+
+def version(path):
+    m = VER.search(Path(path).read_bytes())
+    return m.group(1).decode() if m else None
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    base = Path(args[0] if args else "build/guests")
+    builds = {}                     # one row per distinct libunity build
+    for so in sorted(base.glob("*/lib/arm64-v8a/libunity.so")):
+        title = so.parts[-4]
+        r, why = measure(so)
+        if r is None:
+            if "--quiet" not in sys.argv:
+                print(f"# {title}: {why}", file=sys.stderr)
+            continue
+        key = (r["guard"], r["words"], r["singleton"], r["field"])
+        if key in builds:
+            builds[key]["titles"].append(title)
+        else:
+            r["titles"], r["ver"] = [title], version(so) or "?"
+            builds[key] = r
+    for r in sorted(builds.values(), key=lambda r: r["ver"]):
+        cache = r["cache"]
+        raise_to = min(WANT, cache) if cache and cache >= 36 else 0     # 32-35 is what shaders use
+        if "--c" in sys.argv:
+            w = ", ".join(f"{x:#010x}" for x in r["words"])
+            who = "" if "--quiet" in sys.argv else f'   // {r["ver"]}: {", ".join(r["titles"])}'
+            print(f'    {{ {r["guard"]:#x}, {{ {w} }}, {r["singleton"]:#x}, {r["field"]:#x}, {raise_to} }},{who}')
+        else:
+            print(f"{r['ver']:14} guard {r['guard']:#9x} singleton {r['singleton']:#9x} field {r['field']:#5x} "
+                  f"cache {cache}  {'raise to ' + str(raise_to) if raise_to else 'leave'}  {', '.join(r['titles'])}")
+
+
+if __name__ == "__main__":
+    main()

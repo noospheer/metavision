@@ -24,9 +24,9 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: "Space-separated mv_ targets (tools/metavision-targets list)"
+        description: "all (every bundled title), or space-separated mv_ targets — these show in the public run's details"
         required: true
-        default: "mv_<title>"
+        default: "all"
       launcher:
         description: "One metavision app with all of them, instead of one app per title"
         type: boolean
@@ -100,11 +100,33 @@ jobs:
             tar -xz -C build
           mv build/guests/klepton-targets.py build/klepton-targets.py
           rm /tmp/guests.enc
-          echo "bundled: $(tr '\n' ' ' < build/guests/BUNDLED)"
+          # This repository's logs are public: mask every title's names (slug,
+          # display name, product, Android package) in all later steps.
+          python3 - <<'PY'
+          import json, os, re
+          rows = json.load(open("build/guests/targets.json"))
+          names = set()
+          for slug, t in rows.items():
+              names |= {slug, t.get("display") or "", t.get("product") or ""}
+              if len(slug) > 7:
+                  names.add(slug[3:])
+              m = os.path.join("build/guests", t.get("tree", slug), "AndroidManifest.xml")
+              if os.path.isfile(m):
+                  p = re.search(r'package="([^"]+)"', open(m, errors="replace").read())
+                  if p:
+                      names.add(p.group(1))
+          for n in sorted(n for n in names if len(n) >= 4):
+              print(f"::add-mask::{n}")
+          PY
+          echo "bundled: $(wc -l < build/guests/BUNDLED | tr -d ' ') title(s)"
+
+      - name: Python tools for the overlay (texture-unit cap measurement)
+        run: python3 -m venv /tmp/mvpy && /tmp/mvpy/bin/pip install -q capstone pyelftools
 
       - name: Overlay metavision onto Klepton
         env:
           MV_LAUNCHER: ${{ github.event.inputs.launcher == 'true' && '1' || '0' }}
+          MV_PYTHON: /tmp/mvpy/bin/python
         run: tools/metavision-overlay
 
       - name: Signing material
@@ -145,6 +167,7 @@ jobs:
           MV_GUEST_KEY: ${{ secrets.MV_GUEST_KEY }}
         run: |
           set -euo pipefail
+          [ "$TARGETS" != all ] || TARGETS=$(cat build/guests/BUNDLED)
           mkdir -p out
           for t in $TARGETS; do
             echo "::group::$t"
@@ -192,6 +215,7 @@ jobs:
           MV_GUEST_KEY: ${{ secrets.MV_GUEST_KEY }}
         run: |
           set -euo pipefail
+          [ "$TARGETS" != all ] || TARGETS=$(cat build/guests/BUNDLED)
           mkdir -p out
           tools/metavision-launcher $TARGETS
           cd "$K/visionos"
