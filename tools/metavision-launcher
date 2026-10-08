@@ -40,6 +40,11 @@ done
 set -- "${ok[@]}"
 [ ${#skipped[@]} = 0 ] || echo "LEFT OUT (${#skipped[@]}): ${skipped[*]}"
 ./mkangle.sh | tail -1
+# The Vulkan renderer (MoltenVK) for titles whose graphics API is Vulkan:
+# gen_xcodeproj.py embeds it only if this wrapped it. Without it every Vulkan
+# title boots to black ("MoltenVK is not vendored").
+./mkmvk.sh | tail -1
+[ -d Frameworks/MoltenVK.xcframework ] || { echo "MoltenVK.xcframework missing: run 'make mvk' first" >&2; exit 1; }
 
 # The generator embeds the guest of the target it is generating for; give the
 # launcher row the first title's frameworks so it resolves, then replace that

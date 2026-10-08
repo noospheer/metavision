@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 PICTURE = re.compile(r"(\d+) with a picture")
+ITERS = re.compile(r"\[cp\] alive: (\d+) iters")
 FATAL = re.compile(r"fatal: (.*)")
 FAULT = re.compile(r"fault: signal (\d+) at (0x[0-9a-f]+), pc (\S+)")
 DLFAIL = re.compile(r'guest dlopen\("([^"]+)"\) FAILED')
@@ -35,6 +36,22 @@ SERIOUS = re.compile(r"Exception|GLSL compilation failed|Kernel at index|Shader 
                      r"Failed to (create|compile|load)|is not supported", re.I)
 
 
+RUNTIME_LIBS = {"libvulkan.so", "libvulkan.so.1", "libEGL.so", "libGLESv2.so", "libGLESv3.so", "libOpenSLES.so",
+                "libaaudio.so", "libmediandk.so", "libandroid.so", "liblog.so"}
+# Unity logs a GUID mismatch for a patch OBB that does not exist ("got ''")
+# after the main OBB matched: the patch is optional.
+BENIGN = re.compile(r"OBB has mismatching GUID.*got ''")
+
+
+def shipped_libs(d: Path):
+    """The title's own .so names (build/guests/<title>/lib/arm64-v8a), or None."""
+    for p in [d, *d.parents]:
+        if p.name.startswith("mv_"):
+            lib = Path(__file__).resolve().parent.parent / "build" / "guests" / p.name / "lib" / "arm64-v8a"
+            return {x.name for x in lib.glob("*.so")} if lib.is_dir() else None
+    return None
+
+
 def triage(d: Path):
     boot = d / "klepton-boot.log"
     if not boot.is_file():
@@ -43,15 +60,25 @@ def triage(d: Path):
     lines = text.splitlines()
     started = next((m.group(1) for m in map(START.match, lines[:5]) if m), "?")
     pics = max((int(m.group(1)) for m in PICTURE.finditer(text)), default=0)
-    # Unity probes "lib" + a plugin's name before the name itself, so a miss on
-    # liblib<x>.so is followed by the load that works: not a failure.
-    notes = [f"could not load {n.rsplit('/', 1)[-1]}" for n in sorted({m.group(1) for m in DLFAIL.finditer(text)})
-             if "/liblib" not in n]
+    # A failed load matters when the title ships that library (or it is one the
+    # runtime provides, like libvulkan.so). Unity probes a plugin under several
+    # names, and settings can name a plugin the APK does not carry — misses a
+    # Quest makes too.
+    shipped = shipped_libs(d)
+    notes = []
+    for n in sorted({m.group(1).rsplit("/", 1)[-1] for m in DLFAIL.finditer(text)}):
+        if n in RUNTIME_LIBS or shipped is None or n in shipped:
+            notes.append(f"could not load {n}")
     ending = "running when closed"
     if m := FATAL.search(text):
         ending = "stopped: " + m.group(1).strip()
     errs = {}
     for m in UNITY_E.finditer(text):
+        if BENIGN.search(m.group(1)):
+            continue
+        dll = re.search(r"DllNotFoundException: Unable to load DLL '([^']+)'", m.group(1))
+        if dll and shipped is not None and f"lib{dll.group(1)}.so" not in shipped and f"{dll.group(1)}.so" not in shipped:
+            continue                  # a plugin the APK does not carry: the same on a Quest
         k = re.sub(r"\d+", "N", m.group(1))[:110]
         errs[k] = errs.get(k, 0) + 1
     for k, n in sorted(errs.items(), key=lambda kv: -kv[1])[:3]:
@@ -100,6 +127,10 @@ def verdict(d: Path, exited=None):
     if r is None:
         return {"verdict": "crashed", "summary": "no log at all: the app did not start", "frames": 0}
     _started, pics, ending, notes, serious = r
+    # The compositor ticks whenever the app is in front of a wearer, picture
+    # or not: no ticks at all is a headset asleep or off, not a black title.
+    iters = max((int(m.group(1)) for m in ITERS.finditer((d / "klepton-boot.log").read_text(errors="replace"))),
+                default=0)
     if ending.startswith("crashed"):
         v = "crashed"
     elif ending.startswith("stopped"):
@@ -116,7 +147,7 @@ def verdict(d: Path, exited=None):
     first = [n for n in notes if n.startswith(("could not load", "Unity error"))][:1]
     if first:
         summary += "; " + first[0]
-    return {"verdict": v, "summary": summary, "frames": pics}
+    return {"verdict": v, "summary": summary, "frames": pics, "iters": iters}
 
 
 def rows_under(base: Path):

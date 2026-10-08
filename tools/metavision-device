@@ -741,7 +741,7 @@ async def cmd_test(a):
         save()
         while True:
             v = await one(rsd, pc, afc, good, probe=True)
-            if v["frames"] > 0:
+            if v["frames"] > 0 or v.get("iters"):
                 print(f"  awake again after {round(time.time() - since)} s: resuming", flush=True)
                 return
             await asyncio.sleep(30)
@@ -758,8 +758,8 @@ async def cmd_test(a):
                     todo.pop(0)
                     if v["frames"] > 0:
                         good, dark = key, []
-                    elif v["verdict"] == "black":
-                        dark.append(key)
+                    elif v["verdict"] == "black" and not v.get("iters"):
+                        dark.append(key)          # the compositor never ticked either
                     # Two different titles in a row without a picture, after one
                     # that drew: the headset, not the titles. Run them again.
                     if len(dark) >= 2 and good:
