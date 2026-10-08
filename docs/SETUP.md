@@ -270,9 +270,13 @@ unfinished pass, and `test --failed` re-runs only what did not pass last time.
 The fix loop is: `test` → `metavision-triage` → fix → rebuild and install →
 `test --failed`, until nothing is left.
 
-The headset must be **worn** (or its proximity sensor covered) throughout —
-visionOS stops drawing apps nobody is looking through; three black runs in a
-row print a warning.
+The headset must be **worn** throughout: visionOS stops drawing apps nobody
+is looking through, and since visionOS 2 covering its inner sensor only delays
+sleep. When two titles in a row come back without a picture after one that
+drew, the pass takes the headset to be asleep: it puts those runs back in the
+queue, pauses, and re-launches the last title that drew every 30 s until it
+draws again — put the headset on (or wake it) and the pass carries on. Each
+pause is recorded under `sleeps` in the run's `state.json`.
 
 It needs Apple's developer services, which need the **developer disk image**
 mounted, and visionOS's comes only from Xcode. Run the `ddi` workflow once

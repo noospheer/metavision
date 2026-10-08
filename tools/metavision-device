@@ -657,13 +657,11 @@ async def cmd_test(a):
     total = len(state["items"])
     print(f"{run.relative_to(root)}: {len(todo)} of {total} run(s) to go, "
           f"{state['seconds']} s each (about {len(todo) * (state['seconds'] + 15) // 60} min)", flush=True)
-    blacks = 0
-
-    async def one(rsd, pc, afc, key):
-        nonlocal blacks
+    async def one(rsd, pc, afc, key, probe=False):
+        """Run one title in one mode; a probe only asks whether it draws."""
         title, mode = key.split("@")
         tree = rows.get(title, {}).get("tree", f"mv_{title}")
-        out = run / tree / mode
+        out = run / ".probe" if probe else run / tree / mode
         out.mkdir(parents=True, exist_ok=True)
         for f in ("klepton-boot.log", "klepton-crash.log"):     # nothing stale
             try:
@@ -677,9 +675,10 @@ async def cmd_test(a):
             env["MV_AUTOPLAY"] = "1"
         t0 = time.time()
         pid = await pc.launch(bundle, environment=env, kill_existing=True)
-        print(f"[{total - len(todo) + 1}/{total}] {title} ({mode}): pid {pid}", end="", flush=True)
+        if not probe:
+            print(f"[{total - len(todo) + 1}/{total}] {title} ({mode}): pid {pid}", end="", flush=True)
         exited = None
-        while time.time() - t0 < state["seconds"]:
+        while time.time() - t0 < (25 if probe else state["seconds"]):
             await asyncio.sleep(5)
             if await pc.process_identifier_for_bundle_identifier(bundle) != pid:
                 exited = round(time.time() - t0)
@@ -697,6 +696,8 @@ async def cmd_test(a):
                 got.append(f)
             except Exception:
                 pass
+        if probe:
+            return triage.verdict(out)
         async with CrashReportsManager(rsd) as cr:
             try:
                 await cr.flush()
@@ -710,19 +711,46 @@ async def cmd_test(a):
         state["items"][key] = {"verdict": v["verdict"], "summary": v["summary"], "exited_after": exited}
         save()
         print(f"  -> {v['verdict'].upper()}: {v['summary']}", flush=True)
-        blacks = blacks + 1 if v["frames"] == 0 else 0
-        if blacks == 3:
-            print("  !! three runs in a row without a picture: is the headset being worn? "
-                  "(visionOS stops drawing apps nobody is looking through)", flush=True)
+        return v
+
+    async def wait_awake(rsd, pc, afc, good):
+        """The headset has stopped drawing (asleep, taken off): re-launch a
+        title that drew before until it draws again."""
+        since = time.time()
+        print(f"  !! no picture twice running: the headset looks asleep. Pausing; put it on "
+              f"(or wake it) and the pass carries on. Checking every 30 s with {good}.", flush=True)
+        state.setdefault("sleeps", []).append(time.strftime("%H:%M:%S"))
+        save()
+        while True:
+            v = await one(rsd, pc, afc, good, probe=True)
+            if v["frames"] > 0:
+                print(f"  awake again after {round(time.time() - since)} s: resuming", flush=True)
+                return
+            await asyncio.sleep(30)
 
     async def fn(rsd):
         print(await mount_ddi(rsd, a.ddi), flush=True)
         afc = await HouseArrestService.create(rsd, bundle)
         try:
             async with DvtProvider(rsd) as dvt, ProcessControl(dvt) as pc:
+                good, dark = None, []
                 while todo:
-                    await one(rsd, pc, afc, todo[0])
+                    key = todo[0]                 # popped once done: a drop re-runs it
+                    v = await one(rsd, pc, afc, key)
                     todo.pop(0)
+                    if v["frames"] > 0:
+                        good, dark = key, []
+                    elif v["verdict"] == "black":
+                        dark.append(key)
+                    # Two different titles in a row without a picture, after one
+                    # that drew: the headset, not the titles. Run them again.
+                    if len(dark) >= 2 and good:
+                        for k in dark:
+                            state["items"][k] = {}
+                        todo[0:0] = dark
+                        save()
+                        await wait_awake(rsd, pc, afc, good)
+                        dark = []
         finally:
             await afc.close()
 
