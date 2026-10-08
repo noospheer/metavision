@@ -626,6 +626,14 @@ async def cmd_test(a):
     from pymobiledevice3.services.crash_reports import CrashReportsManager
     triage = _triage_module()
     root = Path(__file__).resolve().parent.parent
+    # One pass at a time: two would each launch the app over the other's run
+    # (kill_existing), and every title would read as exiting after a few seconds.
+    import fcntl
+    lock = open(root / "build" / "test.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit("another `test` is already running (build/test.lock); stop it first")
     rows = json.loads((root / "build" / "guests" / "targets.json").read_text())
     bundle = a.bundle or "metavision.dev.klepton.target.metavision"
     modes = [m.strip().replace("-", "") for m in a.modes.split(",") if m.strip()]
