@@ -43,7 +43,10 @@ def triage(d: Path):
     lines = text.splitlines()
     started = next((m.group(1) for m in map(START.match, lines[:5]) if m), "?")
     pics = max((int(m.group(1)) for m in PICTURE.finditer(text)), default=0)
-    notes = [f"could not load {n}" for n in sorted({m.group(1) for m in DLFAIL.finditer(text)})]
+    # Unity probes "lib" + a plugin's name before the name itself, so a miss on
+    # liblib<x>.so is followed by the load that works: not a failure.
+    notes = [f"could not load {n.rsplit('/', 1)[-1]}" for n in sorted({m.group(1) for m in DLFAIL.finditer(text)})
+             if "/liblib" not in n]
     ending = "running when closed"
     if m := FATAL.search(text):
         ending = "stopped: " + m.group(1).strip()
