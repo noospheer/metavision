@@ -238,10 +238,30 @@ charger of 30 W or more keeps it running indefinitely.
 
 ### Unattended test pass
 
-`test` opens every title in the launcher in turn, lets each run (`--seconds`,
-default 40), closes it, then pulls all their logs; `tools/metavision-triage`
-then prints one line per title. The headset must be **worn** throughout —
-visionOS pauses apps nobody is looking through.
+`test` runs every title in the launcher in every input mode (hands,
+hands-free, auto), each for `--seconds` (default 75), with **scripted input**
+(`MV_AUTOPLAY=1`) going in through that mode's own path:
+
+| mode | what the script does |
+|---|---|
+| `hands` | synthetic Touch controllers *and* synthetic Meta hand skeletons: aims across a grid in front of the user, clicking/pinching at each point; A, B, X, grips, Menu and both sticks on their own periods |
+| `handsfree` | no controllers or hands: a gaze ray at each grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
+| `auto` | the two alternating every 20 s, as a hand entering and leaving view |
+
+After each run the title's boot log, the runtime's crash log and any system
+crash report (`.ips`) are pulled to `build/test/<run>/<title>/<mode>/` and
+judged by `tools/metavision-triage`: **pass**, **errors** (exceptions,
+shader/compute failures, a library that would not load), **black** (never
+drew), **stopped** (an unimplemented entry point) or **crashed** (a fault, a
+crash report, or an exit on its own). Progress is saved after every run: a
+dropped connection reconnects and carries on, running `test` again resumes an
+unfinished pass, and `test --failed` re-runs only what did not pass last time.
+The fix loop is: `test` → `metavision-triage` → fix → rebuild and install →
+`test --failed`, until nothing is left.
+
+The headset must be **worn** (or its proximity sensor covered) throughout —
+visionOS stops drawing apps nobody is looking through; three black runs in a
+row print a warning.
 
 It needs Apple's developer services, which need the **developer disk image**
 mounted, and visionOS's comes only from Xcode. Run the `ddi` workflow once
@@ -251,9 +271,17 @@ mounted, and visionOS's comes only from Xcode. Run the `ddi` workflow once
 gh run download <run id> --repo <you>/<name> --dir build/ddi-dl
 mkdir -p build/ddi && openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
   -pass file:build/guest-bundle.key -in build/ddi-dl/*/visionos-ddi.tar.gz.enc | tar xz -C build/ddi
-sudo tools/metavision-device test            # mounts the image when needed, then the pass
-tools/metavision-triage
+sudo tools/metavision-device tunnel          # in its own terminal; leave it running
+tools/metavision-device test                 # mounts the image when needed, then the pass
+tools/metavision-triage                      # the latest pass, one line per title and mode
+tools/metavision-device test --failed        # after a fix: only what did not pass
 ```
+
+`tunnel` keeps one tunnel to the headset open and re-opens it when it drops;
+while it runs, every other `metavision-device` command works **without sudo**
+(they find it through `build/tunnel.json`). Without it, each command opens its
+own tunnel and needs sudo. Narrow a pass with titles (`test mv_<title> ...`)
+or `--modes hands`.
 
 When a title will not start, see [COMPATIBILITY.md](COMPATIBILITY.md).
 

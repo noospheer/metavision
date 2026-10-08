@@ -29,3 +29,5 @@ exports/
 *.p8
 *.certSigningRequest
 *.pass
+
+__pycache__/

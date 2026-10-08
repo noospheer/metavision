@@ -199,6 +199,8 @@ static int32_t mv_GetSkeleton3(int32_t type, ovrp_skeleton3 *out) {
 static int32_t mv_GetHandState(int32_t step, int32_t hand, ovrp_hand_state *out) {
     (void)step;   // Render or Physics: one pose serves both
     if (hand < 0 || hand > 1 || !out) return OVRP_FAIL_INVALID_PARAM;
+    static int said;
+    if (!said++) fprintf(stderr, "  [mv-hands] the title reads hand state: it uses hand tracking\n");
     memset(out, 0, sizeof *out);
     out->root.o.w = out->pointer.o.w = 1;
     for (int i = 0; i < MV_HAND_BONES; i++) out->rot[i].w = 1;

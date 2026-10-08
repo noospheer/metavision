@@ -40,6 +40,12 @@ sudo tools/metavision-device logs --all    # -> build/logs/<title>/ for every ti
 tools/metavision-triage                    # one line each: picture or black, and how it ended
 ```
 
+**Every title, unattended.** `metavision-device test` opens each title by
+itself in each input mode with scripted input, pulls and judges every run, and
+`test --failed` re-runs what did not pass — see the unattended test pass in
+[SETUP.md](SETUP.md). `uses hand tracking` in the triage notes means the title
+read Meta hand state (`[mv-hands]` in its log).
+
 `klepton-boot.log` is the runtime's log; `klepton-crash.log` is written only on
 a fault (an old one stays until the next fault — check its time). What to look
 for:

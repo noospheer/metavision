@@ -126,6 +126,9 @@ final class MetavisionHandsFree {
         lock.unlock()
     }
 
+    /// A command as if spoken (MetavisionAutoplay's hands-free script).
+    func inject(_ cmd: MetavisionVoice.Command) { voice(cmd) }
+
     private func voice(_ cmd: MetavisionVoice.Command) {
         lock.lock()
         switch cmd {

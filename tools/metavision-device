@@ -23,6 +23,10 @@ support, with the workarounds visionOS currently needs (see docs/SETUP.md):
     sudo metavision-device logs mv_<title>   pull its boot log and crash reports
     sudo metavision-device ls --launcher     what is staged, with sizes
     sudo metavision-device icons             copy staged titles' icons into the launcher
+    sudo metavision-device tunnel            keep a tunnel open; other commands then
+                                             run without sudo
+    metavision-device test [--failed]        every title x input mode, scripted
+                                             input, logs judged (see SETUP)
     sudo metavision-device env mv_<title> KL_OVRP_TRACE=1 ...
                                              runtime switches for the next launch
                                              (none: clear them)
@@ -39,6 +43,7 @@ import json
 import os
 import posixpath
 import pwd
+import re
 import sys
 import time
 from pathlib import Path
@@ -173,23 +178,94 @@ async def cmd_pair(a):
 
 
 # ---------------------------------------------------------------- tunnel commands
-async def with_rsd(a, fn):
-    if os.geteuid() != 0:
-        sys.exit("this command opens a tunnel, which needs root: run it with sudo")
+TUNNEL_FILE = Path(__file__).resolve().parent.parent / "build" / "tunnel.json"
+
+
+def _tunnel_owner_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True           # root's process, alive
+    except OSError:
+        return False
+    return True
+
+
+async def _open_tunnel(a):
     ident = paired_identifier(a.identifier)
     patch_handshake(ident)
-    patch_shim_names()
     svcs = await ts.get_remote_pairing_tunnel_services(5)
     svcs = [s for s in svcs if ":" not in str(getattr(s, "hostname", ""))] or svcs
     if not svcs:
-        sys.exit("headset not reachable: is it awake and on the same network?")
-    async with ts.start_tunnel_over_remotepairing(svcs[0], protocol=ts.TunnelProtocol.TCP) as t:
+        raise ConnectionError("headset not reachable: is it awake and on the same network?")
+    return ts.start_tunnel_over_remotepairing(svcs[0], protocol=ts.TunnelProtocol.TCP)
+
+
+async def with_rsd(a, fn):
+    """Run fn(rsd) over a tunnel: the one `sudo metavision-device tunnel` keeps
+    open (no root needed here), else a tunnel of our own (root)."""
+    patch_shim_names()
+    if TUNNEL_FILE.is_file():
+        info = json.loads(TUNNEL_FILE.read_text())
+        if _tunnel_owner_alive(info.get("pid", -1)):
+            # The tunnel process re-opens a dropped tunnel and rewrites the
+            # file: give it a moment rather than failing at once.
+            for _ in range(30):
+                info = json.loads(TUNNEL_FILE.read_text())
+                rsd = RemoteServiceDiscoveryService((info["address"], info["port"]))
+                try:
+                    await asyncio.wait_for(rsd.connect(), 15)
+                    break
+                except Exception:
+                    await asyncio.sleep(5)
+            else:
+                raise ConnectionError("the shared tunnel is not answering (headset asleep or off the network?)")
+            try:
+                return await fn(rsd)
+            finally:
+                await rsd.close()
+    if os.geteuid() != 0:
+        sys.exit("no tunnel: run `sudo metavision-device tunnel` in another terminal "
+                 "(or run this command with sudo)")
+    try:
+        cm = await _open_tunnel(a)
+    except ConnectionError as e:
+        sys.exit(str(e))
+    async with cm as t:
         rsd = RemoteServiceDiscoveryService((t.address, t.port))
         await rsd.connect()
         try:
             return await fn(rsd)
         finally:
             await rsd.close()
+
+
+async def cmd_tunnel(a):
+    """Keep a tunnel to the headset open for other commands, which then need no
+    root. Re-opens it whenever it drops (headset asleep, network blip)."""
+    if os.geteuid() != 0:
+        sys.exit("the tunnel needs root to create its network interface: run it with sudo")
+    TUNNEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            cm = await _open_tunnel(a)
+            async with cm as t:
+                TUNNEL_FILE.write_text(json.dumps({"address": t.address, "port": t.port, "pid": os.getpid()}))
+                os.chmod(TUNNEL_FILE, 0o644)
+                print(f"{time.strftime('%H:%M:%S')} tunnel up: {t.address} port {t.port} "
+                      "(leave this running; Ctrl+C closes it)", flush=True)
+                while True:          # a cheap check that it still carries traffic
+                    await asyncio.sleep(20)
+                    rsd = RemoteServiceDiscoveryService((t.address, t.port))
+                    await asyncio.wait_for(rsd.connect(), 20)
+                    await rsd.close()
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            break
+        except Exception as e:
+            print(f"{time.strftime('%H:%M:%S')} tunnel down ({type(e).__name__}: {e}); "
+                  "retrying in 10 s", flush=True)
+            await asyncio.sleep(10)
+    TUNNEL_FILE.unlink(missing_ok=True)
 
 
 async def cmd_info(a):
@@ -507,46 +583,158 @@ async def cmd_ddi(a):
     await with_rsd(a, fn)
 
 
+MODES = ("hands", "handsfree", "auto")
+
+
+def _triage_module():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader("mv_triage", str(Path(__file__).resolve().parent / "metavision-triage")).load_module()
+
+
 async def cmd_test(a):
-    """Unattended pass through the launcher's titles: open each one by itself
-    (MV_AUTOSTART) with scripted controller input (MV_AUTOPLAY: pointer sweeps,
-    trigger clicks, buttons, sticks), let it run, close it, then pull every
-    title's logs. The
-    headset must be worn — visionOS pauses apps nobody is looking through."""
+    """Unattended pass: every title, in every input mode, driven by scripted
+    input (MV_AUTOPLAY) through that mode's own path — synthetic controllers
+    and Meta hand skeletons in hands mode, gaze selects and spoken commands in
+    hands-free, the two alternating in auto. Each run's logs and any system
+    crash report are pulled straight after it and judged (metavision-triage);
+    progress is saved, so a dropped connection resumes where it stopped and
+    `--failed` re-runs only what did not pass last time. The headset must be
+    worn (or its proximity sensor covered): visionOS pauses unseen apps."""
     from pymobiledevice3.services.dvt.instruments.dvt_provider import DvtProvider
     from pymobiledevice3.services.dvt.instruments.process_control import ProcessControl
+    from pymobiledevice3.services.house_arrest import HouseArrestService
+    from pymobiledevice3.services.crash_reports import CrashReportsManager
+    triage = _triage_module()
     root = Path(__file__).resolve().parent.parent
     rows = json.loads((root / "build" / "guests" / "targets.json").read_text())
-    names = a.targets or list(rows)
     bundle = a.bundle or "metavision.dev.klepton.target.metavision"
+    modes = [m.strip().replace("-", "") for m in a.modes.split(",") if m.strip()]
+    for m in modes:
+        if m not in MODES:
+            sys.exit(f"unknown mode {m}: {', '.join(MODES)}")
+    titles = a.targets or list(rows)
+    try:   # only what the launcher build carries
+        import zipfile
+        with zipfile.ZipFile(root / "build" / "ipa" / "metavision.ipa") as z:
+            built = {m.group(1) for n in z.namelist()
+                     if (m := re.match(r"Payload/[^/]+/Frameworks/(mv_[^/]+)/", n))}
+        titles = [t for t in titles if t in built] or titles
+    except Exception:
+        pass
 
-    async def fn(rsd):
-        print(await mount_ddi(rsd, a.ddi), flush=True)
-        async with DvtProvider(rsd) as dvt, ProcessControl(dvt) as pc:
-            for i, n in enumerate(names, 1):
-                env = {"MV_AUTOSTART": n}
-                if not a.no_play:
-                    env["MV_AUTOPLAY"] = "1"     # scripted controller input: menus pressed, scenes started
-                pid = await pc.launch(bundle, environment=env, kill_existing=True)
-                print(f"[{i}/{len(names)}] {n}: running (pid {pid}), {a.seconds} s"
-                      f"{'' if a.no_play else ', auto-play on'}", flush=True)
-                await asyncio.sleep(a.seconds)
-                try:
-                    await pc.kill(pid)
-                except Exception:
-                    pass          # already gone: it crashed, which its log will say
-                await asyncio.sleep(2)
-            # One more launch files the last title's logs, then it is closed.
-            pid = await pc.launch(bundle, environment={"MV_AUTOSTART": names[0]}, kill_existing=True)
-            await asyncio.sleep(3)
+    base = root / "build" / "test"
+    runs = sorted(d for d in base.glob("*") if (d / "state.json").is_file()) if base.is_dir() else []
+    prev = runs[-1] if runs else None
+    if a.failed:
+        if not prev:
+            sys.exit("--failed: no earlier test run under build/test")
+        st = json.loads((prev / "state.json").read_text())
+        items = [k for k, v in st["items"].items() if v.get("verdict") != "pass"]
+        if a.targets:
+            items = [k for k in items if k.split("@")[0] in a.targets]
+        if not items:
+            print(f"nothing failed in {prev.name}"); return
+        run = base / time.strftime("%Y%m%d-%H%M%S")
+        state = {"items": {k: {} for k in items}, "seconds": a.seconds, "from": prev.name}
+    elif prev and not a.new and any(not v.get("verdict") for v in
+                                    json.loads((prev / "state.json").read_text())["items"].values()):
+        run = prev
+        state = json.loads((prev / "state.json").read_text())
+        print(f"resuming {run.name}  (--new starts over)")
+    else:
+        run = base / time.strftime("%Y%m%d-%H%M%S")
+        state = {"items": {f"{t}@{m}": {} for t in titles for m in modes}, "seconds": a.seconds}
+    run.mkdir(parents=True, exist_ok=True)
+    save = lambda: (run / "state.json").write_text(json.dumps(state, indent=1))
+    save()
+    todo = [k for k, v in state["items"].items() if not v.get("verdict")]
+    total = len(state["items"])
+    print(f"{run.relative_to(root)}: {len(todo)} of {total} run(s) to go, "
+          f"{state['seconds']} s each (about {len(todo) * (state['seconds'] + 15) // 60} min)", flush=True)
+    blacks = 0
+
+    async def one(rsd, pc, afc, key):
+        nonlocal blacks
+        title, mode = key.split("@")
+        tree = rows.get(title, {}).get("tree", f"mv_{title}")
+        out = run / tree / mode
+        out.mkdir(parents=True, exist_ok=True)
+        for f in ("klepton-boot.log", "klepton-crash.log"):     # nothing stale
+            try:
+                await afc.rm(f"Documents/{f}", force=True)
+            except Exception:
+                pass
+        async with CrashReportsManager(rsd) as cr:
+            before = set(await cr.ls("/", depth=1))
+        env = {"MV_AUTOSTART": title, "MV_INPUT_MODE": mode}
+        if not a.no_play:
+            env["MV_AUTOPLAY"] = "1"
+        t0 = time.time()
+        pid = await pc.launch(bundle, environment=env, kill_existing=True)
+        print(f"[{total - len(todo) + 1}/{total}] {title} ({mode}): pid {pid}", end="", flush=True)
+        exited = None
+        while time.time() - t0 < state["seconds"]:
+            await asyncio.sleep(5)
+            if await pc.process_identifier_for_bundle_identifier(bundle) != pid:
+                exited = round(time.time() - t0)
+                break
+        if exited is None:
             try:
                 await pc.kill(pid)
             except Exception:
                 pass
-    await with_rsd(a, fn)
-    print("pass done; pulling logs")
-    a.all, a.target, a.launcher, a.out = True, "", True, None
-    await cmd_logs(a)
+        await asyncio.sleep(3)
+        got = []
+        for f in ("klepton-boot.log", "klepton-crash.log"):
+            try:
+                (out / f).write_bytes(await afc.get_file_contents(f"Documents/{f}"))
+                got.append(f)
+            except Exception:
+                pass
+        async with CrashReportsManager(rsd) as cr:
+            try:
+                await cr.flush()
+            except Exception:
+                pass
+            for n in sorted(set(await cr.ls("/", depth=1)) - before):
+                if n.endswith(".ips") and ("metavision" in n.lower() or "klepton" in n.lower()):
+                    (out / posixpath.basename(n)).write_bytes(await cr.afc.get_file_contents(n))
+                    got.append(posixpath.basename(n))
+        v = triage.verdict(out, exited=exited)
+        state["items"][key] = {"verdict": v["verdict"], "summary": v["summary"], "exited_after": exited}
+        save()
+        print(f"  -> {v['verdict'].upper()}: {v['summary']}", flush=True)
+        blacks = blacks + 1 if v["frames"] == 0 else 0
+        if blacks == 3:
+            print("  !! three runs in a row without a picture: is the headset being worn? "
+                  "(visionOS stops drawing apps nobody is looking through)", flush=True)
+
+    async def fn(rsd):
+        print(await mount_ddi(rsd, a.ddi), flush=True)
+        afc = await HouseArrestService.create(rsd, bundle)
+        try:
+            async with DvtProvider(rsd) as dvt, ProcessControl(dvt) as pc:
+                while todo:
+                    await one(rsd, pc, afc, todo[0])
+                    todo.pop(0)
+        finally:
+            await afc.close()
+
+    for attempt in range(a.retries + 1):
+        try:
+            await with_rsd(a, fn)
+            break
+        except Exception as e:
+            if not todo:
+                break
+            if attempt == a.retries:
+                sys.exit(f"\ngave up after {a.retries} reconnects; run `test` again to resume")
+            print(f"\n--- connection dropped ({type(e).__name__}: {e}); reconnecting in 10 s "
+                  f"({attempt + 1}/{a.retries}), resuming at {todo[0]}", flush=True)
+            await asyncio.sleep(10)
+    v = [x.get("verdict") for x in state["items"].values()]
+    print(f"\n{run.relative_to(root)}: {v.count('pass')} passed, {len(v) - v.count('pass')} not  "
+          f"(report: tools/metavision-triage {run.relative_to(root)}; again for just those: test --failed)")
 
 
 async def cmd_logs(a):
@@ -748,8 +936,13 @@ def main():
                    help="every title's last run, filed by the launcher (implies --launcher)")
     p.add_argument("--bundle"); p.add_argument("--launcher", action="store_true"); p.add_argument("--out")
     p = sub.add_parser("ddi"); p.add_argument("--dir", default="build/ddi")
+    sub.add_parser("tunnel")
     p = sub.add_parser("test"); p.add_argument("targets", nargs="*")
-    p.add_argument("--seconds", type=int, default=90, help="how long each title runs")
+    p.add_argument("--seconds", type=int, default=75, help="how long each run lasts")
+    p.add_argument("--modes", default=",".join(MODES), help="input modes to run each title in (default: all)")
+    p.add_argument("--failed", action="store_true", help="only what did not pass in the last run")
+    p.add_argument("--new", action="store_true", help="start over instead of resuming an unfinished run")
+    p.add_argument("--retries", type=int, default=20, help="reconnects after a dropped connection")
     p.add_argument("--no-play", action="store_true", help="no scripted input: just open each title")
     p.add_argument("--ddi", default="build/ddi"); p.add_argument("--bundle")
     p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
@@ -757,7 +950,7 @@ def main():
     if a.cmd == "register":
         return cmd_register(a)
     asyncio.run({"discover": cmd_discover, "pair": cmd_pair, "info": cmd_info,
-                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage, "logs": cmd_logs, "env": cmd_env, "ls": cmd_ls, "icons": cmd_icons, "ddi": cmd_ddi, "test": cmd_test}[a.cmd](a))
+                 "devmode": cmd_devmode, "install": cmd_install, "stage": cmd_stage, "logs": cmd_logs, "env": cmd_env, "ls": cmd_ls, "icons": cmd_icons, "ddi": cmd_ddi, "test": cmd_test, "tunnel": cmd_tunnel}[a.cmd](a))
 
 
 if __name__ == "__main__":
