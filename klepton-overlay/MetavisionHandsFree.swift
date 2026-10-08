@@ -79,10 +79,11 @@ final class MetavisionHandsFree {
         return currentMode
     }
 
-    /// Change the mode now and remember it (launcher picker, voice).
-    func setMode(_ m: Mode) {
+    /// Change the mode now and remember it (launcher picker, voice); auto-play's
+    /// mode cycle changes it without remembering.
+    func setMode(_ m: Mode, remember: Bool = true) {
         lock.lock(); currentMode = m; lock.unlock()
-        Self.remember(m)
+        if remember { Self.remember(m) }
         applyVoice()
         NSLog("[mv] input mode -> %@", m.rawValue)
     }

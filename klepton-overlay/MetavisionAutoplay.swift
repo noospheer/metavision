@@ -15,6 +15,10 @@
 //   auto       the two alternating every 20 s, as a hand coming into and
 //              leaving view would
 //
+// MV_AUTOPLAY_CYCLE=<seconds> runs all three in one launch instead — hands,
+// then hands-free, then auto, that long each (start in auto so the audio
+// session has the microphone) — so a test pass boots each title once.
+//
 // Either way it aims at a grid of directions around the head's forward view, a
 // click at each, with other buttons and both thumbsticks on their own periods.
 //
@@ -50,6 +54,8 @@ enum MetavisionAutoplay {
     static let movesHead: Bool = enabled && (getenv("MV_AUTOPLAY_HEAD").map { String(cString: $0) != "0" } ?? true)
     static let speaks: Bool = enabled && (getenv("MV_AUTOPLAY_SPEECH").map { String(cString: $0) != "0" } ?? true)
     private static var headStart: Double = 0
+    static let cycle: Double = getenv("MV_AUTOPLAY_CYCLE").flatMap { Double(String(cString: $0)) } ?? 0
+    private static let cycleModes: [MetavisionHandsFree.Mode] = [.hands, .handsfree, .auto]
     private static var headNow_ = ""
     private static let headLock = NSLock()
     /// Written on the render thread, read on the controller thread.
@@ -91,11 +97,18 @@ enum MetavisionAutoplay {
         let aim = heading * simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
                           * simd_quatf(angle: pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
 
+        if cycle > 0 {
+            let m = cycleModes[min(Int(t / cycle), cycleModes.count - 1)]
+            if MetavisionHandsFree.shared.mode != m {
+                MetavisionHandsFree.shared.setMode(m, remember: false)
+                NSLog("[mv-autoplay] t=%.1fs mode cycle: %@", t, m.rawValue as NSString)
+            }
+        }
         let viaHandsFree: Bool
         switch MetavisionHandsFree.shared.mode {
         case .hands:     viaHandsFree = false
         case .handsfree: viaHandsFree = true
-        case .auto:      viaHandsFree = Int(t / 20) % 2 == 1
+        case .auto:      viaHandsFree = Int(t / (cycle > 0 ? 5 : 20)) % 2 == 1   // faster inside a cycle
         }
         let path = viaHandsFree ? "hands-free" : "controllers+hands"
         if path != lastPath { lastPath = path; NSLog("[mv-autoplay] input path: %@", path as NSString) }

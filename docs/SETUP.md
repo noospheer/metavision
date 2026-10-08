@@ -238,15 +238,18 @@ charger of 30 W or more keeps it running indefinitely.
 
 ### Unattended test pass
 
-`test` runs every title in the launcher in every input mode (hands,
-hands-free, auto), each for `--seconds` (default 75), with **scripted input**
-(`MV_AUTOPLAY=1`) going in through that mode's own path:
+`test` runs every title in the launcher with **scripted input**
+(`MV_AUTOPLAY=1`) in every input mode. By default each title is launched once
+and the modes follow one another, 20 s each — hands, hands-free, auto
+(`MV_AUTOPLAY_CYCLE`), 95 s a title, about 75 minutes for 45 titles; with
+`--modes hands,handsfree,auto` each mode is a launch of its own (75 s). Input
+goes in through each mode's own path:
 
 | mode | what the script does |
 |---|---|
 | `hands` | synthetic Touch controllers *and* synthetic Meta hand skeletons: aims across a grid in front of the user, clicking/pinching at each point; A, B, X, grips, Menu and both sticks on their own periods |
 | `handsfree` | no controllers or hands: a gaze ray at each grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
-| `auto` | the two alternating every 20 s, as a hand entering and leaving view |
+| `auto` | the two alternating (every 20 s; 5 s inside a cycle), as a hand entering and leaving view |
 
 In every mode the **head moves** as well (`MV_AUTOPLAY_HEAD=0` holds it
 still): the pose the title sees looks around, turns right round once a minute,
@@ -272,7 +275,8 @@ The fix loop is: `test` → `metavision-triage` → fix → rebuild and install 
 
 The headset must be **worn** throughout: visionOS stops drawing apps nobody
 is looking through, and since visionOS 2 covering its inner sensor only delays
-sleep. When two titles in a row come back without a picture after one that
+sleep. Whoever wears it should not watch: the scripted head motion swings the
+picture against their real head. When two titles in a row come back without a picture after one that
 drew, the pass takes the headset to be asleep: it puts those runs back in the
 queue, pauses, and re-launches the last title that drew every 30 s until it
 draws again — put the headset on (or wake it) and the pass carries on. Each

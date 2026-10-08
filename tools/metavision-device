@@ -583,7 +583,7 @@ async def cmd_ddi(a):
     await with_rsd(a, fn)
 
 
-MODES = ("hands", "handsfree", "auto")
+MODES = ("hands", "handsfree", "auto", "cycle")   # cycle: all three in one launch
 
 
 def _triage_module():
@@ -618,6 +618,8 @@ async def cmd_test(a):
     for m in modes:
         if m not in MODES:
             sys.exit(f"unknown mode {m}: {', '.join(MODES)}")
+    if a.seconds is None:
+        a.seconds = 95 if modes == ["cycle"] else 75
     titles = a.targets or list(rows)
     try:   # only what the launcher build carries
         import zipfile
@@ -670,9 +672,11 @@ async def cmd_test(a):
                 pass
         async with CrashReportsManager(rsd) as cr:
             before = set(await cr.ls("/", depth=1))
-        env = {"MV_AUTOSTART": title, "MV_INPUT_MODE": mode}
+        env = {"MV_AUTOSTART": title, "MV_INPUT_MODE": "auto" if mode == "cycle" else mode}
         if not a.no_play:
             env["MV_AUTOPLAY"] = "1"
+            if mode == "cycle":
+                env["MV_AUTOPLAY_CYCLE"] = "20"   # hands, hands-free, auto: 20 s each
         t0 = time.time()
         pid = await pc.launch(bundle, environment=env, kill_existing=True)
         if not probe:
@@ -972,8 +976,10 @@ def main():
     p = sub.add_parser("ddi"); p.add_argument("--dir", default="build/ddi")
     sub.add_parser("tunnel")
     p = sub.add_parser("test"); p.add_argument("targets", nargs="*")
-    p.add_argument("--seconds", type=int, default=75, help="how long each run lasts")
-    p.add_argument("--modes", default=",".join(MODES), help="input modes to run each title in (default: all)")
+    p.add_argument("--seconds", type=int, help="how long each run lasts (default 95 for cycle, else 75)")
+    p.add_argument("--modes", default="cycle",
+                   help="cycle (default: one launch per title, all three modes in turn), "
+                        "or any of hands,handsfree,auto as separate launches")
     p.add_argument("--failed", action="store_true", help="only what did not pass in the last run")
     p.add_argument("--new", action="store_true", help="start over instead of resuming an unfinished run")
     p.add_argument("--retries", type=int, default=20, help="reconnects after a dropped connection")
