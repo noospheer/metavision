@@ -587,8 +587,14 @@ MODES = ("hands", "handsfree", "auto")
 
 
 def _triage_module():
+    import importlib.util
     from importlib.machinery import SourceFileLoader
-    return SourceFileLoader("mv_triage", str(Path(__file__).resolve().parent / "metavision-triage")).load_module()
+    path = str(Path(__file__).resolve().parent / "metavision-triage")
+    loader = SourceFileLoader("mv_triage", path)
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("mv_triage", loader))
+    sys.dont_write_bytecode = True
+    loader.exec_module(mod)
+    return mod
 
 
 async def cmd_test(a):
