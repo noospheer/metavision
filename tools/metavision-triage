@@ -185,11 +185,8 @@ def main():
         r = triage(d)
         if r is None and not list(d.glob("*.ips")):
             continue
-        v = verdict(d)
         key = f"{d.parent.name}@{d.name}"
-        if key in state and state[key].get("verdict"):
-            v["verdict"] = state[key]["verdict"]          # what the run itself saw (early exits)
-            v["summary"] = state[key].get("summary", v["summary"])
+        v = verdict(d, exited=state.get(key, {}).get("exited_after"))   # early exits: what the run saw
         rows.append((label, v, r[3] if r else []))
     if not rows:
         sys.exit(f"no logs under {base}: run `metavision-device test` (or `logs --all`) first")
