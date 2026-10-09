@@ -938,3 +938,38 @@ s = s.replace(old, new, 1)
 open(path, "w").write(s)
 print("overlay: ELF TLS through TLS descriptors (R_AARCH64_TLSDESC)")
 EOF
+
+# 15 — the Android version: API 32 (Android 12L), what a Quest on current
+# firmware reports, instead of Klepton's 29 (Android 10). Unity 2022.3 accepts
+# a Vulkan driver from a GPU vendor it does not know — Apple's, through
+# MoltenVK — only from API 30; below that it abandons Vulkan for a GLES2
+# context whose shaders the title does not ship ("shader compiler platform 5 is
+# not available"): broken or missing rendering in every such title. It reads the
+# level over JNI (Build.VERSION.SDK_INT); the ro.build.version.sdk property and
+# NativeActivity's sdkVersion follow the same value.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+rt = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+J = f"{rt}/kl_jni.c"
+patch(J, '    KLJ_FINT("android/os/Build$VERSION", "SDK_INT", 29),\n',
+         '    KLJ_FINT("android/os/Build$VERSION", "SDK_INT", 32),   // metavision: Android 12L\n',
+         "metavision: Android 12L")
+patch(J, '    KLJ_FSTR("android/os/Build$VERSION", "RELEASE", "10"),\n',
+         '    KLJ_FSTR("android/os/Build$VERSION", "RELEASE", "12"),   // metavision: Android 12L (release)\n',
+         "metavision: Android 12L (release)")
+patch(J, '    return (klj_val){.j = (uint64_t)kl_jni_build_int("SDK_INT", 29)};\n',
+         '    return (klj_val){.j = (uint64_t)kl_jni_build_int("SDK_INT", 32)};   // metavision: Android 12L (UE4)\n',
+         "metavision: Android 12L (UE4)")
+patch(f"{rt}/libc/kl_libc.c", 'kl_jni_build_int("SDK_INT", 29)', 'kl_jni_build_int("SDK_INT", 32)',
+      'kl_jni_build_int("SDK_INT", 32)')
+patch(f"{rt}/guest/kl_nativeactivity.c", "    g_act.sdkVersion       = 29;\n",
+      "    g_act.sdkVersion       = 32;   // metavision: Android 12L\n", "metavision: Android 12L")
+print("overlay: Android 12L (API 32)")
+PYEOF
