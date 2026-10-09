@@ -19,11 +19,15 @@
 // then hands-free, then auto, that long each (start in auto so the audio
 // session has the microphone) — so a test pass boots each title once.
 //
-// Either way it aims across where menus sit — a dense 7.5-degree scan, then a
-// wider grid — resting on each point before a click, with other buttons and
-// both thumbsticks on their own periods. Sweeps alternate between aiming from
-// where the title started (menus placed in the world) and from where the head
-// faces now (menus that follow the head).
+// Either way it aims at what looks pressable in the picture the title drew —
+// text, icons, buttons, found by MetavisionTargets every 1.5 s — resting on
+// each before a click, least-tried first, so a menu's buttons are actually
+// pressed rather than hit by chance. One step in four (and every step while
+// nothing is found) it sweeps instead: a dense 7.5-degree scan of where menus
+// sit, then a wider grid, alternating between aiming from where the title
+// started (menus placed in the world) and from where the head faces now (menus
+// that follow the head). Other buttons and both thumbsticks run on their own
+// periods.
 //
 // After the first 30 s — when menus are up — the head moves too
 // (MV_AUTOPLAY_HEAD=0 holds it still): the pose the title sees looks left and
@@ -90,6 +94,31 @@ enum MetavisionAutoplay {
     /// The head holds still this long first — when a title's menus are up.
     private static let headHold: Float = 30
     nonisolated(unsafe) private static var headSaid = false
+    /// The target this step aims at (origin, direction), held for the whole step.
+    nonisolated(unsafe) private static var target: (SIMD3<Float>, SIMD3<Float>, String)?
+    /// How often each 4-degree patch of directions has been pressed.
+    nonisolated(unsafe) private static var tried: [Int: Int] = [:]
+    nonisolated(unsafe) private static var sweepStep = 0
+
+    private static func yawPitch(_ d: SIMD3<Float>) -> (Float, Float) {
+        (atan2f(-d.x, -d.z) * 180 / .pi, asinf(max(-1, min(1, d.y))) * 180 / .pi)
+    }
+
+    /// At a step's start: the least-pressed of the latest targets, or nil to sweep.
+    private static func pickTarget(step: Int) -> (SIMD3<Float>, SIMD3<Float>, String)? {
+        let ts = MetavisionTargets.latest()
+        guard !ts.isEmpty, step % 4 != 3 else { return nil }
+        func key(_ d: SIMD3<Float>) -> Int {
+            let (y, p) = yawPitch(d)
+            return Int((y + 360).rounded() / 4) * 1000 + Int((p + 90).rounded() / 4)
+        }
+        let best = ts.enumerated().min { a, b in
+            let ca = tried[key(a.element.dir)] ?? 0, cb = tried[key(b.element.dir)] ?? 0
+            return ca != cb ? ca < cb : a.offset < b.offset
+        }!.element
+        tried[key(best.dir), default: 0] += 1
+        return (best.origin, best.dir, best.kind)
+    }
 
     static func drive() {
         guard enabled else { return }
@@ -116,11 +145,27 @@ enum MetavisionAutoplay {
         if origin == nil { origin = (hp, facing) }
         // Alternate sweeps: from where the title started (menus placed in the
         // world), then from where the head now faces (menus that follow the head).
-        let fromStart = (step / aims.count) % 2 == 0
-        let (base, heading) = fromStart ? origin! : (hp, facing)
-        let (yaw, pitch) = aims[step % aims.count]
-        let aim = heading * simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
+        if step != lastStep {
+            target = pickTarget(step: step)
+            if target == nil { sweepStep += 1 }
+        }
+        let fromStart = (sweepStep / aims.count) % 2 == 0
+        var (base, heading) = fromStart ? origin! : (hp, facing)
+        var (yaw, pitch) = aims[sweepStep % aims.count]
+        var aim = heading * simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
                           * simd_quatf(angle: pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
+        var aimFrom: SIMD3<Float>? = nil
+        if let tg = target {
+            let o = tg.0, d = tg.1
+            // Aimed in world terms, from just below the eye the frame was drawn
+            // from, so the ray lands where the region was seen.
+            (yaw, pitch) = yawPitch(d)
+            aim = simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
+                * simd_quatf(angle: pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
+            base = o
+            heading = simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
+            aimFrom = o + SIMD3<Float>(0, -0.04, 0)
+        }
 
         if cycle > 0 {
             let m = cycleModes[min(Int(t / cycle), cycleModes.count - 1)]
@@ -140,11 +185,13 @@ enum MetavisionAutoplay {
 
         let what = viaHandsFree
             ? handsFree(step: step, head: base, aim: aim)
-            : controllersAndHands(step: step, phase: phase, now: now, head: base, heading: heading, aim: aim)
+            : controllersAndHands(step: step, phase: phase, now: now, head: base, heading: heading, aim: aim,
+                                  rightAt: aimFrom)
         if step != lastStep {
             lastStep = step
+            let src = target.map { "target (" + $0.2 + ")" } ?? (fromStart ? "start" : "head")
             NSLog("[mv-autoplay] t=%.1fs step %ld: aim %.1f,%.1f from %@%@%@", t, step, yaw, pitch,
-                  (fromStart ? "start" : "head") as NSString, what as NSString, headNow as NSString)
+                  src as NSString, what as NSString, headNow as NSString)
         }
     }
 
@@ -187,8 +234,9 @@ enum MetavisionAutoplay {
     // MARK: hands mode — controllers and Meta hand skeletons
 
     private static func controllersAndHands(step: Int, phase: Double, now: Double, head hp: SIMD3<Float>,
-                                            heading: simd_quatf, aim rq: simd_quatf) -> String {
-        let rp = hp + heading.act(SIMD3<Float>(0.18, -0.30, -0.25))
+                                            heading: simd_quatf, aim rq: simd_quatf,
+                                            rightAt: SIMD3<Float>? = nil) -> String {
+        let rp = rightAt ?? hp + heading.act(SIMD3<Float>(0.18, -0.30, -0.25))
         let lq = heading * simd_quatf(angle: -10 * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
         let lp = hp + heading.act(SIMD3<Float>(-0.18, -0.30, -0.25))
 

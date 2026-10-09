@@ -383,10 +383,11 @@ echo "overlay: older Oculus XR Plugin surface handshake (initComplete)"
 # Modes auto / hands / handsfree (launcher picker, voice, MV_INPUT_MODE);
 # handsfree ignores tracked hands entirely.
 cp "$ROOT/klepton-overlay/MetavisionHandsFree.swift" "$ROOT/klepton-overlay/MetavisionHands.swift" \
-   "$ROOT/klepton-overlay/MetavisionAutoplay.swift" "$ROOT/klepton-overlay/MetavisionShots.swift" "$K/visionos/Sources/"
+   "$ROOT/klepton-overlay/MetavisionAutoplay.swift" "$ROOT/klepton-overlay/MetavisionShots.swift" \
+   "$ROOT/klepton-overlay/MetavisionTargets.swift" "$K/visionos/Sources/"
 grep -q '"MetavisionHandsFree.swift"' "$G" || {
     grep -q '"MetavisionLibrary.swift"\]' "$G" || die "SWIFT list anchor (MetavisionLibrary) not found"
-    sed -i.bak 's|"MetavisionLibrary.swift"\]|"MetavisionLibrary.swift", "MetavisionHandsFree.swift", "MetavisionHands.swift", "MetavisionAutoplay.swift", "MetavisionShots.swift"]|' "$G" && rm -f "$G.bak"
+    sed -i.bak 's|"MetavisionLibrary.swift"\]|"MetavisionLibrary.swift", "MetavisionHandsFree.swift", "MetavisionHands.swift", "MetavisionAutoplay.swift", "MetavisionShots.swift", "MetavisionTargets.swift"]|' "$G" && rm -f "$G.bak"
 }
 python3 - "$K/visionos" <<'EOF'
 import sys
@@ -434,6 +435,21 @@ patch(f"{v}/Sources/KleptonCompositor.swift",
       "                MetavisionShots.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue)\n"
       "            }\n",
       "metavision: shots")
+# ...and auto-play's targets: what looks pressable in that eye (MetavisionTargets.swift),
+# placed with the frustum, viewport and head pose the title rendered it with.
+patch(f"{v}/Sources/KleptonCompositor.swift",
+      "                MetavisionShots.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue)\n",
+      "                MetavisionShots.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue)\n"
+      "                if haveRendered {   // metavision: targets\n"
+      "                    let e = vi == 0\n"
+      "                    let t = e ? rendered.tangents.0 : rendered.tangents.1\n"
+      "                    let r = e ? rendered.viewport.0 : rendered.viewport.1\n"
+      "                    MetavisionTargets.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue,\n"
+      "                        viewport: SIMD4<Int32>(r.0, r.1, r.2, r.3), tangents: SIMD4<Float>(t.0, t.1, t.2, t.3),\n"
+      "                        pose: (SIMD3<Float>(rendered.px, rendered.py, rendered.pz),\n"
+      "                               simd_quatf(ix: rendered.qx, iy: rendered.qy, iz: rendered.qz, r: rendered.qw)))\n"
+      "                }\n",
+      "metavision: targets")
 
 # The launcher closes its boot window once a title is drawing.
 patch(f"{v}/Sources/KleptonCompositor.swift",
@@ -1425,4 +1441,46 @@ if marker not in s:
         sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
     open(p, "w").write(s.replace(old, new))
 print("overlay: microphone voice processing no longer ducks the title's audio")
+PYEOF
+
+# 26 — DoubleWide eye layers (UE4 GLES): the right eye shares the left eye's
+# storage instead of re-binding the GL name. kl_glfb_bind_eye_mtl_texture
+# re-points the name at the provider's slice for THAT eye, so registering the
+# one wide texture for eye 1 moved it to array slice 1: the guest drew both
+# halves there and the left eye sampled an empty slice 0 (black in that eye,
+# a washed-out picture overall). Eye 1 is now noted against eye 0's MTLTexture
+# and slice; the per-eye submit viewports still crop each half.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/xr/kl_ovrp.c"
+s = open(p).read()
+marker = "metavision: DoubleWide shares eye 0's slice"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    helper = ("// metavision: DoubleWide shares eye 0's slice (step 26). Re-binding the GL\n"
+              "// name for eye 1 would move it to eye 1's array slice; note eye 0's storage instead.\n"
+              "static void mv_dw_share_eye1(int stage) {\n"
+              "    int sl = 0;\n"
+              "    void *t = kl_glfb_eye_mtl_texture(0, stage, &sl);\n"
+              "    if (!t) return;\n"
+              "    kl_glfb_note_eye_mtl_texture(1, stage, t, sl, g_layers_dw_w, g_layers_dw_h);\n"
+              "    static int said;\n"
+              "    if (!said++) fprintf(stderr, \"  [ovrp] DoubleWide: eye 1 shares eye 0's storage (slice %d)\\n\", sl);\n"
+              "}\n\n")
+    anchor = "static uint64_t klovrp_SetupLayer(void *device, const ovrp_layer_desc_eyefov *desc,\n"
+    s = sub(s, anchor, "static int g_layers_dw_w, g_layers_dw_h;\n" + helper + anchor)
+    s = sub(s,
+        "                if (kl_glfb_has_mtl_provider())\n"
+        "                    kl_glfb_bind_eye_mtl_texture(1, stage, name, w, h, glfmt);\n",
+        "                if (mtl_backed) { g_layers_dw_w = w; g_layers_dw_h = h; mv_dw_share_eye1(stage); }   // metavision (step 26)\n")
+    s = sub(s,
+        "            kl_glfb_bind_eye_mtl_texture(eye, stage, *slot,\n"
+        "                l->desc.texture_size.w, l->desc.texture_size.h, gf);\n",
+        "            (void)gf;   // metavision (step 26): share eye 0's storage, never re-bind\n"
+        "            if (eye == 1) { g_layers_dw_w = l->desc.texture_size.w; g_layers_dw_h = l->desc.texture_size.h; mv_dw_share_eye1(stage); }\n")
+    open(p, "w").write(s)
+print("overlay: DoubleWide eye layers keep both eyes on one slice")
 PYEOF

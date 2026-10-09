@@ -247,14 +247,20 @@ goes in through each mode's own path:
 
 | mode | what the script does |
 |---|---|
-| `hands` | synthetic Touch controllers *and* synthetic Meta hand skeletons: aims across a grid in front of the user, clicking/pinching at each point; A, B, X, grips, Menu and both sticks on their own periods |
-| `handsfree` | no controllers or hands: a gaze ray at each grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
+| `hands` | synthetic Touch controllers *and* synthetic Meta hand skeletons: aims at what looks pressable (or across a grid), clicking/pinching at each; A, B, X, grips, Menu and both sticks on their own periods |
+| `handsfree` | no controllers or hands: a gaze ray at each target or grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
 | `auto` | the two alternating (every 20 s; 5 s inside a cycle), as a hand entering and leaving view |
 
-Aiming is a dense 7.5° scan of where menus sit, then a wider grid, resting
-about 0.35 s on each point before the click; sweeps alternate between aiming
-from where the title started (menus placed in the world) and from where the
-head now faces (menus that follow it). After the first 30 s the **head moves**
+Aiming goes for **what looks pressable**: every 1.5 s the eye the title drew
+is shrunk to a 128-pixel luminance map (`MetavisionTargets`), regions dense with
+edges (text, icons, button outlines) or standing out in brightness are picked
+out, and each becomes a world direction through the frustum and head pose that
+frame was rendered with. Auto-play rests about 0.35 s on a target before the
+click, least-pressed first, and logs the targets as `[mv-target]`. One step in
+four, and whenever nothing is found, it sweeps instead: a dense 7.5° scan of
+where menus sit, then a wider grid, alternating between aiming from where the
+title started (menus placed in the world) and from where the head now faces
+(menus that follow it). After the first 30 s the **head moves**
 as well (`MV_AUTOPLAY_HEAD=0` holds it still): the pose the title sees looks
 around, turns right round once a minute, steps about and crouches.
 
