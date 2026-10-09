@@ -20,6 +20,8 @@ that will not start, and what is still open.
 | `dl_iterate_phdr` reports bare library names | Unity 2018 il2cpp crashes at start (`SIGSEGV` at `0xffffffffffffffff`): it opens its own library by that name and maps the result unchecked | full paths, as Android gives | overlay step 10 |
 | `socket()`/`socketpair()` with Linux's `SOCK_NONBLOCK`/`SOCK_CLOEXEC` type bits | Rust/tokio networking (LiveKit, …) panics: `failed to create UnixStream` | strip the bits, apply them with `fcntl` | overlay step 11 |
 | `Class.forName(String)`, `System.loadLibrary`, FMOD's `org.fmod.FMOD` | `NullReferenceException` every frame from `FMODUnity.RuntimeUtils`; plugins not loaded; FMOD banks in assets unreadable | bound to Klepton's existing class interning, guest dlopen + `JNI_OnLoad`, and the context's `AssetManager` | overlay steps 12-13 |
+| **ELF TLS** (`R_AARCH64_TLSDESC`, relocation 1031) — libraries built for API 29+ | `translated dylib present but failed to load: unhandled relocation type 1031` (Meta Interaction SDK, Meta body tracking, …) | a TLS-descriptor resolver: each thread's own copy of the library's TLS block, from `PT_TLS`, offset from the thread pointer the guest reads | overlay step 14 |
+| `libandroid.so` opened by name | `could not load libandroid.so` (Unreal, Unity probes) | a handle whose symbols are Klepton's own NDK functions | `shims/mv_shims.c` |
 | the launcher did not carry **MoltenVK** | every Vulkan title black: `MoltenVK is not vendored` | the launcher build wraps it like ANGLE | `tools/metavision-launcher` |
 | a hand-launched app has no environment, and every Klepton diagnostic is an environment switch | — | `Documents/klepton.env`, read before configure | `tools/metavision-overlay`, `metavision-device env` |
 

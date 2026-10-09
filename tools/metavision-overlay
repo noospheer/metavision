@@ -801,3 +801,140 @@ patch(S, "static klj_val klj_Context_getAssets(void *env, void *self, const klj_
       "metavision: FMOD.init(context)")
 print("overlay: System.loadLibrary, FMOD's Java half")
 EOF
+
+# 14 — ELF thread-local storage through TLS descriptors (R_AARCH64_TLSDESC,
+# type 1031). Libraries built with a recent NDK for API 29+ use ELF TLS, which
+# on arm64 means TLSDESC; Klepton's loader refused the relocation and the
+# library with it (Meta's Interaction SDK in dozens of titles, Meta body
+# tracking, ...). The descriptor's resolver answers the variable's offset from
+# the thread pointer the guest reads (TPIDRRO_EL0 — Klepton rewrites guest
+# reads of TPIDR_EL0 to it): each thread gets its own copy of the library's TLS
+# block on first use, initialised from PT_TLS.
+python3 - "$K/runtime/kl_image.c" <<'EOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "metavision: TLSDESC" in s:
+    sys.exit(0)
+helper = r'''
+// metavision: TLSDESC — a module's TLS block per thread, and the descriptor resolver.
+typedef struct { pthread_key_t key; const uint8_t *init; size_t filesz, memsz, align; } mv_tls_mod;
+typedef struct { mv_tls_mod *mod; uint64_t off; } mv_tls_arg;
+
+void *mv_tlsdesc_addr(mv_tls_arg *a);
+void *mv_tlsdesc_addr(mv_tls_arg *a) {
+    mv_tls_mod *m = a->mod;
+    uint8_t *b = pthread_getspecific(m->key);
+    if (!b) {
+        size_t al = m->align < 16 ? 16 : m->align;
+        void *p = NULL;
+        if (posix_memalign(&p, al, m->memsz ? m->memsz : 1) != 0) abort();
+        b = p;
+        if (m->filesz) memcpy(b, m->init, m->filesz);
+        if (m->memsz > m->filesz) memset(b + m->filesz, 0, m->memsz - m->filesz);
+        pthread_setspecific(m->key, b);
+    }
+    return b + a->off;
+}
+
+#if defined(__aarch64__)
+#ifdef __APPLE__
+#define MV_SYM(x) "_" #x
+#else
+#define MV_SYM(x) #x
+#endif
+// TLSDESC ABI: x0 = &descriptor {resolver, arg}; return x0 = address - TP; every
+// other register (general and SIMD) preserved.
+__attribute__((naked)) static void mv_tlsdesc_resolve(void) {
+    __asm__ volatile(
+        "stp x29, x30, [sp, #-16]!\n"
+        "mov x29, sp\n"
+        "sub sp, sp, #528\n"
+        "stp x1, x2, [sp, #0]\n"    "stp x3, x4, [sp, #16]\n"
+        "stp x5, x6, [sp, #32]\n"   "stp x7, x8, [sp, #48]\n"
+        "stp x9, x10, [sp, #64]\n"  "stp x11, x12, [sp, #80]\n"
+        "stp x13, x14, [sp, #96]\n" "stp x15, x16, [sp, #112]\n"
+        "stp x17, x18, [sp, #128]\n"
+        "stp q0, q1, [sp, #144]\n"  "stp q2, q3, [sp, #176]\n"
+        "stp q4, q5, [sp, #208]\n"  "stp q6, q7, [sp, #240]\n"
+        "stp q16, q17, [sp, #272]\n" "stp q18, q19, [sp, #304]\n"
+        "stp q20, q21, [sp, #336]\n" "stp q22, q23, [sp, #368]\n"
+        "stp q24, q25, [sp, #400]\n" "stp q26, q27, [sp, #432]\n"
+        "stp q28, q29, [sp, #464]\n" "stp q30, q31, [sp, #496]\n"
+        "ldr x0, [x0, #8]\n"
+        "bl " MV_SYM(mv_tlsdesc_addr) "\n"
+        "mrs x1, tpidrro_el0\n"
+        "sub x0, x0, x1\n"
+        "ldp q30, q31, [sp, #496]\n" "ldp q28, q29, [sp, #464]\n"
+        "ldp q26, q27, [sp, #432]\n" "ldp q24, q25, [sp, #400]\n"
+        "ldp q22, q23, [sp, #368]\n" "ldp q20, q21, [sp, #336]\n"
+        "ldp q18, q19, [sp, #304]\n" "ldp q16, q17, [sp, #272]\n"
+        "ldp q6, q7, [sp, #240]\n"  "ldp q4, q5, [sp, #208]\n"
+        "ldp q2, q3, [sp, #176]\n"  "ldp q0, q1, [sp, #144]\n"
+        "ldp x17, x18, [sp, #128]\n"
+        "ldp x15, x16, [sp, #112]\n" "ldp x13, x14, [sp, #96]\n"
+        "ldp x11, x12, [sp, #80]\n" "ldp x9, x10, [sp, #64]\n"
+        "ldp x7, x8, [sp, #48]\n"   "ldp x5, x6, [sp, #32]\n"
+        "ldp x3, x4, [sp, #16]\n"   "ldp x1, x2, [sp, #0]\n"
+        "add sp, sp, #528\n"
+        "ldp x29, x30, [sp], #16\n"
+        "ret\n");
+}
+#endif
+
+// The image's PT_TLS, once.
+static mv_tls_mod *mv_tls_module(kl_image *img) {
+    static struct { kl_image *img; mv_tls_mod *mod; } seen[64];
+    static unsigned n;
+    for (unsigned i = 0; i < n; i++) if (seen[i].img == img) return seen[i].mod;
+    unsigned phn = 0;
+    const Elf64_Phdr *ph = kl_phdrs(img, &phn);
+    for (unsigned i = 0; ph && i < phn; i++) {
+        if (ph[i].p_type != 7 /* PT_TLS */) continue;
+        mv_tls_mod *m = calloc(1, sizeof *m);
+        if (!m || pthread_key_create(&m->key, free) != 0) return NULL;
+        m->init = img->base + ph[i].p_vaddr;
+        m->filesz = ph[i].p_filesz;
+        m->memsz = ph[i].p_memsz;
+        m->align = ph[i].p_align;
+        if (n < 64) { seen[n].img = img; seen[n].mod = m; n++; }
+        return m;
+    }
+    return NULL;
+}
+
+static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {'''
+old = "static int apply_relocs(kl_image *img, const Elf64_Rela *r, size_t count) {"
+if s.count(old) != 1:
+    sys.exit(f"overlay: anchor moved upstream in {path}: apply_relocs")
+s = s.replace(old, helper.lstrip("\n"), 1)
+old = '''        default:
+            err("unhandled relocation type %u at %#llx", type, (unsigned long long)r->r_offset);
+            return -1;'''
+new = '''#if defined(__aarch64__)
+        case 1031: {   // metavision: TLSDESC — R_AARCH64_TLSDESC
+            mv_tls_mod *m = mv_tls_module(img);
+            const Elf64_Sym *sy = sidx ? &img->symtab[sidx] : NULL;
+            if (!m || (sy && sy->st_shndx == 0)) {
+                err("TLSDESC at %#llx: %s", (unsigned long long)r->r_offset,
+                    m ? "imported TLS variable (unsupported)" : "no PT_TLS in the image");
+                return -1;
+            }
+            mv_tls_arg *arg = malloc(sizeof *arg);
+            if (!arg) return -1;
+            arg->mod = m;
+            arg->off = (sy ? sy->st_value : 0) + (uint64_t)r->r_addend;
+            slot[0] = (uint64_t)(uintptr_t)mv_tlsdesc_resolve;
+            slot[1] = (uint64_t)(uintptr_t)arg;
+            break;
+        }
+#endif
+        default:
+            err("unhandled relocation type %u at %#llx", type, (unsigned long long)r->r_offset);
+            return -1;'''
+if s.count(old) != 1:
+    sys.exit(f"overlay: anchor moved upstream in {path}: reloc default")
+s = s.replace(old, new, 1)
+open(path, "w").write(s)
+print("overlay: ELF TLS through TLS descriptors (R_AARCH64_TLSDESC)")
+EOF
