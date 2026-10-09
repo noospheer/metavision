@@ -2863,3 +2863,141 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: device-memory and image-view census on large depth targets (diagnostic)")
 PYEOF
+
+# 49 — buffer targets an ES 3.0 context does not have are not forwarded. ANGLE's
+# Metal context is ES 3.0; a guest told of a newer GLES binds shader-storage,
+# atomic-counter, dispatch-indirect (and similar) buffers, and each such
+# glBindBuffer / glBufferData raised GL_INVALID_ENUM with no other effect — the
+# error Unity then reports as "OPENGL NATIVE PLUG-IN ERROR" hundreds of times.
+# On an ES 3.0 context only the eight ES 3.0 targets are forwarded; the runtime's
+# own bookkeeping (texel-buffer emulation) still sees every call, and the first
+# eight skipped targets are logged. A context of ES 3.1 or later is untouched.
+python3 - "$K/runtime/gfx/kl_glfb.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: ES 3.0 buffer targets only (step 49)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static void klfb_BufferData(uint32_t target, intptr_t size, const void *data,\n",
+        "// " + marker + "\n"
+        "static int mv_buffer_target_ok(uint32_t t, const char *fn) {\n"
+        "    static int es31 = -1;\n"
+        "    if (es31 < 0) {\n"
+        "        int32_t ma = 0, mi = 0;\n"
+        "        if (a_glGetIntegerv) { a_glGetIntegerv(0x821B, &ma); a_glGetIntegerv(0x821C, &mi); }\n"
+        "        if (ma == 0) return 1;              // no context answer yet: forward as before\n"
+        "        es31 = ma > 3 || (ma == 3 && mi >= 1);\n"
+        "    }\n"
+        "    if (es31) return 1;\n"
+        "    switch (t) {\n"
+        "    case 0x8892: case 0x8893:               // ARRAY, ELEMENT_ARRAY\n"
+        "    case 0x8F36: case 0x8F37:               // COPY_READ, COPY_WRITE\n"
+        "    case 0x88EB: case 0x88EC:               // PIXEL_PACK, PIXEL_UNPACK\n"
+        "    case 0x8C8E: case 0x8A11:               // TRANSFORM_FEEDBACK, UNIFORM\n"
+        "        return 1;\n"
+        "    }\n"
+        "    static unsigned said;\n"
+        "    if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 8)\n"
+        "        fprintf(stderr, \"  [glfb] %s(0x%x): not an ES 3.0 buffer target, not forwarded\\n\", fn, t);\n"
+        "    return 0;\n"
+        "}\n"
+        "static void klfb_BufferData(uint32_t target, intptr_t size, const void *data,\n")
+    s = sub(s, "    if (g_real_BufferData_t) g_real_BufferData_t(target, size, data, usage);\n",
+               "    if (g_real_BufferData_t && mv_buffer_target_ok(target, \"glBufferData\"))   // metavision (step 49)\n"
+               "        g_real_BufferData_t(target, size, data, usage);\n")
+    s = sub(s, "    if (g_real_BindBuffer) g_real_BindBuffer(target, buffer);\n",
+               "    if (g_real_BindBuffer && mv_buffer_target_ok(target, \"glBindBuffer\"))   // metavision (step 49)\n"
+               "        g_real_BindBuffer(target, buffer);\n")
+    open(p, "w").write(s)
+print("overlay: buffer targets an ES 3.0 context lacks are not forwarded")
+PYEOF
+
+# 50 — denormal float literals survive ANGLE's compiler. Unity's HLSL→GLSL
+# translator keeps integers in float registers and writes such a value as a
+# literal: intBitsToFloat(9) appears as 1.26116862e-44. ANGLE's lexer turns any
+# literal below FLT_MIN into 0.0 unless preserveDenorms is set, which its Metal
+# backend never sets; a loop whose exit value was such a literal (a parallax
+# shader's step counter) then restarted forever and the GPU watchdog killed the
+# session. In a GLSL ES 3.00+ shader each nonzero literal below FLT_MIN is
+# rewritten as intBitsToFloat(<its exact bits>), which compiles to a bit cast
+# and keeps the value. The first few rewrites are logged.
+python3 - "$K/runtime/gfx/kl_glfb.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: denormal literals kept (step 50)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static void klfb_ShaderSource(uint32_t shader, int32_t count,\n",
+        "// " + marker + "\n"
+        "#include <float.h>\n"
+        "static int mv_ident_char(char c) {\n"
+        "    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||\n"
+        "           c == '_' || c == '.';\n"
+        "}\n"
+        "static int mv_rewrite_denorms(char *buf, size_t cap, uint32_t shader) {\n"
+        "    const char *v = strstr(buf, \"#version \");\n"
+        "    if (!v || v[9] < '3' || v[9] > '9' || !strstr(v, \" es\")) return 0;   // ESSL 3.00+\n"
+        "    int n = 0;\n"
+        "    size_t len = strlen(buf);\n"
+        "    for (size_t i = 0; i < len; i++) {\n"
+        "        char c = buf[i];\n"
+        "        if (!((c >= '0' && c <= '9') || c == '.')) continue;\n"
+        "        if (i > 0 && mv_ident_char(buf[i - 1])) continue;   // inside a name or number\n"
+        "        size_t j = i, e = 0;\n"
+        "        while (j < len && ((buf[j] >= '0' && buf[j] <= '9') || buf[j] == '.')) j++;\n"
+        "        if (j < len && (buf[j] == 'e' || buf[j] == 'E')) {\n"
+        "            e = j++;\n"
+        "            if (j < len && (buf[j] == '-' || buf[j] == '+')) j++;\n"
+        "            while (j < len && buf[j] >= '0' && buf[j] <= '9') j++;\n"
+        "        }\n"
+        "        size_t end = j;\n"
+        "        if (end < len && (buf[end] == 'f' || buf[end] == 'F')) end++;\n"
+        "        if (!e || (end < len && mv_ident_char(buf[end]))) { i = j; continue; }\n"
+        "        char tok[64];\n"
+        "        if (j - i >= sizeof tok) { i = j; continue; }\n"
+        "        memcpy(tok, buf + i, j - i); tok[j - i] = 0;\n"
+        "        float f = strtof(tok, NULL);\n"
+        "        if (f == 0.0f || fabsf(f) >= FLT_MIN) { i = j; continue; }\n"
+        "        // A leading minus that is a sign (not subtraction) goes into the bits.\n"
+        "        size_t from = i;\n"
+        "        if (i > 0 && buf[i - 1] == '-') {\n"
+        "            size_t k = i - 1;\n"
+        "            while (k > 0 && (buf[k - 1] == ' ' || buf[k - 1] == '\\t')) k--;\n"
+        "            char pc = k > 0 ? buf[k - 1] : '(';\n"
+        "            if (strchr(\"=(,+-*/?:<>!&|[{\", pc)) { from = i - 1; f = -f; }\n"
+        "        }\n"
+        "        union { float f; int32_t i; } u = { .f = f };\n"
+        "        char rep[48];\n"
+        "        int rl = snprintf(rep, sizeof rep, \"intBitsToFloat(%d)\", u.i);\n"
+        "        size_t old = end - from;\n"
+        "        if (len + (size_t)rl - old + 1 > cap) break;\n"
+        "        memmove(buf + from + rl, buf + end, len - end + 1);\n"
+        "        memcpy(buf + from, rep, (size_t)rl);\n"
+        "        len = len + (size_t)rl - old;\n"
+        "        i = from + (size_t)rl - 1;\n"
+        "        n++;\n"
+        "    }\n"
+        "    if (n) {\n"
+        "        static unsigned said;\n"
+        "        if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 6)\n"
+        "            fprintf(stderr, \"  [glfb] shader %u: %d denormal literal(s) kept as bit casts\\n\", shader, n);\n"
+        "    }\n"
+        "    return n;\n"
+        "}\n"
+        "static void klfb_ShaderSource(uint32_t shader, int32_t count,\n")
+    s = sub(s, "            char *rewritten = klfb_rewrite_glsl(buf, cap, shader);\n",
+               "            char *rewritten = klfb_rewrite_glsl(buf, cap, shader);\n"
+               "            int mv_dn = mv_rewrite_denorms(buf, cap, shader);   // metavision (step 50)\n")
+    s = sub(s, "            if (rewritten || dbg_modified) {\n",
+               "            if (rewritten || dbg_modified || mv_dn) {\n")
+    open(p, "w").write(s)
+print("overlay: denormal float literals kept as bit casts in GLSL ES 3.00+ shaders")
+PYEOF
