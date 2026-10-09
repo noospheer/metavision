@@ -112,9 +112,10 @@ OVRPlugin call in order — the step where a title stops is the last one.
   Next: a run with `KL_GLFB_ERRSCAN=0x506 KL_TRACE_FBO=1` names the call.
 - **Video into a texture.** Unity's VideoPlayer renders through a
   `SurfaceTexture`, which Klepton does not have (a flat video app waits
-  forever: `AndroidVideoMedia surface creation stalled`), and MediaCodec in
-  byte-buffer mode (no surface) returns no output. Both are media work in
-  Klepton's `kl_mediandk.c`.
+  forever: `AndroidVideoMedia surface creation stalled`), MediaCodec in
+  byte-buffer mode (no surface) returns no output, and the AVPro video plugin
+  cannot create its player. All are media work in Klepton's `kl_mediandk.c`
+  and its Java media classes.
 - **Hand tracking in OpenXR titles.** metavision's hands reach titles through
   OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
 - **Memory growth on the Vulkan path** in at least one title (killed within
