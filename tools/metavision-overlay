@@ -1312,3 +1312,25 @@ patch(N, old, old +
       "metavision: built-in mic")
 print("overlay: microphone for titles that ask (one built-in input device)")
 PYEOF
+
+# 23 — ovrp_GetDisplayAdapterId2: no adapter (NULL) rather than a pointer to the
+# GPU's LUID. Unity's XR pre-init takes the Oculus plugin's answer as the
+# adapter id and, for Vulkan, compares it with the VkPhysicalDevice handles it
+# enumerated; a LUID buffer's address matches none, the picker returns NULL and
+# Unity 2022.3's Vulkan detection says "unsupported" — a Vulkan-only title then
+# falls back to GLES2 with no shaders for it. NULL means "no preference": the
+# one GPU is picked by type.
+python3 - "$K/runtime/xr/kl_ovrp.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "metavision: no adapter preference" not in s:
+    old = "    if (out) *out = id;\n    return OVRP_SUCCESS;\n}\n\nstatic uint64_t klovrp_Initialize5(void)"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: GetDisplayAdapterId2")
+    s = s.replace(old,
+        "    if (out) *out = NULL;   // metavision: no adapter preference (see overlay step 23)\n"
+        "    return OVRP_SUCCESS;\n}\n\nstatic uint64_t klovrp_Initialize5(void)", 1)
+    open(p, "w").write(s)
+    print("overlay: ovrp_GetDisplayAdapterId2 answers no adapter preference")
+PYEOF
