@@ -138,7 +138,11 @@ def cmd_run(a):
                "SIMCTL_CHILD_MV_AUTOSTART": t,
                "SIMCTL_CHILD_MV_INPUT_MODE": "auto",
                "SIMCTL_CHILD_MV_AUTOPLAY": "1",
-               "SIMCTL_CHILD_MV_AUTOPLAY_CYCLE": "20"}
+               "SIMCTL_CHILD_MV_AUTOPLAY_CYCLE": "20",
+               # The simulator's Metal stand-in aborts when MoltenVK writes
+               # descriptors through an argument encoder (MTLSimArgumentEncoder,
+               # over XPC); plain binding works there. Real Metal is unaffected.
+               "SIMCTL_CHILD_MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS": "0"}
         for kv in a.env or []:
             k, v = kv.split("=", 1)
             env["SIMCTL_CHILD_" + k] = v
