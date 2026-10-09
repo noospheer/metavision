@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # metavision-guest-bundle — pack what a CI build needs of the guests, encrypted.
 #
-# The macOS runner never sees an APK. It needs, per target, only the guest's
+# The build runner never sees an APK (the simulator pass gets its data from
+# tools/metavision-sim-data instead). It needs, per target, only the guest's
 # arm64 libraries (klepton-ld translates them there, mkguest.sh wraps them as
 # frameworks), its decoded AndroidManifest.xml (permissions, package), plus the
 # generated target table. Assets, OBBs and decoded

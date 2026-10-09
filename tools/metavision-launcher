@@ -94,11 +94,13 @@ print(f"  removed the flat embed of {len(refs)} framework(s)")
 # 2 — one copy phase per title, into Frameworks/<target>/
 buildfiles, filerefs, phases, phase_ids, group_children = [], [], [], [], []
 for t in targets:
-    # The plain device-slice .framework folders mkguest.sh leaves in build/guest/,
-    # not the .xcframeworks: Xcode unpacks every xcframework into one shared
-    # products directory, where two titles' libunity collide ("Unexpected
-    # duplicate tasks") even though they are copied to different folders.
-    src = os.path.join("build", "guest", t, "xros")
+    # The plain .framework folders mkguest.sh leaves in build/guest/, not the
+    # .xcframeworks: Xcode unpacks every xcframework into one shared products
+    # directory, where two titles' libunity collide ("Unexpected duplicate
+    # tasks") even though they are copied to different folders. The device
+    # slice, or the simulator's with XROS_PLATFORMS=xrsim (tools/metavision-sim).
+    slice_ = "xrsimulator" if os.environ.get("XROS_PLATFORMS", "").split() == ["xrsim"] else "xros"
+    src = os.path.join("build", "guest", t, slice_)
     fws = sorted(f for f in os.listdir(os.path.join(here, src)) if f.endswith(".framework"))
     files = []
     for fw in fws:

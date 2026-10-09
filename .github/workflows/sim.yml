@@ -1,0 +1,151 @@
+name: sim
+
+# The unattended test pass in the visionOS Simulator: the metavision launcher
+# built for the simulator, each title of a data set booted with auto-play, and
+# a verdict per title from metavision-triage — no headset involved.
+#
+# Inputs name only a data SET (tools/metavision-sim-data packs one and attaches
+# it, encrypted, to the private guests release), so no title name shows in this
+# public run's details; the step that unpacks it masks every name in the logs.
+# The results — logs, screenshots, verdicts — are uploaded encrypted with
+# MV_GUEST_KEY: fetch them with tools/metavision-sim-results.
+#
+# What it cannot test: memory limits, GPU speed, the real eye/hand/mic hardware.
+#
+# Secrets: MV_GUESTS_REPO  MV_GUESTS_TOKEN  MV_GUEST_KEY
+
+on:
+  workflow_dispatch:
+    inputs:
+      set:
+        description: "data set name (tools/metavision-sim-data SET ...)"
+        required: true
+        default: "smoke"
+      seconds:
+        description: "seconds per title"
+        required: true
+        default: "95"
+
+jobs:
+  sim:
+    runs-on: macos-26
+    timeout-minutes: 360
+    env:
+      K: vendor/klepton
+      XROS_PLATFORMS: xrsim
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/iOS* \
+                      /Users/runner/Library/Android /usr/local/share/dotnet || true
+          df -h /
+
+      - name: ANGLE cache (restore)
+        id: angle
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            vendor/klepton/vendor/out/xros
+            vendor/klepton/vendor/out/xrsim
+          key: angle-${{ hashFiles('vendor/klepton/angle-patches/**') }}-${{ hashFiles('vendor/klepton/Makefile') }}
+
+      - name: Build ANGLE (only if the titles workflow has not cached it)
+        if: steps.angle.outputs.cache-hit != 'true'
+        run: |
+          (cd "$K" && make angle-fetch)
+          (cd "$K/vendor/depot_tools" && ./ensure_bootstrap)
+          (cd "$K" && make angle-xros angle-xrsim)
+
+      - name: Fetch and decrypt guest bundle and data set
+        env:
+          GH_TOKEN: ${{ secrets.MV_GUESTS_TOKEN }}
+          REPO: ${{ secrets.MV_GUESTS_REPO }}
+          KEY: ${{ secrets.MV_GUEST_KEY }}
+          SET: ${{ github.event.inputs.set }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/simdata
+          gh release download guests --repo "$REPO" --pattern 'guest-bundle.tar.gz.enc' --output /tmp/guests.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "pass:$KEY" -in /tmp/guests.enc | tar -xz -C build
+          mv build/guests/klepton-targets.py build/klepton-targets.py
+          rm /tmp/guests.enc
+          python3 - <<'PY'
+          import json, os, re
+          rows = json.load(open("build/guests/targets.json"))
+          names = set()
+          for slug, t in rows.items():
+              names |= {slug, t.get("display") or "", t.get("product") or "", t.get("tree") or "", t.get("apk") or ""}
+              if len(slug) > 7:
+                  names.add(slug[3:])
+              m = os.path.join("build/guests", t.get("tree", slug), "AndroidManifest.xml")
+              if os.path.isfile(m):
+                  p = re.search(r'package="([^"]+)"', open(m, errors="replace").read())
+                  if p:
+                      names.add(p.group(1))
+          for n in sorted(n for n in names if len(n) >= 4):
+              print(f"::add-mask::{n}")
+          PY
+          mkdir -p /tmp/set
+          gh release download guests --repo "$REPO" --pattern "sim-$SET.tar.enc.part*" --dir /tmp/set
+          cat /tmp/set/sim-$SET.tar.enc.part* | openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "pass:$KEY" |
+            tar -x -C build/simdata
+          rm -rf /tmp/set
+          echo "set: $(wc -l < build/simdata/.sim-targets | tr -d ' ') title(s)"
+
+      - name: Python tools for the overlay
+        run: python3 -m venv /tmp/mvpy && /tmp/mvpy/bin/pip install -q capstone pyelftools
+
+      - name: Overlay metavision onto Klepton
+        env:
+          MV_LAUNCHER: "1"
+          MV_PYTHON: /tmp/mvpy/bin/python
+        run: tools/metavision-overlay
+
+      - name: Runtime and translator (simulator slice)
+        run: |
+          (cd "$K" && make mvk)
+          (cd "$K" && make build/klepton-ld)
+          (cd "$K" && make xros)
+
+      - name: Boot a visionOS simulator
+        run: tools/metavision-sim boot
+
+      - name: Build the launcher for the simulator
+        run: |
+          set -euo pipefail
+          tools/metavision-launcher $(cat build/simdata/.sim-targets)
+          UDID=$(python3 -c "import json;print(json.load(open('build/sim.json'))['udid'])")
+          cd "$K/visionos"
+          xcodebuild -project metavision.xcodeproj -scheme metavision -configuration Debug \
+            -destination "platform=visionOS Simulator,id=$UDID" -derivedDataPath build/dd-sim \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | grep -E 'error:|warning: .*metavision|\*\* BUILD' || true
+          test -f build/dd-sim/Build/Products/Debug-xrsimulator/metavision.app/Info.plist
+
+      - name: Install and stage
+        run: |
+          tools/metavision-sim install "$K/visionos/build/dd-sim/Build/Products/Debug-xrsimulator/metavision.app"
+          tools/metavision-sim stage build/simdata
+
+      - name: Test pass
+        run: tools/metavision-sim run --seconds "${{ github.event.inputs.seconds }}" --out build/simtest/run
+
+      - name: Encrypt results
+        if: always()
+        env:
+          KEY: ${{ secrets.MV_GUEST_KEY }}
+        run: |
+          mkdir -p out
+          [ -d build/simtest/run ] || exit 0
+          tar -cz -C build/simtest run |
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass "pass:$KEY" -out out/simtest.tar.gz.enc
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: simtest-encrypted
+          path: out/simtest.tar.gz.enc
+          retention-days: 14

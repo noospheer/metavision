@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""metavision-sim-data — pack titles' data for the simulator test pass, encrypted.
+
+The headset gets each title's APK, assets and OBBs at install time
+(metavision-device stage). The simulator pass (tools/metavision-sim, the `sim`
+workflow) runs on a GitHub macOS runner, so the same data goes there instead,
+as a "set": one archive laid out exactly as the launcher's Documents folder,
+AES-256 encrypted with the guest-bundle passphrase and attached to the private
+guests release in parts under 2 GB. The run's inputs name only the set, so no
+title name appears in the public repository's run details.
+
+    tools/metavision-sim-data SET TARGET...     (mv_ names; 'all' = every target)
+    tools/metavision-sim-data SET --upload TARGET...
+
+    --repo OWNER/NAME   the private repo holding the `guests` release
+                        (default: $MV_GUESTS_REPO)
+    --no-obb            leave OBB expansion files out (the archive stays small;
+                        titles that need them stop at their loading screen)
+
+The archive carries .sim-targets (the titles, one per line) at its root.
+"""
+import argparse, json, os, re, subprocess, sys, tarfile, tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+G = ROOT / "build" / "guests"
+PART = 1900 * 1024 * 1024
+
+
+def title_icon(tree):
+    m = re.search(r'<application[^>]*android:icon="@(\w+)/([\w.]+)"',
+                  (tree / "AndroidManifest.xml").read_text(errors="replace"))
+    if not m:
+        return None
+    kind, name = m.groups()
+    pngs = [p for d in (tree / "res").glob(f"{kind}*") for p in [d / f"{name}.png"] if p.exists()]
+    return max(pngs, key=lambda p: p.stat().st_size) if pngs else None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("set", help="set name: letters, digits, dashes")
+    ap.add_argument("targets", nargs="+")
+    ap.add_argument("--upload", action="store_true")
+    ap.add_argument("--repo", default=os.environ.get("MV_GUESTS_REPO"))
+    ap.add_argument("--no-obb", action="store_true")
+    a = ap.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9-]+", a.set):
+        sys.exit("set name: letters, digits and dashes only")
+    rows = json.loads((G / "targets.json").read_text())
+    names = list(rows) if a.targets == ["all"] else a.targets
+    for n in names:
+        if n not in rows:
+            sys.exit(f"unknown target {n}")
+    key = os.environ.get("MV_GUEST_KEY") or (ROOT / "build" / "guest-bundle.key").read_text().strip()
+
+    out = ROOT / "build" / "sim-data"
+    out.mkdir(parents=True, exist_ok=True)
+    for old in out.glob(f"sim-{a.set}.tar.enc*"):
+        old.unlink()
+    enc = out / f"sim-{a.set}.tar.enc"
+    total = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        lst = Path(tmp) / ".sim-targets"
+        lst.write_text("\n".join(names) + "\n")
+        ssl = subprocess.Popen(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-salt",
+                                "-pass", "env:MVK", "-out", str(enc)],
+                               stdin=subprocess.PIPE, env={**os.environ, "MVK": key})
+        with tarfile.open(fileobj=ssl.stdin, mode="w|") as tar:
+            tar.add(lst, ".sim-targets")
+            for n in names:
+                t = rows[n]
+                tree, apk = G / t["tree"], G / t["apk"]
+                if not apk.exists():
+                    sys.exit(f"{n} is not staged: tools/metavision-targets stage")
+                tar.add(apk, t["apk"]); total += apk.stat().st_size
+                for f in ("apktool.yml", "AndroidManifest.xml"):
+                    if (tree / f).exists():
+                        tar.add(tree / f, f"{t['tree']}/{f}")
+                icon = title_icon(tree)
+                if icon:
+                    tar.add(icon, f"{t['tree']}/icon.png")
+                if (tree / "assets").is_dir():
+                    tar.add(tree / "assets", f"{t['tree']}/assets")
+                    total += sum(f.stat().st_size for f in (tree / "assets").rglob("*") if f.is_file())
+                pkg = re.search(r'package="([^"]+)"', (tree / "AndroidManifest.xml").read_text(errors="replace")).group(1)
+                obb = ROOT / "pull" / pkg / "obb"
+                if obb.is_dir() and not a.no_obb:
+                    for f in sorted(obb.iterdir()):
+                        tar.add(f, f"{t['tree']}/android-files/{t['obb']}/{f.name}")
+                        total += f.stat().st_size
+                print(f"  {n}", flush=True)
+        ssl.stdin.close()
+        if ssl.wait():
+            sys.exit("openssl failed")
+    # Parts under GitHub's 2 GB release-asset limit.
+    parts = []
+    with open(enc, "rb") as f:
+        i = 0
+        while chunk := f.read(PART):
+            p = out / f"sim-{a.set}.tar.enc.part{i:02d}"
+            p.write_bytes(chunk); parts.append(p); i += 1
+    enc.unlink()
+    print(f"set {a.set}: {len(names)} title(s), {total / 1e9:.2f} GB of data, {len(parts)} part(s) in {out}")
+    if a.upload:
+        if not a.repo:
+            sys.exit("--upload needs --repo or $MV_GUESTS_REPO")
+        subprocess.run(["gh", "release", "upload", "guests", "--repo", a.repo, "--clobber",
+                        *map(str, parts)], check=True)
+        print(f"uploaded to the guests release of the private repo")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""metavision-sim — the unattended test pass in the visionOS Simulator (macOS).
+
+The same pass as `metavision-device test` — each title booted with auto-play
+cycling hands, hands-free and auto, logs and screenshots pulled, a verdict from
+metavision-triage — with no headset to wear and nothing to fall asleep. Runs on
+a GitHub macOS runner (the `sim` workflow) or any Mac with Xcode.
+
+    tools/metavision-sim boot                    create + boot an Apple Vision Pro simulator
+    tools/metavision-sim install APP             install the built .app
+    tools/metavision-sim stage DATA              unpack a data set (metavision-sim-data) into the app
+    tools/metavision-sim run [--seconds N] [--out DIR] [TARGET...]
+                                                 run each title (default: the staged set)
+
+What the simulator cannot tell you: memory limits and jetsam, GPU speed, and
+the real eye, hand and microphone hardware. Those stay with the headset.
+"""
+import argparse, json, os, plistlib, shutil, subprocess, sys, time
+from pathlib import Path
+import importlib.machinery, importlib.util
+
+ROOT = Path(__file__).resolve().parent.parent
+STATE = ROOT / "build" / "sim.json"
+
+
+def sh(*cmd, check=True, capture=True, env=None):
+    r = subprocess.run(cmd, check=False, text=True, env=env,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.STDOUT if capture else None)
+    if check and r.returncode:
+        sys.exit(f"{' '.join(cmd[:4])}...: exit {r.returncode}\n{(r.stdout or '')[-2000:]}")
+    return r.stdout or ""
+
+
+def state():
+    return json.loads(STATE.read_text()) if STATE.exists() else {}
+
+
+def save(s):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(s, indent=1))
+
+
+def triage():
+    l = importlib.machinery.SourceFileLoader("mvtriage", str(ROOT / "tools" / "metavision-triage"))
+    spec = importlib.util.spec_from_loader("mvtriage", l)
+    m = importlib.util.module_from_spec(spec)
+    l.exec_module(m)
+    return m
+
+
+def cmd_boot(a):
+    rts = json.loads(sh("xcrun", "simctl", "list", "runtimes", "-j"))["runtimes"]
+    vis = [r for r in rts if r.get("platform") == "visionOS" and r.get("isAvailable")]
+    if not vis:
+        print("no visionOS simulator runtime: downloading it (several GB)", flush=True)
+        sh("xcodebuild", "-downloadPlatform", "visionOS", capture=False)
+        rts = json.loads(sh("xcrun", "simctl", "list", "runtimes", "-j"))["runtimes"]
+        vis = [r for r in rts if r.get("platform") == "visionOS" and r.get("isAvailable")]
+    if not vis:
+        sys.exit("still no visionOS runtime")
+    rt = sorted(vis, key=lambda r: r["version"])[-1]
+    types = [t for t in rt.get("supportedDeviceTypes", []) if "Vision" in t.get("name", "")]
+    if not types:
+        sys.exit(f"runtime {rt['name']} lists no Vision device type")
+    udid = sh("xcrun", "simctl", "create", "metavision", types[0]["identifier"], rt["identifier"]).strip()
+    sh("xcrun", "simctl", "boot", udid)
+    sh("xcrun", "simctl", "bootstatus", udid, "-b", capture=False)
+    s = state(); s["udid"] = udid; save(s)
+    print(f"booted {types[0]['name']} on {rt['name']}: {udid}")
+
+
+def udid():
+    u = state().get("udid")
+    if not u:
+        sys.exit("no simulator: tools/metavision-sim boot")
+    return u
+
+
+def cmd_install(a):
+    app = Path(a.app)
+    bundle = plistlib.loads((app / "Info.plist").read_bytes())["CFBundleIdentifier"]
+    sh("xcrun", "simctl", "install", udid(), str(app))
+    s = state(); s["bundle"] = bundle; save(s)
+    print(f"installed {bundle}")
+
+
+def container():
+    s = state()
+    return Path(sh("xcrun", "simctl", "get_app_container", udid(), s["bundle"], "data").strip())
+
+
+def cmd_stage(a):
+    docs = container() / "Documents"
+    docs.mkdir(parents=True, exist_ok=True)
+    src = Path(a.data)
+    for p in src.iterdir():
+        dst = docs / p.name
+        if dst.exists():
+            shutil.rmtree(dst) if dst.is_dir() else dst.unlink()
+        shutil.move(str(p), str(dst))
+    names = (docs / ".sim-targets").read_text().split()
+    s = state(); s["targets"] = names; save(s)
+    print(f"staged {len(names)} title(s)")
+
+
+def running(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def cmd_run(a):
+    tri = triage()
+    s = state()
+    names = a.targets or s.get("targets") or sys.exit("nothing staged")
+    out = Path(a.out or ROOT / "build" / "simtest" / time.strftime("%Y%m%d-%H%M%S"))
+    out.mkdir(parents=True, exist_ok=True)
+    docs = container() / "Documents"
+    reports = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+    results = {"seconds": a.seconds, "items": {}}
+    print(f"{out}: {len(names)} title(s), {a.seconds} s each", flush=True)
+    for i, t in enumerate(names, 1):
+        for f in ("klepton-boot.log", "klepton-crash.log", "shots"):
+            p = docs / f
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+            elif p.exists():
+                p.unlink()
+        before = set(reports.glob("*")) if reports.is_dir() else set()
+        env = {**os.environ,
+               "SIMCTL_CHILD_KL_AUTOBOOT": "1",
+               "SIMCTL_CHILD_MV_AUTOSTART": t,
+               "SIMCTL_CHILD_MV_INPUT_MODE": "auto",
+               "SIMCTL_CHILD_MV_AUTOPLAY": "1",
+               "SIMCTL_CHILD_MV_AUTOPLAY_CYCLE": "20"}
+        for kv in a.env or []:
+            k, v = kv.split("=", 1)
+            env["SIMCTL_CHILD_" + k] = v
+        line = sh("xcrun", "simctl", "launch", "--terminate-running-process", udid(), s["bundle"], env=env)
+        try:
+            pid = int(line.strip().split(":")[-1])
+        except ValueError:
+            pid = -1
+        print(f"[{i}/{len(names)}] {t}: pid {pid}", end="", flush=True)
+        t0, exited = time.time(), None
+        while time.time() - t0 < a.seconds:
+            time.sleep(5)
+            if pid > 0 and not running(pid):
+                exited = round(time.time() - t0)
+                break
+        sh("xcrun", "simctl", "terminate", udid(), s["bundle"], check=False)
+        time.sleep(3)
+        d = out / t / "cycle"
+        d.mkdir(parents=True, exist_ok=True)
+        for f in ("klepton-boot.log", "klepton-crash.log"):
+            if (docs / f).exists():
+                shutil.copy(docs / f, d / f)
+        if (docs / "shots").is_dir():
+            for p in sorted((docs / "shots").glob("*.png")):
+                shutil.copy(p, d / p.name)
+        if reports.is_dir():
+            for p in set(reports.glob("*")) - before:
+                if p.suffix == ".ips" and any(k in p.name.lower() for k in ("metavision", "klepton")):
+                    shutil.copy(p, d / p.name)
+        v = tri.verdict(d, exited=exited)
+        results["items"][f"{t}@cycle"] = {"verdict": v["verdict"], "summary": v["summary"], "exited_after": exited}
+        (out / "state.json").write_text(json.dumps(results, indent=1))
+        print(f"  -> {v['verdict'].upper()}: {v['summary']}", flush=True)
+    counts = {}
+    for r in results["items"].values():
+        counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1
+    print("summary: " + ", ".join(f"{k} {n}" for k, n in sorted(counts.items())))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("boot").set_defaults(fn=cmd_boot)
+    p = sub.add_parser("install"); p.add_argument("app"); p.set_defaults(fn=cmd_install)
+    p = sub.add_parser("stage"); p.add_argument("data"); p.set_defaults(fn=cmd_stage)
+    p = sub.add_parser("run")
+    p.add_argument("targets", nargs="*")
+    p.add_argument("--seconds", type=int, default=95)
+    p.add_argument("--out")
+    p.add_argument("--env", action="append", metavar="KEY=VALUE")
+    p.set_defaults(fn=cmd_run)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

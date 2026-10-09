@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# metavision-sim-results — fetch a `sim` workflow run's results and decrypt them.
+#
+#   tools/metavision-sim-results [RUN_ID]     (default: the latest sim run)
+#
+# Lands in build/simtest/<run id>/ in the layout `metavision-device test` uses
+# (<title>/cycle/klepton-boot.log, shot_NN.png, state.json), so
+# tools/metavision-triage reads it as it reads a headset pass.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+RUN=${1:-$(gh run list --workflow sim.yml --limit 1 --json databaseId -q '.[0].databaseId')}
+KEY=${MV_GUEST_KEY:-$(cat "$ROOT/build/guest-bundle.key")}
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+gh run download "$RUN" --name simtest-encrypted --dir "$TMP"
+OUT="$ROOT/build/simtest/$RUN"
+mkdir -p "$OUT"
+openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "pass:$KEY" -in "$TMP/simtest.tar.gz.enc" |
+    tar -xz -C "$OUT" --strip-components=1
+echo "$OUT"
+python3 "$ROOT/tools/metavision-triage" "$OUT" 2>/dev/null | tail -60 || true

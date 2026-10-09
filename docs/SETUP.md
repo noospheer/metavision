@@ -318,6 +318,25 @@ or `--modes hands`.
 
 When a title will not start, see [COMPATIBILITY.md](COMPATIBILITY.md).
 
+### Test pass in the simulator (no headset)
+
+The same pass runs unattended in the visionOS Simulator on a GitHub macOS
+runner — no headset to wear, nothing to fall asleep. Pack the titles' data
+into an encrypted set in the private guests release, then run the `sim`
+workflow on it:
+
+```bash
+tools/metavision-sim-data <set> mv_<title> ... --upload --repo <you>/<private-repo>
+gh workflow run sim -f set=<set>          # -f seconds=95 per title
+tools/metavision-sim-results              # latest run -> build/simtest/<run>/, triaged
+```
+
+The run's inputs name only the set, and its logs mask every title name; the
+results (logs, screenshots, verdicts) come back encrypted with the guest key.
+`--no-obb` keeps a set small by leaving expansion files out. The simulator
+cannot show memory limits, GPU speed or the real eye, hand and microphone
+hardware — the headset pass stays the last word on those.
+
 ### One app for every title: the metavision launcher
 
 ```bash
