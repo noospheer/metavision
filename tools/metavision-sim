@@ -51,14 +51,17 @@ def triage():
 
 def cmd_boot(a):
     rts = json.loads(sh("xcrun", "simctl", "list", "runtimes", "-j"))["runtimes"]
-    vis = [r for r in rts if r.get("platform") == "visionOS" and r.get("isAvailable")]
+    def is_vis(r):   # simctl calls the platform "xrOS" in some Xcodes, "visionOS" in others
+        return r.get("isAvailable") and (r.get("platform") in ("visionOS", "xrOS")
+                                         or "xrOS" in r.get("identifier", "") or "visionOS" in r.get("name", ""))
+    vis = [r for r in rts if is_vis(r)]
     if not vis:
         print("no visionOS simulator runtime: downloading it (several GB)", flush=True)
         sh("xcodebuild", "-downloadPlatform", "visionOS", capture=False)
         rts = json.loads(sh("xcrun", "simctl", "list", "runtimes", "-j"))["runtimes"]
-        vis = [r for r in rts if r.get("platform") == "visionOS" and r.get("isAvailable")]
+        vis = [r for r in rts if is_vis(r)]
     if not vis:
-        sys.exit("still no visionOS runtime")
+        sys.exit("still no visionOS runtime: " + ", ".join(f"{r.get('name')} [{r.get('platform')}]" for r in rts))
     rt = sorted(vis, key=lambda r: r["version"])[-1]
     types = [t for t in rt.get("supportedDeviceTypes", []) if "Vision" in t.get("name", "")]
     if not types:
