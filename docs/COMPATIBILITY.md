@@ -124,9 +124,15 @@ OVRPlugin call in order — the step where a title stops is the last one.
   and its Java media classes.
 - **Hand tracking in OpenXR titles.** metavision's hands reach titles through
   OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
-- **Memory growth on the Vulkan path** in at least one title (killed within
-  seconds; `test` now keeps the jetsam report and triage names it).
-- **Unreal titles** (3 in the archive) are untested past build.
+- **An OpenXR title exits on its own about 5 s in**, after its first frames,
+  with no crash report. Not memory: the memory answers are right since step 27
+  and no jetsam report is written. Under investigation.
+- **MoltenVK faults on the first frame** in titles that replay a secondary
+  command buffer beginning a render pass. Step 24's first option did not stop
+  it; graphics jobs are now forced off as well — awaiting a test pass.
+- **Unreal titles** run with a picture since steps 21 and 26 (compute stand-in,
+  DoubleWide eye layers). Their eye layer is large (about 9700x3900, three
+  stages) because the engine sizes it itself; it is not capped.
 - **Dwell Control inside an immersive title** is untested (see ACCESSIBILITY.md).
 - Titles whose code is 32-bit only, Flutter, Quill's own engine or Unreal 5 are
   not generated (8 of 54 in the archive).

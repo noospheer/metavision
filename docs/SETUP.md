@@ -285,8 +285,9 @@ After each run the title's boot log, the runtime's crash log and any system
 crash report (`.ips`) are pulled to `build/test/<run>/<title>/<mode>/` and
 judged by `tools/metavision-triage`: **pass**, **errors** (exceptions,
 shader/compute failures, a library that would not load), **black** (never
-drew), **stopped** (an unimplemented entry point) or **crashed** (a fault, a
-crash report, or an exit on its own). Progress is saved after every run: a
+drew), **stopped** (an unimplemented entry point), **asleep** (sent to the
+background mid-run — the headset taken off; re-run, not counted) or
+**crashed** (a fault, a crash report, or an exit on its own). Progress is saved after every run: a
 dropped connection reconnects and carries on, running `test` again resumes an
 unfinished pass, and `test --failed` re-runs only what did not pass last time.
 The fix loop is: `test` → `metavision-triage` → fix → rebuild and install →
@@ -294,8 +295,10 @@ The fix loop is: `test` → `metavision-triage` → fix → rebuild and install 
 
 The headset must be **worn** throughout: visionOS stops drawing apps nobody
 is looking through, and since visionOS 2 covering its inner sensor only delays
-sleep. Whoever wears it should not watch: the scripted head motion swings the
-picture against their real head. When two titles in a row come back without a picture after one that
+sleep. A hidden pass (the default) shows the wearer nothing but the room, so
+the headset can be used for other things; with `--visible`, whoever wears it
+should not watch: the scripted head motion swings the picture against their
+real head. When two titles in a row come back without a picture after one that
 drew, the pass takes the headset to be asleep: it puts those runs back in the
 queue, pauses, and re-launches the last title that drew every 30 s until it
 draws again — put the headset on (or wake it) and the pass carries on. Each
