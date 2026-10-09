@@ -1580,3 +1580,64 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: /proc/<pid> resolves to /proc/self; oom_score present")
 PYEOF
+
+# 29 — Android 11+ window metrics, and an empty MIDI device list. With the
+# platform reported as 12L (step 15), Unity sizes its view from
+# WindowManager.getMaximumWindowMetrics().getBounds() — unanswered, it read null.
+# The bounds are the display Klepton reports (KLJ_DISPLAY_W x H). MidiManager.getDevices
+# was polled every frame (tens of thousands of unanswered calls a run, each one
+# logged); it now returns an empty array, which is a device with no MIDI attached.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/jni/kl_jni_android.c"
+s = open(p).read()
+marker = "metavision: window metrics"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "// ---- com.vrchat.android.plugin.Info ----\n",
+        "// metavision: window metrics (step 29) — one WindowMetrics, one Rect: the display.\n"
+        "static void *g_mv_bounds;\n"
+        "static klj_val mv_wm_metrics(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n;\n"
+        "    static void *wm;\n"
+        "    return klj_singleton(\"android/view/WindowMetrics\", &wm);\n"
+        "}\n"
+        "static klj_val mv_wm_bounds(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n;\n"
+        "    int fresh = g_mv_bounds == NULL;\n"
+        "    klj_val r = klj_singleton(\"android/graphics/Rect\", &g_mv_bounds);\n"
+        "    if (fresh) {\n"
+        "        void *cls = klj_class_object(\"android/graphics/Rect\");\n"
+        "        klj_field_store(r.l, klj_want(cls, \"left\", \"I\", 'f'), (klj_val){.j = 0});\n"
+        "        klj_field_store(r.l, klj_want(cls, \"top\", \"I\", 'f'), (klj_val){.j = 0});\n"
+        "        klj_field_store(r.l, klj_want(cls, \"right\", \"I\", 'f'), (klj_val){.j = KLJ_DISPLAY_W});\n"
+        "        klj_field_store(r.l, klj_want(cls, \"bottom\", \"I\", 'f'), (klj_val){.j = KLJ_DISPLAY_H});\n"
+        "        KLJ_LOG(\"WindowMetrics.getBounds() -> 0,0 %dx%d\", KLJ_DISPLAY_W, KLJ_DISPLAY_H);\n"
+        "    }\n"
+        "    return r;\n"
+        "}\n"
+        "static klj_val mv_rect_w(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)a; (void)n; return (klj_val){.j = s && s == g_mv_bounds ? KLJ_DISPLAY_W : 0};\n"
+        "}\n"
+        "static klj_val mv_rect_h(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)a; (void)n; return (klj_val){.j = s && s == g_mv_bounds ? KLJ_DISPLAY_H : 0};\n"
+        "}\n"
+        "static klj_val mv_midi_devices(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n;\n"
+        "    return (klj_val){.l = klj_new_array('L', \"android/media/midi/MidiDeviceInfo\", 0)};\n"
+        "}\n\n"
+        "// ---- com.vrchat.android.plugin.Info ----\n")
+    old = '    {"android/app/ActivityManager", "getMemoryInfo", "(Landroid/app/ActivityManager$MemoryInfo;)V", klj_ActivityManager_getMemoryInfo},\n'
+    s = sub(s, old, old +
+        '    {"android/view/WindowManager", "getMaximumWindowMetrics", "()Landroid/view/WindowMetrics;", mv_wm_metrics},   // metavision (step 29)\n'
+        '    {"android/view/WindowManager", "getCurrentWindowMetrics", "()Landroid/view/WindowMetrics;", mv_wm_metrics},\n'
+        '    {"android/view/WindowMetrics", "getBounds", "()Landroid/graphics/Rect;", mv_wm_bounds},\n'
+        '    {"android/graphics/Rect", "width", "()I", mv_rect_w},\n'
+        '    {"android/graphics/Rect", "height", "()I", mv_rect_h},\n'
+        '    {"android/media/midi/MidiManager", "getDevices", "()[Landroid/media/midi/MidiDeviceInfo;", mv_midi_devices},\n')
+    open(p, "w").write(s)
+print("overlay: window metrics (display bounds); empty MIDI device list")
+PYEOF
