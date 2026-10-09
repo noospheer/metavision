@@ -2206,6 +2206,7 @@ PYEOF
 # target every frame; whether they are never destroyed or destroyed but still
 # backed is the question. Every large attachment image (1024x1024 or more) is
 # tracked from create to destroy, and the live count is logged as it grows.
+# The first eight large depth targets also log the library that made them.
 python3 - "$K/runtime" <<'PYEOF'
 import sys
 p = f"{sys.argv[1]}/gfx/kl_vulkan.c"
@@ -2218,10 +2219,11 @@ def sub(s, old, new):
 if marker not in s:
     s = sub(s, "static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,\n",
         "// metavision: large render-target census (step 39) — diagnostic.\n"
+        "const char *kl_addr_image(const void *addr, size_t *offset);   // kl_dl.c\n"
         "static pthread_mutex_t mv_rt_lock = PTHREAD_MUTEX_INITIALIZER;\n"
         "static VkImage mv_rt[1024];\n"
         "static unsigned mv_rt_live, mv_rt_made, mv_rt_gone, mv_rt_said;\n"
-        "static void mv_rt_add(VkImage img, const VkImageCreateInfo *ci) {\n"
+        "static void mv_rt_add(VkImage img, const VkImageCreateInfo *ci, const void *caller) {\n"
         "    if (!img || !ci || !(ci->usage & 0x30u)) return;   // colour or depth attachment\n"
         "    if ((uint64_t)ci->extent.width * ci->extent.height < 1024u * 1024u) return;\n"
         "    pthread_mutex_lock(&mv_rt_lock);\n"
@@ -2234,6 +2236,13 @@ if marker not in s:
         "                (int)ci->format, ci->arrayLayers, ci->usage);\n"
         "    }\n"
         "    pthread_mutex_unlock(&mv_rt_lock);\n"
+        "    static int mv_rt_who;   // who makes the large depth targets (the first eight)\n"
+        "    if (ci->format >= 124 && ci->format <= 130 && mv_rt_who < 8) {\n"
+        "        mv_rt_who++;\n"
+        "        size_t off = 0; const char *who = kl_addr_image(caller, &off);\n"
+        "        fprintf(stderr, \"  [vk-rt] depth %ux%u x%u made by %s+%#zx\\n\",\n"
+        "                ci->extent.width, ci->extent.height, ci->arrayLayers, who ? who : \"?\", off);\n"
+        "    }\n"
         "}\n"
         "static void mv_rt_del(VkImage img) {\n"
         "    if (!img) return;\n"
@@ -2244,7 +2253,7 @@ if marker not in s:
         "static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,\n")
     s = sub(s, "    if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);\n",
                "    if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);\n"
-               "    if (r == VK_SUCCESS && out) mv_rt_add(*out, ci);   // metavision (step 39)\n")
+               "    if (r == VK_SUCCESS && out) mv_rt_add(*out, ci, __builtin_return_address(0));   // metavision (step 39)\n")
     s = sub(s, "    klvk_img_reg_del(img);\n",
                "    klvk_img_reg_del(img);\n    mv_rt_del(img);   // metavision (step 39)\n")
     open(p, "w").write(s)
@@ -2411,4 +2420,133 @@ if marker not in s:
         '     klj_ActivityThread_getApplication},\n' + old)
     open(p, "w").write(s)
 print("overlay: ActivityThread.currentApplication answers the Application")
+PYEOF
+
+# 43 — secondary command buffers replayed outside a render pass. MoltenVK
+# (v1.4.2) replays a secondary's commands through the primary's encoder; a draw
+# there restarts the Metal render pass from the primary's current render pass,
+# and with none open (the primary never began one, or already ended it — invalid
+# Vulkan that a mobile driver tolerates) it dereferences a NULL subpass and the
+# process faults on the first frame. Begin/end of render passes and dynamic
+# rendering are now tracked per command buffer, and vkCmdExecuteCommands drops
+# secondaries recorded to continue a render pass when the primary has none
+# open: those draws are lost, the frame is not. Each such call is logged (the
+# first 24) with the render pass the secondary expected. KL_VK_SEC_GUARD=0 logs
+# without dropping.
+python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: secondary-outside-render-pass guard (step 43)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static void VKAPI_CALL klvk_CmdBeginRenderPass(VkCommandBuffer cb,\n",
+        "// metavision: secondary-outside-render-pass guard (step 43)\n"
+        "#define MV_CB_N 4096\n"
+        "static pthread_mutex_t mv_cb_lock = PTHREAD_MUTEX_INITIALIZER;\n"
+        "static struct { void *cb; uint8_t in_rp, cont; uint32_t flags; VkRenderPass rp; } mv_cb[MV_CB_N];\n"
+        "static int mv_cb_slot(void *cb, int add) {          // caller holds mv_cb_lock\n"
+        "    uint32_t h = (uint32_t)(((uintptr_t)cb >> 4) % MV_CB_N);\n"
+        "    for (int i = 0; i < MV_CB_N; i++) {\n"
+        "        int j = (int)((h + (uint32_t)i) % MV_CB_N);\n"
+        "        if (mv_cb[j].cb == cb) return j;\n"
+        "        if (!mv_cb[j].cb) { if (!add) return -1; mv_cb[j].cb = cb; return j; }\n"
+        "    }\n"
+        "    return -1;                                      // full: the guard goes inert\n"
+        "}\n"
+        "static void mv_cb_rp(void *cb, int in) {\n"
+        "    pthread_mutex_lock(&mv_cb_lock);\n"
+        "    int s = mv_cb_slot(cb, 1);\n"
+        "    if (s >= 0) mv_cb[s].in_rp = (uint8_t)in;\n"
+        "    pthread_mutex_unlock(&mv_cb_lock);\n"
+        "}\n"
+        "static void mv_cb_begin(void *cb, const VkCommandBufferBeginInfo *bi) {\n"
+        "    pthread_mutex_lock(&mv_cb_lock);\n"
+        "    int s = mv_cb_slot(cb, 1);\n"
+        "    if (s >= 0) {\n"
+        "        const VkCommandBufferInheritanceInfo *h = bi ? bi->pInheritanceInfo : NULL;\n"
+        "        mv_cb[s].in_rp = 0;\n"
+        "        mv_cb[s].flags = bi ? bi->flags : 0;\n"
+        "        mv_cb[s].rp = h ? h->renderPass : VK_NULL_HANDLE;\n"
+        "        mv_cb[s].cont = h && bi && (bi->flags & VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT);\n"
+        "    }\n"
+        "    pthread_mutex_unlock(&mv_cb_lock);\n"
+        "}\n"
+        "static void VKAPI_CALL mv_CmdEndRenderPass(VkCommandBuffer cb) {\n"
+        "    static PFN_vkCmdEndRenderPass r;\n"
+        "    if (!r) r = (PFN_vkCmdEndRenderPass)mvk_sym(\"vkCmdEndRenderPass\");\n"
+        "    mv_cb_rp(cb, 0);\n"
+        "    if (r) r(cb);\n"
+        "}\n"
+        "static void VKAPI_CALL mv_CmdEndRenderPass2(VkCommandBuffer cb, const VkSubpassEndInfo *e) {\n"
+        "    static PFN_vkCmdEndRenderPass2 r;\n"
+        "    if (!r) { r = (PFN_vkCmdEndRenderPass2)mvk_sym(\"vkCmdEndRenderPass2\");\n"
+        "        if (!r) r = (PFN_vkCmdEndRenderPass2)mvk_sym(\"vkCmdEndRenderPass2KHR\"); }\n"
+        "    mv_cb_rp(cb, 0);\n"
+        "    if (r) r(cb, e);\n"
+        "}\n"
+        "static void VKAPI_CALL mv_CmdEndRendering(VkCommandBuffer cb) {\n"
+        "    static PFN_vkCmdEndRendering r;\n"
+        "    if (!r) { r = (PFN_vkCmdEndRendering)mvk_sym(\"vkCmdEndRendering\");\n"
+        "        if (!r) r = (PFN_vkCmdEndRendering)mvk_sym(\"vkCmdEndRenderingKHR\"); }\n"
+        "    mv_cb_rp(cb, 0);\n"
+        "    if (r) r(cb);\n"
+        "}\n"
+        "static void VKAPI_CALL mv_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n,\n"
+        "                                             const VkCommandBuffer *p) {\n"
+        "    static PFN_vkCmdExecuteCommands real;\n"
+        "    static int guard = -1, said;\n"
+        "    if (!real) real = (PFN_vkCmdExecuteCommands)mvk_sym(\"vkCmdExecuteCommands\");\n"
+        "    if (guard < 0) guard = kl_env_on(\"KL_VK_SEC_GUARD\", 1);\n"
+        "    if (!real) return;\n"
+        "    if (n > 64 || !p) { real(cb, n, p); return; }\n"
+        "    VkCommandBuffer keep[64];\n"
+        "    uint32_t k = 0;\n"
+        "    pthread_mutex_lock(&mv_cb_lock);\n"
+        "    int ps = mv_cb_slot(cb, 0);\n"
+        "    int in_rp = ps < 0 || mv_cb[ps].in_rp;           // unknown counts as open\n"
+        "    for (uint32_t i = 0; i < n; i++) {\n"
+        "        int s = mv_cb_slot(p[i], 0);\n"
+        "        int cont = s >= 0 && mv_cb[s].cont;\n"
+        "        int drop = guard && !in_rp && cont;\n"
+        "        if (!in_rp && said < 24) {\n"
+        "            said++;\n"
+        "            VKI(\"ExecuteCommands: primary %p has no render pass open; secondary %p \"\n"
+        "                \"flags %#x continue %d expects render pass %#llx -> %s\\n\",\n"
+        "                (void *)cb, (void *)p[i], s >= 0 ? mv_cb[s].flags : 0u, cont,\n"
+        "                s >= 0 ? (unsigned long long)(uintptr_t)mv_cb[s].rp : 0ULL,\n"
+        "                drop ? \"DROPPED\" : \"forwarded\");\n"
+        "        }\n"
+        "        if (!drop) keep[k++] = p[i];\n"
+        "    }\n"
+        "    pthread_mutex_unlock(&mv_cb_lock);\n"
+        "    if (k) real(cb, k, keep);\n"
+        "}\n\n"
+        "static void VKAPI_CALL klvk_CmdBeginRenderPass(VkCommandBuffer cb,\n")
+    s = sub(s, "    if (real) real(cb, inj ? &tmp : bi, c);\n",
+               "    mv_cb_rp(cb, 1);   // metavision (step 43)\n"
+               "    if (real) real(cb, inj ? &tmp : bi, c);\n")
+    s = sub(s, "    if (real) real(cb, inj ? &tmp : bi, sbi);\n",
+               "    mv_cb_rp(cb, 1);   // metavision (step 43)\n"
+               "    if (real) real(cb, inj ? &tmp : bi, sbi);\n")
+    s = sub(s, "    }\n    if (real) real(cb, ri);\n}\n",
+               "    }\n    mv_cb_rp(cb, 1);   // metavision (step 43)\n    if (real) real(cb, ri);\n}\n")
+    s = sub(s, "    klvk_cb_set_idx(cb, 0);\n    return real ? real(cb, bi)",
+               "    klvk_cb_set_idx(cb, 0);\n"
+               "    mv_cb_begin(cb, (const VkCommandBufferBeginInfo *)bi);   // metavision (step 43)\n"
+               "    return real ? real(cb, bi)")
+    s = sub(s, "    E(CmdBeginRendering),\n",
+               "    E(CmdBeginRendering),\n"
+               "    // metavision: render-pass tracking for the secondary guard (step 43)\n"
+               "    { \"vkCmdExecuteCommands\",   (PFN_vkVoidFunction)mv_CmdExecuteCommands },\n"
+               "    { \"vkCmdEndRenderPass\",     (PFN_vkVoidFunction)mv_CmdEndRenderPass },\n"
+               "    { \"vkCmdEndRenderPass2\",    (PFN_vkVoidFunction)mv_CmdEndRenderPass2 },\n"
+               "    { \"vkCmdEndRenderPass2KHR\", (PFN_vkVoidFunction)mv_CmdEndRenderPass2 },\n"
+               "    { \"vkCmdEndRendering\",      (PFN_vkVoidFunction)mv_CmdEndRendering },\n"
+               "    { \"vkCmdEndRenderingKHR\",   (PFN_vkVoidFunction)mv_CmdEndRendering },\n")
+    open(p, "w").write(s)
+print("overlay: secondaries replayed outside a render pass are dropped and logged")
 PYEOF
