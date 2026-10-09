@@ -114,6 +114,8 @@ jobs:
         run: tools/metavision-sim boot
 
       - name: Build the launcher for the simulator
+        env:
+          KLEPTON_TEAM: '""'          # nothing is signed for the simulator; an empty value must still parse
         run: |
           set -euo pipefail
           tools/metavision-launcher $(cat build/simdata/.sim-targets)
@@ -121,8 +123,9 @@ jobs:
           cd "$K/visionos"
           xcodebuild -project metavision.xcodeproj -scheme metavision -configuration Debug \
             -destination "platform=visionOS Simulator,id=$UDID" -derivedDataPath build/dd-sim \
-            CODE_SIGNING_ALLOWED=NO build 2>&1 | grep -E 'error:|warning: .*metavision|\*\* BUILD' || true
-          test -f build/dd-sim/Build/Products/Debug-xrsimulator/metavision.app/Info.plist
+            CODE_SIGNING_ALLOWED=NO build > /tmp/xcb.log 2>&1 || true
+          grep -E 'error:|\*\* BUILD' /tmp/xcb.log | head -40 || true
+          test -f build/dd-sim/Build/Products/Debug-xrsimulator/metavision.app/Info.plist || { tail -40 /tmp/xcb.log; exit 1; }
 
       - name: Install and stage
         run: |
