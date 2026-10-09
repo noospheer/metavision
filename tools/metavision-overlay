@@ -2250,3 +2250,39 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: Vulkan large render-target census (diagnostic)")
 PYEOF
+
+# 40 — the AAudio stream getters for what the builder set: usage, content type,
+# capture policy, privacy and spatialization (API 28-32). Klepton aborts on an
+# unimplemented AAudio entry point by design, and an Unreal title reading
+# AAudioStream_getUsage after opening its output stream went down with it.
+# They answer Android's defaults (USAGE_MEDIA, CONTENT_TYPE_MUSIC,
+# ALLOW_CAPTURE_BY_ALL, not privacy-sensitive, not spatialized): the stream does
+# not keep the builder's values, and nothing here acts on them.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/media/kl_aaudio.c"
+s = open(p).read()
+marker = "metavision: AAudio attribute getters"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static int32_t klaa_getInputPreset(klaa_stream *s)     { return s ? s->input_preset : 0; }\n",
+        "static int32_t klaa_getInputPreset(klaa_stream *s)     { return s ? s->input_preset : 0; }\n"
+        "// metavision: AAudio attribute getters (step 40) — Android's defaults.\n"
+        "static int32_t mv_aa_getUsage(klaa_stream *s)               { (void)s; return 1; /* USAGE_MEDIA */ }\n"
+        "static int32_t mv_aa_getContentType(klaa_stream *s)         { (void)s; return 2; /* CONTENT_TYPE_MUSIC */ }\n"
+        "static int32_t mv_aa_getAllowedCapturePolicy(klaa_stream *s){ (void)s; return 1; /* ALLOW_CAPTURE_BY_ALL */ }\n"
+        "static int32_t mv_aa_isPrivacySensitive(klaa_stream *s)     { (void)s; return 0; }\n"
+        "static int32_t mv_aa_isContentSpatialized(klaa_stream *s)   { (void)s; return 0; }\n")
+    old = '    A("AAudioStream_getInputPreset",               klaa_getInputPreset),\n'
+    s = sub(s, old, old +
+        '    A("AAudioStream_getUsage",                     mv_aa_getUsage),   // metavision (step 40)\n'
+        '    A("AAudioStream_getContentType",               mv_aa_getContentType),\n'
+        '    A("AAudioStream_getAllowedCapturePolicy",      mv_aa_getAllowedCapturePolicy),\n'
+        '    A("AAudioStream_isPrivacySensitive",           mv_aa_isPrivacySensitive),\n'
+        '    A("AAudioStream_isContentSpatialized",         mv_aa_isContentSpatialized),\n')
+    open(p, "w").write(s)
+print("overlay: AAudio usage/content/capture getters")
+PYEOF
