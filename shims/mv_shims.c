@@ -397,11 +397,15 @@ static int32_t mv_ovrp_dominant_hand(int32_t *out) {
 // false button, a zero axis, an identity pose — and that is what is true here.
 // Signatures per OVRPlugin's C#: (string actionName, ref/out value), and
 // GetActionStatePose2 adds a Hand before the out-param. Posef is {qx,qy,qz,qw,px,py,pz}.
-static int32_t mv_ovrp_action_bool(const char *n, int32_t *out) { (void)n; if (out) *out = 0; return 0; }
-static int32_t mv_ovrp_action_float(const char *n, float *out) { (void)n; if (out) *out = 0; return 0; }
+static void mv_action_said(const char *fn, const char *n) {
+    static int said;
+    if (said++ < 3) fprintf(stderr, "  [mv-shim] %s(\"%s\") -> inactive\n", fn, n ? n : "");
+}
+static int32_t mv_ovrp_action_bool(const char *n, int32_t *out) { mv_action_said("ovrp_GetActionStateBoolean", n); if (out) *out = 0; return 0; }
+static int32_t mv_ovrp_action_float(const char *n, float *out) { mv_action_said("ovrp_GetActionStateFloat", n); if (out) *out = 0; return 0; }
 static int32_t mv_ovrp_action_vec2(const char *n, float *out) { (void)n; if (out) out[0] = out[1] = 0; return 0; }
 static int32_t mv_ovrp_action_pose(const char *n, float *pose) {
-    (void)n;
+    mv_action_said("ovrp_GetActionStatePose", n);
     if (pose) { memset(pose, 0, 7 * sizeof *pose); pose[3] = 1; }
     return 0;
 }

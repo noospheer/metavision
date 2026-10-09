@@ -3,7 +3,8 @@
 #
 # The macOS runner never sees an APK. It needs, per target, only the guest's
 # arm64 libraries (klepton-ld translates them there, mkguest.sh wraps them as
-# frameworks) plus the generated target table. Assets, OBBs and decoded
+# frameworks), its decoded AndroidManifest.xml (permissions, package), plus the
+# generated target table. Assets, OBBs and decoded
 # metadata go to the headset's app container at install time, not into the
 # build. Guest code is not ours to publish, so the bundle is AES-256 encrypted
 # with a passphrase that lives only here and in the repo's secrets.
@@ -38,6 +39,9 @@ for t in "$@"; do
     [ -d "$G/$t/lib/arm64-v8a" ] || { echo "$t not staged (tools/metavision-targets stage)" >&2; exit 1; }
     mkdir -p "$STAGE/guests/$t/lib"
     cp -a "$G/$t/lib/arm64-v8a" "$STAGE/guests/$t/lib/"
+    # The decoded manifest: the launcher reads the title's permissions from it
+    # (RECORD_AUDIO arms the microphone) and the workflow masks its package name.
+    [ -f "$G/$t/AndroidManifest.xml" ] && cp "$G/$t/AndroidManifest.xml" "$STAGE/guests/$t/"
     echo "  + $t  ($(du -sh "$G/$t/lib/arm64-v8a" | cut -f1))" >&2
 done
 printf '%s\n' "$@" > "$STAGE/guests/BUNDLED"
