@@ -19,11 +19,15 @@
 // then hands-free, then auto, that long each (start in auto so the audio
 // session has the microphone) — so a test pass boots each title once.
 //
-// Either way it aims at a grid of directions around the head's forward view, a
-// click at each, with other buttons and both thumbsticks on their own periods.
+// Either way it aims across where menus sit — a dense 7.5-degree scan, then a
+// wider grid — resting on each point before a click, with other buttons and
+// both thumbsticks on their own periods. Sweeps alternate between aiming from
+// where the title started (menus placed in the world) and from where the head
+// faces now (menus that follow the head).
 //
-// The head moves too (MV_AUTOPLAY_HEAD=0 holds it still): the pose the title
-// sees looks left and right, up and down, turns right round once a minute,
+// After the first 30 s — when menus are up — the head moves too
+// (MV_AUTOPLAY_HEAD=0 holds it still): the pose the title sees looks left and
+// right, up and down, turns right round once a minute,
 // steps forward, back and sideways and crouches — for titles that react to
 // where the user looks or goes. The display is not moved, so anyone wearing
 // the headset during a pass sees the picture swing.
@@ -64,24 +68,40 @@ enum MetavisionAutoplay {
         set { headLock.lock(); headNow_ = newValue; headLock.unlock() }
     }
 
-    // 5 x 3 grid, degrees from the head's forward: centre first, where menus usually are.
+    // Where to aim, degrees (yaw, pitch) from forward. First a dense scan of
+    // where menus sit — 7.5 degree steps (a button 2 m away spans about 8),
+    // centre outwards — then a wider grid for what is further out.
     private static let aims: [(Float, Float)] = {
-        var a: [(Float, Float)] = [(0, -5)]
-        for p: Float in [-5, -22, 12] { for y: Float in [0, -20, 20, -40, 40] where !(y == 0 && p == -5) { a.append((y, p)) } }
-        return a
+        var dense: [(Float, Float)] = []
+        for p: Float in [-5, 2.5, -12.5, 10, -20, -27.5] {
+            for y in stride(from: Float(-30), through: 30, by: 7.5) { dense.append((y, p)) }
+        }
+        dense.sort { abs($0.0) + abs($0.1 + 5) < abs($1.0) + abs($1.1 + 5) }
+        var wide: [(Float, Float)] = []
+        for p: Float in [-5, -22, 12] { for y: Float in [-45, 45, -60, 60] { wide.append((y, p)) } }
+        return dense + wide
     }()
+    /// Seconds per aim: about 0.35 s of hover before the click, as a pointer
+    /// has to rest on a control before a press counts.
+    private static let period = 0.7
+    /// Where the title started, levelled: menus are placed in front of that, and
+    /// the scripted head motion must not carry the aim away from them.
+    nonisolated(unsafe) private static var origin: (SIMD3<Float>, simd_quatf)?
+    /// The head holds still this long first — when a title's menus are up.
+    private static let headHold: Float = 30
+    nonisolated(unsafe) private static var headSaid = false
 
     static func drive() {
         guard enabled else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if start == 0 {
             start = now
-            NSLog("[mv-autoplay] on: scripted input every 1.2 s, input mode %@",
+            NSLog("[mv-autoplay] on: scripted input every %.1f s, input mode %@", period,
                   MetavisionHandsFree.shared.mode.rawValue as NSString)
         }
         let t = now - start
-        let step = Int(t / 1.2)
-        let phase = t - Double(step) * 1.2
+        let step = Int(t / period)
+        let phase = t - Double(step) * period
 
         var px: Float = 0, py: Float = 1.6, pz: Float = 0
         var hx: Float = 0, hy: Float = 0, hz: Float = 0, hw: Float = 1
@@ -92,7 +112,12 @@ enum MetavisionAutoplay {
         // Level the head's heading: aim relative to where the user faces, not
         // to how their head happens to be tilted.
         let fwd = head.act(SIMD3<Float>(0, 0, -1))
-        let heading = simd_quatf(angle: atan2f(-fwd.x, -fwd.z), axis: SIMD3<Float>(0, 1, 0))
+        let facing = simd_quatf(angle: atan2f(-fwd.x, -fwd.z), axis: SIMD3<Float>(0, 1, 0))
+        if origin == nil { origin = (hp, facing) }
+        // Alternate sweeps: from where the title started (menus placed in the
+        // world), then from where the head now faces (menus that follow the head).
+        let fromStart = (step / aims.count) % 2 == 0
+        let (base, heading) = fromStart ? origin! : (hp, facing)
         let (yaw, pitch) = aims[step % aims.count]
         let aim = heading * simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
                           * simd_quatf(angle: pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
@@ -114,12 +139,12 @@ enum MetavisionAutoplay {
         if path != lastPath { lastPath = path; NSLog("[mv-autoplay] input path: %@", path as NSString) }
 
         let what = viaHandsFree
-            ? handsFree(step: step, head: hp, aim: aim)
-            : controllersAndHands(step: step, phase: phase, now: now, head: hp, heading: heading, aim: aim)
+            ? handsFree(step: step, head: base, aim: aim)
+            : controllersAndHands(step: step, phase: phase, now: now, head: base, heading: heading, aim: aim)
         if step != lastStep {
             lastStep = step
-            NSLog("[mv-autoplay] t=%.1fs step %ld: aim %ld,%ld%@%@", t, step, Int(yaw), Int(pitch), what as NSString,
-                  headNow as NSString)
+            NSLog("[mv-autoplay] t=%.1fs step %ld: aim %.1f,%.1f from %@%@%@", t, step, yaw, pitch,
+                  (fromStart ? "start" : "head") as NSString, what as NSString, headNow as NSString)
         }
     }
 
@@ -131,8 +156,12 @@ enum MetavisionAutoplay {
     static func moveHead(_ pose: (SIMD3<Float>, simd_quatf)) -> (SIMD3<Float>, simd_quatf) {
         guard movesHead else { return pose }
         let now = ProcessInfo.processInfo.systemUptime
-        if headStart == 0 { headStart = now; NSLog("[mv-autoplay] head motion on") }
-        let t = Float(now - headStart)
+        if headStart == 0 { headStart = now }
+        let held = Float(now - headStart)
+        if held < headHold { headNow = "; head still"; return pose }
+        if !headSaid { headSaid = true; NSLog("[mv-autoplay] head motion on") }
+        let t = held - headHold
+        let ease = min(1, t / 3)                 // ease in, no jump
         let tau: Float = 2 * .pi
         let m = t.truncatingRemainder(dividingBy: 60)
         func ramp(_ a: Float, _ b: Float) -> Float { min(1, max(0, (m - a) / (b - a))) }
@@ -147,9 +176,9 @@ enum MetavisionAutoplay {
         let (p, q) = pose
         let f = q.act(SIMD3<Float>(0, 0, -1))
         let heading = simd_quatf(angle: atan2f(-f.x, -f.z), axis: SIMD3<Float>(0, 1, 0))
-        let ry = simd_quatf(angle: yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
-        let rx = simd_quatf(angle: pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
-        let np = p + heading.act(SIMD3<Float>(side, -crouch, -fwd))
+        let ry = simd_quatf(angle: ease * yaw * .pi / 180, axis: SIMD3<Float>(0, 1, 0))
+        let rx = simd_quatf(angle: ease * pitch * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
+        let np = p + heading.act(ease * SIMD3<Float>(side, -crouch, -fwd))
         headNow = String(format: "; head yaw %.0f pitch %.0f, at %+.2f,%+.2f%@", yaw, pitch, side, -fwd,
                          crouch > 0.1 ? ", crouching" : "")
         return (np, ry * q * rx)
@@ -167,8 +196,8 @@ enum MetavisionAutoplay {
         var rTrig: Float = 0, rGrip: Float = 0, lTrig: Float = 0, lGrip: Float = 0
         var rStick = SIMD2<Float>(0, 0), lStick = SIMD2<Float>(0, 0)
         var what = " + trigger/pinch"
-        let click = phase > 0.6 && phase < 0.8
-        let phaseLate = phase > 0.3
+        let click = phase > 0.35 && phase < 0.5
+        let phaseLate = phase > 0.2
         if click { rb |= OVRPRawButton.rIndexTrigger; rTrig = 1 }
         if step % 8 == 5 && click { rb |= OVRPRawButton.a; what += ", A" }
         if step % 13 == 9 && click { rb |= OVRPRawButton.b; what += ", B" }
@@ -236,7 +265,8 @@ enum MetavisionAutoplay {
         // the gaze only with a select, so this is what Dwell Control would give.
         hf.noteSelection(origin: head, direction: aim.act(SIMD3<Float>(0, 0, -1)))
         var what = " (gaze)"
-        guard step != lastStep else { return what }
+        // A spoken phrase every other aim: speech takes about as long as an aim.
+        guard step != lastStep, step % 2 == 0 else { return what }
         // Spoken commands fire once per step, at the step's start.
         var cmds: [MetavisionVoice.Command] = [.select]
         if step % 8 == 5 { cmds.append(.confirm) }

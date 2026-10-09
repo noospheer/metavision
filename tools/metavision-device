@@ -688,7 +688,7 @@ async def cmd_test(a):
         tree = rows.get(title, {}).get("tree", f"mv_{title}")
         out = run / ".probe" if probe else run / tree / mode
         out.mkdir(parents=True, exist_ok=True)
-        for f in ("klepton-boot.log", "klepton-crash.log"):     # nothing stale
+        for f in ("klepton-boot.log", "klepton-crash.log", "shots"):     # nothing stale
             try:
                 await afc.rm(f"Documents/{f}", force=True)
             except Exception:
@@ -726,6 +726,13 @@ async def cmd_test(a):
                 pass
         if probe:
             return triage.verdict(out)
+        try:                                  # the eye screenshots (MetavisionShots)
+            for n in sorted(await afc.listdir("Documents/shots")):
+                if n.endswith(".png"):
+                    (out / n).write_bytes(await afc.get_file_contents(f"Documents/shots/{n}"))
+                    got.append(n)
+        except Exception:
+            pass
         async with CrashReportsManager(rsd) as cr:
             try:
                 await cr.flush()

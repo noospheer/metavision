@@ -251,9 +251,17 @@ goes in through each mode's own path:
 | `handsfree` | no controllers or hands: a gaze ray at each grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
 | `auto` | the two alternating (every 20 s; 5 s inside a cycle), as a hand entering and leaving view |
 
-In every mode the **head moves** as well (`MV_AUTOPLAY_HEAD=0` holds it
-still): the pose the title sees looks around, turns right round once a minute,
-steps about and crouches. In hands-free the commands are **spoken** —
+Aiming is a dense 7.5° scan of where menus sit, then a wider grid, resting
+about 0.35 s on each point before the click; sweeps alternate between aiming
+from where the title started (menus placed in the world) and from where the
+head now faces (menus that follow it). After the first 30 s the **head moves**
+as well (`MV_AUTOPLAY_HEAD=0` holds it still): the pose the title sees looks
+around, turns right round once a minute, steps about and crouches.
+
+Every run also saves **screenshots** of the eye the title drew, every 15 s
+(`MetavisionShots`), pulled beside the logs as `shot_NN.png`; triage reports
+**BLACK CONTENT** when every one is dark or a flat colour — frames presented
+but nothing in them. In hands-free the commands are **spoken** —
 synthesised speech replaces the microphone's input, so the recogniser is
 tested too (`MV_AUTOPLAY_SPEECH=0` hands them over directly); triage reports
 phrases said against commands recognised. Speech recognition must have been

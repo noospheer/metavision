@@ -383,10 +383,10 @@ echo "overlay: older Oculus XR Plugin surface handshake (initComplete)"
 # Modes auto / hands / handsfree (launcher picker, voice, MV_INPUT_MODE);
 # handsfree ignores tracked hands entirely.
 cp "$ROOT/klepton-overlay/MetavisionHandsFree.swift" "$ROOT/klepton-overlay/MetavisionHands.swift" \
-   "$ROOT/klepton-overlay/MetavisionAutoplay.swift" "$K/visionos/Sources/"
+   "$ROOT/klepton-overlay/MetavisionAutoplay.swift" "$ROOT/klepton-overlay/MetavisionShots.swift" "$K/visionos/Sources/"
 grep -q '"MetavisionHandsFree.swift"' "$G" || {
     grep -q '"MetavisionLibrary.swift"\]' "$G" || die "SWIFT list anchor (MetavisionLibrary) not found"
-    sed -i.bak 's|"MetavisionLibrary.swift"\]|"MetavisionLibrary.swift", "MetavisionHandsFree.swift", "MetavisionHands.swift", "MetavisionAutoplay.swift"]|' "$G" && rm -f "$G.bak"
+    sed -i.bak 's|"MetavisionLibrary.swift"\]|"MetavisionLibrary.swift", "MetavisionHandsFree.swift", "MetavisionHands.swift", "MetavisionAutoplay.swift", "MetavisionShots.swift"]|' "$G" && rm -f "$G.bak"
 }
 python3 - "$K/visionos" <<'EOF'
 import sys
@@ -425,6 +425,15 @@ patch(f"{v}/Sources/KleptonCompositor.swift",
       "        guard !MetavisionAutoplay.movesHead,   // metavision: autoplay head prediction\n"
       "              let out, let tracker = KleptonCompositor.headAtTracker else { return 0 }\n",
       "metavision: autoplay head prediction")
+
+# Test-pass screenshots of the eye the title drew (MetavisionShots.swift).
+patch(f"{v}/Sources/KleptonCompositor.swift",
+      "            let a = eyeSource(vi, stage)\n",
+      "            let a = eyeSource(vi, stage)\n"
+      "            if vi == viewIndices.first, let a {   // metavision: shots\n"
+      "                MetavisionShots.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue)\n"
+      "            }\n",
+      "metavision: shots")
 
 # The launcher closes its boot window once a title is drawing.
 patch(f"{v}/Sources/KleptonCompositor.swift",
