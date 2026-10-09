@@ -1,0 +1,104 @@
+name: check
+
+# The fast gate: does everything still compile for visionOS? Applies the
+# overlay and runs Klepton's `make xros` — the shipping runtime compiled and
+# linked for the device, then `swiftcheck`, every Swift file in the app
+# typechecked against the runtime headers. No ANGLE build, no title
+# translation, no signing: a broken edit fails here in minutes rather than at
+# the end of a full titles build.
+#
+# It needs the guest bundle only for the catalogue the overlay generates
+# (klepton-targets.py, the launcher's title list); nothing is translated.
+#
+# Secrets: MV_GUESTS_REPO  MV_GUESTS_TOKEN  MV_GUEST_KEY
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "klepton-overlay/**"
+      - "tools/metavision-overlay"
+      - "tools/metavision-unitycaps"
+      - "shims/**"
+      - "vendor/**"
+      - ".github/workflows/check.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+      - run: pip install pyelftools && make test
+
+  compile:
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      K: vendor/klepton
+      XROS_PLATFORMS: xros
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: MoltenVK cache (restore)
+        id: mvk
+        uses: actions/cache/restore@v4
+        with:
+          path: vendor/klepton/vendor-moltenvk/out
+          key: mvk-${{ hashFiles('vendor/klepton/Makefile') }}
+
+      - name: MoltenVK (first run only)
+        if: steps.mvk.outputs.cache-hit != 'true'
+        run: cd "$K" && make mvk
+
+      - name: MoltenVK cache (save)
+        if: steps.mvk.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vendor/klepton/vendor-moltenvk/out
+          key: ${{ steps.mvk.outputs.cache-primary-key }}
+
+      - name: Fetch and decrypt guest bundle (catalogue only)
+        env:
+          GH_TOKEN: ${{ secrets.MV_GUESTS_TOKEN }}
+          REPO: ${{ secrets.MV_GUESTS_REPO }}
+          KEY: ${{ secrets.MV_GUEST_KEY }}
+        run: |
+          mkdir -p build
+          gh release download guests --repo "$REPO" --pattern 'guest-bundle.tar.gz.enc' --output /tmp/guests.enc
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass "pass:$KEY" -in /tmp/guests.enc |
+            tar -xz -C build
+          mv build/guests/klepton-targets.py build/klepton-targets.py
+          rm /tmp/guests.enc
+          # This repository's logs are public: mask every title's names.
+          python3 - <<'PY'
+          import json, os, re
+          rows = json.load(open("build/guests/targets.json"))
+          names = set()
+          for slug, t in rows.items():
+              names |= {slug, t.get("display") or "", t.get("product") or ""}
+              if len(slug) > 7:
+                  names.add(slug[3:])
+              m = os.path.join("build/guests", t.get("tree", slug), "AndroidManifest.xml")
+              if os.path.isfile(m):
+                  p = re.search(r'package="([^"]+)"', open(m, errors="replace").read())
+                  if p:
+                      names.add(p.group(1))
+          for n in sorted(n for n in names if len(n) >= 4):
+              print(f"::add-mask::{n}")
+          PY
+
+      - name: Python tools for the overlay
+        run: python3 -m venv /tmp/mvpy && /tmp/mvpy/bin/pip install -q capstone pyelftools
+
+      - name: Overlay metavision onto Klepton
+        env:
+          MV_LAUNCHER: "1"
+          MV_PYTHON: /tmp/mvpy/bin/python
+        run: tools/metavision-overlay
+
+      - name: Compile runtime and typecheck the app
+        run: cd "$K" && make xros

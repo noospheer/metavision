@@ -30,7 +30,7 @@ on:
       launcher:
         description: "One metavision app with all of them, instead of one app per title"
         type: boolean
-        default: false
+        default: true
 
 jobs:
   test:

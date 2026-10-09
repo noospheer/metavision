@@ -206,7 +206,7 @@ refused whenever a passcode exists, and a Vision Pro always has one.
 ## 5. Build and install
 
 ```bash
-gh workflow run titles -f targets="mv_<title> ..."
+gh workflow run titles -f targets="mv_<title> ..." -f launcher=false   # one app per title
 ```
 
 The first run builds ANGLE from source (about an hour); later runs restore it
@@ -321,7 +321,7 @@ When a title will not start, see [COMPATIBILITY.md](COMPATIBILITY.md).
 ### One app for every title: the metavision launcher
 
 ```bash
-gh workflow run titles -f targets="mv_<title> mv_<title> ..." -f launcher=true
+gh workflow run titles -f targets="mv_<title> mv_<title> ..."   # launcher is the default
 sudo tools/metavision-device install metavision.ipa
 sudo tools/metavision-device stage mv_<title> --launcher     # once per title
 ```

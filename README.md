@@ -98,7 +98,7 @@ tools/metavision-targets stage && tools/metavision-targets emit
 tools/metavision-gaps                         # link-time gaps, ranked by titles blocked
 tools/metavision-guest-bundle mv_<title> ...  # -> build/guest-bundle.tar.gz.enc
 gh release upload guests build/guest-bundle.tar.gz.enc --repo <you>/<private-repo> --clobber
-gh workflow run titles -f targets="mv_<title> ..."
+gh workflow run titles -f targets="mv_<title> ..." -f launcher=false   # one app per title
 ```
 
 Account, signing and headset setup, step by step: [docs/SETUP.md](docs/SETUP.md).
@@ -106,8 +106,11 @@ Account, signing and headset setup, step by step: [docs/SETUP.md](docs/SETUP.md)
 `tools/metavision-device` pairs, registers and installs.
 
 `tools/build-klepton-ld-linux.sh` builds the translator here if you want to
-inspect translations locally. The workflow (`.github/workflows/titles.yml`)
-needs these repository secrets:
+inspect translations locally. Every push that touches the overlay, shims or
+runtime runs `.github/workflows/check.yml` first: the overlay applied, the
+runtime compiled for visionOS and the app's Swift typechecked, in minutes and
+with no titles translated, so a broken edit never costs a full build. The
+workflow (`.github/workflows/titles.yml`) needs these repository secrets:
 
 | Secret | What |
 |---|---|
