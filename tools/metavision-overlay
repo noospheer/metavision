@@ -2286,3 +2286,129 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: AAudio usage/content/capture getters")
 PYEOF
+
+# 41 — a wild image handle viewed as depth gets a depth stand-in. The wild-handle
+# substitution (a guest view on an image no create ever produced) only had one
+# stand-in, a colour RGBA8 image. A guest that builds its depth/stencil views on
+# such a handle (D32S8, 2-layer, eye-sized) then had MoltenVK build a depth view
+# over RGBA8, and Metal's validation aborted the process ("source texture
+# pixelFormat RGBA8Unorm not compatible with texture view pixelFormat
+# Depth32Float_Stencil8"). Depth and stencil formats now get a stand-in of their
+# own format, made on first use, one per format; barriers on a wild handle whose
+# aspect is depth or stencil transition that same stand-in. Diagnostic as well:
+# the eye-layer depth answer is logged once with the flags that asked for it, so
+# the next pass shows where such handles come from.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+root = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:70]!r}")
+    open(path, "w").write(s.replace(old, new))
+
+V = f"{root}/gfx/kl_vulkan.c"
+patch(V,
+      "    return g_wild_scratch;\n}\n",
+      "    return g_wild_scratch;\n}\n\n"
+      "// metavision: depth stand-ins for wild handles (step 41). One per depth/stencil\n"
+      "// format (VK_FORMAT_D16_UNORM 124 .. D32_SFLOAT_S8_UINT 130), 4096x4096, two\n"
+      "// layers, one mip, made the first time a guest views a wild handle as depth.\n"
+      "static int mv_fmt_is_depth(VkFormat f) { return f >= 124 && f <= 130; }\n"
+      "static VkImage mv_wild_depth[7];\n"
+      "static VkImage mv_wild_depth_scratch(VkFormat f) {\n"
+      "    if (!mv_fmt_is_depth(f)) return VK_NULL_HANDLE;\n"
+      "    VkImage *slot = &mv_wild_depth[f - 124];\n"
+      "    if (!*slot) {\n"
+      "        klvk_device *d = g_devs[0];\n"
+      "        if (!d) return VK_NULL_HANDLE;\n"
+      "        *slot = klvk_image_alloc(d, f, 4096, 4096, KLVK_SCRATCH_LAYERS, 1,\n"
+      "            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |\n"
+      "            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |\n"
+      "            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, NULL);\n"
+      "        if (*slot) {\n"
+      "            klvk_img_reg_add(*slot);\n"
+      "            VKI(\"created 4096x4096 depth scratch %#llx (format %d) for wild-handle \"\n"
+      "                \"depth views\\n\", (unsigned long long)(uintptr_t)*slot, (int)f);\n"
+      "        }\n"
+      "    }\n"
+      "    return *slot;\n"
+      "}\n"
+      "// The depth stand-in already made, for a barrier that names only an aspect.\n"
+      "static VkImage mv_wild_depth_any(void) {\n"
+      "    for (int i = 6; i >= 0; i--) if (mv_wild_depth[i]) return mv_wild_depth[i];\n"
+      "    return VK_NULL_HANDLE;\n"
+      "}\n",
+      "metavision: depth stand-ins for wild handles (step 41)")
+patch(V, "static VkImage klvk_wild_scratch(void);\n",
+      "static VkImage klvk_wild_scratch(void);\n"
+      "static VkImage mv_wild_depth_any(void);   // metavision: depth stand-in (step 41)\n",
+      "metavision: depth stand-in (step 41)")
+patch(V,
+      "        VkImage scratch = klvk_wild_scratch();\n",
+      "        // metavision: a depth/stencil view gets a stand-in of its own format (step 41)\n"
+      "        int mv_depth = mv_fmt_is_depth(ci->format);\n"
+      "        VkImage scratch = mv_depth ? mv_wild_depth_scratch(ci->format) : klvk_wild_scratch();\n",
+      "metavision: a depth/stencil view gets a stand-in")
+patch(V,
+      "                r->layerCount = KLVK_SCRATCH_LAYERS - r->baseArrayLayer;\n",
+      "                r->layerCount = KLVK_SCRATCH_LAYERS - r->baseArrayLayer;\n"
+      "            if (mv_depth) { r->baseMipLevel = 0; r->levelCount = 1; }   // metavision: one mip (step 41)\n",
+      "metavision: one mip (step 41)")
+patch(V,
+      "        if (KLVK_IMG_BAD(ib[i].image)) { rew[i].image = klvk_sub_wild(ib[i].image); redir++; }\n",
+      "        if (KLVK_IMG_BAD(ib[i].image)) {\n"
+      "            // metavision: a depth/stencil barrier lands on the depth stand-in (step 41)\n"
+      "            VkImage dsub = (ib[i].subresourceRange.aspectMask &\n"
+      "                            (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))\n"
+      "                           ? mv_wild_depth_any() : VK_NULL_HANDLE;\n"
+      "            if (dsub) {\n"
+      "                rew[i].image = dsub;\n"
+      "                rew[i].subresourceRange.baseMipLevel = 0;\n"
+      "                rew[i].subresourceRange.levelCount = 1;\n"
+      "            } else rew[i].image = klvk_sub_wild(ib[i].image);\n"
+      "            redir++;\n"
+      "        }\n",
+      "metavision: a depth/stencil barrier lands on the depth stand-in")
+
+O = f"{root}/xr/kl_ovrp.c"
+patch(O,
+      "    if (depth) *depth = 0;\n    if (!color) return OVRP_SUCCESS;\n",
+      "    if (depth) *depth = 0;\n"
+      "    {   // metavision: diagnostic (step 41) — who asks for eye depth, and how\n"
+      "        static int said;\n"
+      "        if (l->is_eye && !said++)\n"
+      "            fprintf(stderr, \"  [ovrp] GetLayerTexture2: eye depth %s (desc depth format %d, \"\n"
+      "                            \"layer flags %#x); answered none\\n\",\n"
+      "                    depth ? \"requested\" : \"not requested\", l->desc.depth_format,\n"
+      "                    (unsigned)l->desc.layer_flags);\n"
+      "    }\n"
+      "    if (!color) return OVRP_SUCCESS;\n",
+      "metavision: diagnostic (step 41)")
+print("overlay: wild handles viewed as depth get a depth stand-in")
+PYEOF
+
+# 42 — ActivityThread.currentApplication(). Android's hidden static that
+# returns the process's Application; SDKs that need a Context without being
+# handed one (a cache directory, say) call it, and with no binding it answered
+# null, which one such SDK turned into std::string(nullptr) and a fault in strlen.
+# It answers the same Application singleton as currentActivityThread()
+# .getApplication(), so a guest never sees two different Contexts.
+python3 - "$K/runtime/jni/kl_jni_services.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: ActivityThread.currentApplication (step 42)"
+if marker not in s:
+    old = '    {"android/app/ActivityThread", "getTopResumedActivity", "()Landroid/app/Activity;",\n'
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old,
+        '    // metavision: ActivityThread.currentApplication (step 42) — the static form\n'
+        '    {"android/app/ActivityThread", "currentApplication", "()Landroid/app/Application;",\n'
+        '     klj_ActivityThread_getApplication},\n' + old)
+    open(p, "w").write(s)
+print("overlay: ActivityThread.currentApplication answers the Application")
+PYEOF
