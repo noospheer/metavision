@@ -1661,6 +1661,25 @@ C = f"{k}/visionos/Sources/KleptonCompositor.swift"
 patch(C, "            ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, 1)\n",
          "            ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, MetavisionShots.hidden ? 0 : 1)   // metavision: hidden clear\n",
          "metavision: hidden clear")
+# One gate for every draw path (eye, OpenXR projection layers, equirect,
+# cylinders, panels, the loading skybox): capture the first eye, draw nothing.
+patch(C, "        if probe == 1 { enc.endEncoding(); return viewIndices.count }\n",
+         "        if probe == 1 { enc.endEncoding(); return viewIndices.count }\n"
+         "        if MetavisionShots.hidden {   // metavision: hidden gate — capture, draw nothing\n"
+         "            if let vi = viewIndices.first, let a = eyeSource(vi, stage) {\n"
+         "                MetavisionShots.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue)\n"
+         "                if haveRendered {\n"
+         "                    let t = vi == 0 ? rendered.tangents.0 : rendered.tangents.1\n"
+         "                    let r = vi == 0 ? rendered.viewport.0 : rendered.viewport.1\n"
+         "                    MetavisionTargets.offer(a.texture, slice: a.slice, flipY: a.flipY, queue: queue,\n"
+         "                        viewport: SIMD4<Int32>(r.0, r.1, r.2, r.3), tangents: SIMD4<Float>(t.0, t.1, t.2, t.3),\n"
+         "                        pose: (SIMD3<Float>(rendered.px, rendered.py, rendered.pz),\n"
+         "                               simd_quatf(ix: rendered.qx, iy: rendered.qy, iz: rendered.qz, r: rendered.qw)))\n"
+         "                }\n"
+         "            }\n"
+         "            enc.endEncoding(); return viewIndices.count\n"
+         "        }\n",
+         "metavision: hidden gate")
 patch(C, "            u.visible = alloc == nil ? 0 : 1\n",
          "            u.visible = alloc == nil || MetavisionShots.hidden ? 0 : 1   // metavision: hidden eye\n",
          "metavision: hidden eye")

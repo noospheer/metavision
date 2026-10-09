@@ -724,11 +724,27 @@ async def cmd_test(a):
         await asyncio.sleep(3)
         got = []
         for f in ("klepton-boot.log", "klepton-crash.log"):
-            try:
-                (out / f).write_bytes(await afc.get_file_contents(f"Documents/{f}"))
-                got.append(f)
-            except Exception:
-                pass
+            # Retried on a fresh connection: the first read after a title closes
+            # has failed with the file plainly there. The launcher also files the
+            # last run's logs under logs/<title>/ when the next title starts.
+            why = None
+            for attempt in range(3):
+                try:
+                    src = afc if attempt == 0 else await HouseArrestService.create(rsd, bundle)
+                    for path in (f"Documents/{f}", f"Documents/logs/{title}/{f}"):
+                        try:
+                            (out / f).write_bytes(await src.get_file_contents(path))
+                            got.append(f)
+                            break
+                        except Exception as e:
+                            why = e
+                    if f in got:
+                        break
+                except Exception as e:
+                    why = e
+                await asyncio.sleep(2)
+            if f == "klepton-boot.log" and f not in got and not probe:
+                print(f"  (boot log not pulled: {type(why).__name__}: {why})", end="", flush=True)
         if probe:
             return triage.verdict(out)
         try:                                  # the eye screenshots (MetavisionShots)
