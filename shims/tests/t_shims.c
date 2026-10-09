@@ -75,6 +75,17 @@ static void test_hands(void *(*dls)(void *, const char *)) {
     assert(fabsf(r7[2] + s45) < 1e-5f);                   // Index2 relative to Index1: undoes it
     assert(*(uint32_t *)(st + 0x1a0) == 3);               // thumb + index pinching
     assert(*(double *)(st + 0x1f8) == 12.5);
+    // Hand mesh: a tube per bone on the measured skeleton, refused until seen.
+    int32_t (*gm)(int32_t, void *) = (int32_t (*)(int32_t, void *))dls(&g_fake_ovrp, "ovrp_GetMesh");
+    static unsigned char mesh[0x31cec];
+    assert(gm(0, mesh) != 0);                             // left hand never seen
+    assert(gm(2, mesh) != 0);                             // not a hand
+    assert(gm(1, mesh) == 0);
+    uint32_t *mh = (uint32_t *)mesh;
+    assert(mh[0] == 1 && mh[1] == 22 * 16 && mh[2] == 22 * 48);
+    for (uint32_t i = 0; i < mh[2]; i++) assert((uint32_t)((int16_t *)(mesh + 0x8cac))[i] < mh[1]);
+    assert(((float *)(mesh + 0x2616c))[0] == 1.0f);       // first vertex wholly on its bone
+
     assert(hs(0, 0, st) == 0 && *(int32_t *)st == 0);     // left hand never seen
     mv_hands_set_enabled(0);
     assert(hs(0, 1, st) == 0 && *(int32_t *)st == 0);     // hands-free: hands ignored

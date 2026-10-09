@@ -21,8 +21,12 @@
 //
 // Bone frames are ARKit's joint frames, not Meta's. Anything built from bone
 // positions — the hand skeleton, colliders, particles, pinch tests — sees the
-// real hand. Meta's own hand MESH is skinned to Meta's frames, so ovrp_GetMesh
-// stays refused and titles draw no mesh (OVRMesh checks the result).
+// real hand. Meta's own hand MESH is skinned to Meta's frames and is not ours to
+// ship, so ovrp_GetMesh answers a mesh of our own instead: a tube along every
+// bone of the bind skeleton below, each vertex bound wholly to the bone it
+// rides. OVRMeshRenderer derives the bind poses from that same skeleton, so it
+// skins to the live hand. Titles that emit or place effects on the hand mesh
+// (SkinnedMeshRenderer.BakeMesh, particle shapes) need one to draw anything.
 #include "mv_hands.h"
 
 #include <math.h>
@@ -224,12 +228,110 @@ static int32_t mv_GetHandState(int32_t step, int32_t hand, ovrp_hand_state *out)
     return OVRP_SUCCESS;
 }
 
+// ovrp_GetMesh(MeshType, ovrpMesh *): OVRPlugin's MeshInternal, fixed arrays of
+// 3000 vertices and 18000 indices. The offsets are the real plugin's own: its
+// GetMesh memsets 0x31cec bytes and writes positions at +0xc, indices at
+// +0x8cac, normals at +0x1194c, UV0 at +0x1a5ec, blend indices at +0x203ac and
+// blend weights at +0x2616c.
+#define MESH_MAX_V 3000
+#define MESH_MAX_I 18000
+typedef struct { float x, y; } mv_vec2;
+typedef struct { int16_t x, y, z, w; } mv_vec4s;
+typedef struct { float x, y, z, w; } mv_vec4f;
+typedef struct {
+    int32_t type;
+    uint32_t num_vertices, num_indices;
+    mv_vec3 pos[MESH_MAX_V];
+    int16_t idx[MESH_MAX_I];
+    mv_vec3 nrm[MESH_MAX_V];
+    mv_vec2 uv[MESH_MAX_V];
+    mv_vec4s bone[MESH_MAX_V];
+    mv_vec4f weight[MESH_MAX_V];
+} ovrp_mesh;
+_Static_assert(offsetof(ovrp_mesh, pos) == 0xc, "Mesh.VertexPositions");
+_Static_assert(offsetof(ovrp_mesh, idx) == 0x8cac, "Mesh.Indices");
+_Static_assert(offsetof(ovrp_mesh, nrm) == 0x1194c, "Mesh.VertexNormals");
+_Static_assert(offsetof(ovrp_mesh, uv) == 0x1a5ec, "Mesh.VertexUV0");
+_Static_assert(offsetof(ovrp_mesh, bone) == 0x203ac, "Mesh.BlendIndices");
+_Static_assert(offsetof(ovrp_mesh, weight) == 0x2616c, "Mesh.BlendWeights");
+_Static_assert(sizeof(ovrp_mesh) == 0x31cec, "MeshInternal");
+
+static mv_vec3 v_add(mv_vec3 a, mv_vec3 b) { return (mv_vec3){ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static mv_vec3 v_sub(mv_vec3 a, mv_vec3 b) { return (mv_vec3){ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static mv_vec3 v_scale(mv_vec3 a, float k) { return (mv_vec3){ a.x * k, a.y * k, a.z * k }; }
+static mv_vec3 v_cross(mv_vec3 a, mv_vec3 b) {
+    return (mv_vec3){ a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
+}
+static float v_len(mv_vec3 a) { return sqrtf(a.x*a.x + a.y*a.y + a.z*a.z); }
+
+#define TUBE_SIDES 8
+
+// Fails, like the skeleton, until the hand has been seen once: the mesh is
+// built on the measured bind skeleton and must match it bone for bone.
+static int32_t mv_GetMesh(int32_t type, ovrp_mesh *out) {
+    if (!out) return OVRP_FAIL_INVALID_PARAM;
+    if (type != 0 && type != 1) return OVRP_FAILURE;   // HandLeft / HandRight only, as the skeleton
+    mv_vec3 at[MV_HAND_BONES];                         // each bone's bind origin, wrist frame
+    pthread_mutex_lock(&g_lock);
+    if (!g_enabled || !g_hand[type].have_bind) {
+        pthread_mutex_unlock(&g_lock);
+        return OVRP_FAILURE;
+    }
+    for (int i = 0; i < MV_HAND_BONES; i++) {          // parents precede children
+        int p = k_parent[i];
+        at[i] = p < 0 ? (mv_vec3){ 0, 0, 0 } : v_add(at[p], g_hand[type].bind[i]);
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    memset(out, 0, sizeof *out);
+    out->type = type;
+    uint32_t nv = 0, ni = 0;
+    for (int i = 2; i < MV_HAND_BONES; i++) {          // every bone but the wrist and forearm stub
+        int p = k_parent[i];
+        mv_vec3 a = at[p], b = at[i], axis = v_sub(b, a);
+        float len = v_len(axis);
+        if (len < 1e-4f) continue;
+        axis = v_scale(axis, 1.0f / len);
+        mv_vec3 ref = fabsf(axis.y) < 0.9f ? (mv_vec3){ 0, 1, 0 } : (mv_vec3){ 1, 0, 0 };
+        mv_vec3 u = v_cross(axis, ref);
+        u = v_scale(u, 1.0f / v_len(u));
+        mv_vec3 v = v_cross(axis, u);
+        float r = p == 0 ? 0.011f : 0.008f;            // metres: palm rays a little wider
+        uint32_t base = nv;
+        for (int ring = 0; ring < 2; ring++)
+            for (int k = 0; k < TUBE_SIDES; k++) {
+                float t = 6.2831853f * (float)k / TUBE_SIDES;
+                mv_vec3 n = v_add(v_scale(u, cosf(t)), v_scale(v, sinf(t)));
+                out->pos[nv] = v_add(ring ? b : a, v_scale(n, r));
+                out->nrm[nv] = n;
+                out->uv[nv] = (mv_vec2){ (float)k / TUBE_SIDES, (float)ring };
+                out->bone[nv] = (mv_vec4s){ (int16_t)p, 0, 0, 0 };   // rides its parent bone
+                out->weight[nv] = (mv_vec4f){ 1, 0, 0, 0 };
+                nv++;
+            }
+        for (int k = 0; k < TUBE_SIDES; k++) {         // outward, counter-clockwise (right-handed)
+            int16_t a0 = (int16_t)(base + k), a1 = (int16_t)(base + (k + 1) % TUBE_SIDES);
+            int16_t b0 = (int16_t)(a0 + TUBE_SIDES), b1 = (int16_t)(a1 + TUBE_SIDES);
+            int16_t q[6] = { a0, a1, b1, a0, b1, b0 };
+            for (int j = 0; j < 6; j++) out->idx[ni++] = q[j];
+        }
+    }
+    out->num_vertices = nv;
+    out->num_indices = ni;
+    static int said[2];
+    if (!said[type]++)
+        fprintf(stderr, "  [mv-hands] %s hand mesh: %u vertices, %u indices, skinned to the "
+                        "measured skeleton\n", type ? "right" : "left", nv, ni);
+    return OVRP_SUCCESS;
+}
+
 void *mv_hands_ovrp(const char *name) {
     static const struct { const char *name; void *fn; } k[] = {
         { "ovrp_GetHandTrackingEnabled", (void *)mv_GetHandTrackingEnabled },
         { "ovrp_GetSkeleton2",           (void *)mv_GetSkeleton2 },
         { "ovrp_GetSkeleton3",           (void *)mv_GetSkeleton3 },
         { "ovrp_GetHandState",           (void *)mv_GetHandState },
+        { "ovrp_GetMesh",                (void *)mv_GetMesh },
     };
     for (size_t i = 0; name && i < sizeof k / sizeof k[0]; i++)
         if (strcmp(name, k[i].name) == 0) return k[i].fn;

@@ -14,7 +14,7 @@ that will not start, and what is still open.
 | **Older Oculus XR Plugin** (1.x, Unity 2019.4) takes its display surface through `OculusUnity.initComplete(Surface)`, not `surfaceCreated(Surface)` | black picture: ten OVRPlugin calls, then no `SetupDisplayObjects`, no frames | fall back to `initComplete` (same signature) — **6 titles** | `tools/metavision-overlay`, step 5b |
 | **Meta Interaction SDK** loads `libossdk.oculus.so` (Quest OS telemetry) and calls the handler it never got | a few hundred frames, then `SIGSEGV at 0x0` in `TelemetrySender::TelemetrySender` | a stand-in library: every symbol returns a harmless object; nothing is sent — **32 titles** | `shims/mv_shims.c` (dlopen/dlsym wrappers) |
 | OVRPlugin capability questions Klepton does not implement (`ovrp_GetHandTrackingEnabled`, body/face tracking, environment depth, …) | `fatal: guest called unimplemented OVRPlugin entry point …` | answer 18 "is X enabled / supported?" questions with success + **no**, which sends titles down their controller path — `GetHandTrackingEnabled` alone is in **37 titles** | `shims/mv_shims.c` |
-| **Meta hand tracking** (`ovrp_GetHandState`, `GetSkeleton2/3`) — Klepton refuses it | hand-driven titles run but nothing responds to hands | the Vision Pro's hand skeleton mapped onto Meta's 24 bones, in Meta's struct layouts (offsets pinned by static asserts): wrist pose, bone rotations, pinch strengths, pointer ray; the rest skeleton is measured from the user's hand. Off in hands-free mode. Meta's hand *mesh* stays refused — titles draw no mesh hand | `shims/mv_hands.c`, `klepton-overlay/MetavisionHands.swift` |
+| **Meta hand tracking** (`ovrp_GetHandState`, `GetSkeleton2/3`) — Klepton refuses it | hand-driven titles run but nothing responds to hands | the Vision Pro's hand skeleton mapped onto Meta's 24 bones, in Meta's struct layouts (offsets pinned by static asserts): wrist pose, bone rotations, pinch strengths, pointer ray; the rest skeleton is measured from the user's hand. Off in hands-free mode. `ovrp_GetMesh` answers a hand mesh of our own (a tube along every bone of the measured skeleton, skinned to it) — titles that place particles or effects on the hand mesh need one; titles that show Meta's mesh hand draw tube hands | `shims/mv_hands.c`, `klepton-overlay/MetavisionHands.swift` |
 | **Unity's texture-unit cap**: Unity limits units to 32 while Quest shaders bind samplers at 32-35, and refuses those binds | text drawn as boxes, wrong textures; `OpenGL Error: Invalid texture unit!` tens of thousands of times a run | `tools/metavision-unitycaps` measures every bundled libunity (cap field, singleton, Unity's own per-unit cache) from the binary at build time; the runtime raises the cap only where the guard's code bytes match | `tools/metavision-unitycaps`, overlay step 8 |
 | **Java exceptions**: Klepton's JNI never has one pending | a call that throws on Android (a missing optional asset, a missing patch OBB) returns null, the title reads through it and crashes (`strlen(NULL)`) or logs a bogus OBB mismatch | a pending throwable per thread; `ExceptionCheck/Occurred/Clear`, `Throw`, `ThrowNew`; missing assets and zips throw `FileNotFoundException` | overlay step 9 |
 | `dl_iterate_phdr` reports bare library names | Unity 2018 il2cpp crashes at start (`SIGSEGV` at `0xffffffffffffffff`): it opens its own library by that name and maps the result unchecked | full paths, as Android gives | overlay step 10 |
@@ -39,6 +39,15 @@ that will not start, and what is still open.
 | `/proc/<own pid>/…` missed the synthetic tree; no `oom_score` | memory-advice: "Could not open /proc/N/status" | `/proc/<pid>` resolves to `/proc/self`; `oom_score`/`oom_score_adj` read 0 | overlay step 28 |
 | Android 11+ `WindowManager.getMaximumWindowMetrics` unanswered once the platform reads 12L; `MidiManager.getDevices` polled every frame unanswered | Unity reads a null window size; tens of thousands of logged misses a run | window metrics return the display bounds as a `Rect`; MIDI returns an empty device list | overlay step 29 |
 | (test passes) a pass filled the wearer's view and ears | the headset could not be used while testing | `MV_HIDDEN=1`: no eye, panels or skybox drawn over passthrough, audio output zeroed; capture and measurement unchanged | overlay step 30 |
+| Klepton's environment lookups took Darwin's `getenv` lock, and `sem_post` asked for its trace switch on every call — also from a signal handler (the GC's suspend handler) | a title aborts at random: "Trying to recursively lock an os_unfair_lock" when the GC signal lands on a thread already inside `getenv` | lock-free lookups that walk `environ`; `sem_post`/`pthread_kill` read their trace switch once | overlay step 31 |
+| `socketpair` was still forwarded raw: the generated libc table comes first and the lookup is first-match, so step 11's entry was never reached | Rust/tokio titles abort at start: the signal pipe's `socketpair` with `SOCK_NONBLOCK`/`SOCK_CLOEXEC` fails with `EPROTONOSUPPORT`, then a panic that cannot unwind | the flag-translating `socketpair` listed ahead of the generated table | overlay step 32 |
+| Android 12's `Build.SOC_MANUFACTURER`/`SOC_MODEL` unanswered once the platform reads 12L; any unset `Build` string read null | Unity's render thread faults in `strlen` at start | the Quest 2's SoC (`QTI`, `SM8250`), also as `ro.soc.*` properties; any other unset `Build` string reads `unknown`, as Android's `Build.UNKNOWN` | overlay step 33 |
+| `truncate`, `symlink`, `chmod`, `rmdir`, `readlink`, … : the generated table forwards them with the guest's path unmapped, ahead of step 19's mapped entries | AssetBundle caches under `/sdcard` still fail: `Unable to reserve header in the archive file`, `Failed to decompress data for the AssetBundle` | a path-mapped entry for every path-taking forward, listed ahead of the generated table | overlay step 34 |
+| Klepton describes **GLES 3.2** while the ANGLE context is ES 3.0, so Unity runs compute that never compiled | GLES Unity 2021+ titles with GPU skinning draw errors or black: `Internal-Skinning … GLSL compilation failed`, tens of thousands of `Kernel at index (N) is invalid`, `GL_INVALID_FRAMEBUFFER_OPERATION` | Unity 2021+ (year read from the libunity build) is told ES 3.0: CPU skinning, ES 3.0 shader variants — 4 of 4 GPU-skinning titles went from errors or black to pass; older Unity keeps 3.2; `KL_GLES_VERSION` still wins | overlay step 35 (on step 17) |
+| (diagnostic) a title freezes when it opens the OpenSL ES recorder: the log stops at `[sl] record state -> STOPPED` | every guest thread goes silent, frames stop | each recorder entry point logged on entry with its thread, so the call that never returns is the last line | overlay step 36 |
+| Klepton describes OVRPlugin **1.60.0**, and the C# wrapper refuses newer calls (OpenXR action states are 1.95) without reaching native code | `Error getting action name` every frame; the action-state shims are never called | `KL_OVRP_VERSION=<x.y.z>` describes another version (default unchanged; a switch for A/B: a newer version may reach entry points Klepton stops on by name) | overlay step 37 |
+| **Application SpaceWarp** titles: `ovrp_GetLayerTextureSpaceWarp` refused, and the eye-layer desc left the motion-vector size at 0x0 | one XR frame, then none: the main loop runs, the picture stays black | the desc reports a motion-vector size (a quarter of the eye); the entry point takes its real seven arguments and hands out per-stage motion-vector colour and depth images from `kl_vulkan_aux_image` (Vulkan only; GL keeps the refusal). Nothing reads the vectors: visionOS reprojects on its own | overlay step 38 |
+| (diagnostic) whether per-frame Vulkan render targets are leaked or only backed | a title killed for memory seconds in, allocating a full-size depth target every frame | every large attachment image tracked create→destroy; `[vk-rt]` logs the live count as it grows | overlay step 39 |
 | the launcher did not carry **MoltenVK** | every Vulkan title black: `MoltenVK is not vendored` | the launcher build wraps it like ANGLE | `tools/metavision-launcher` |
 | a hand-launched app has no environment, and every Klepton diagnostic is an environment switch | — | `Documents/klepton.env`, read before configure | `tools/metavision-overlay`, `metavision-device env` |
 
@@ -96,32 +105,45 @@ OVRPlugin call in order — the step where a title stops is the last one.
 ## Open issues
 
 - **GPU compute in OpenGL ES titles.** Klepton runs GLES titles on ANGLE's
-  Metal backend, which is GLES 3.0: no compute shaders. A GLES-only title that
-  uses them — Unity VFX Graph particles, GPU skinning, compute effects — runs
-  with those effects missing; its log shows `GLSL compilation failed` and
-  `Kernel at index (N) is invalid` (triage lists both). Titles that ship Vulkan
-  (their manifest declares `android.hardware.vulkan`) run on MoltenVK, which
-  has compute. The fix is GLES 3.1 compute in the GL path.
-
+  Metal backend, which is GLES 3.0: no compute shaders. Unity 2021+ is now told
+  ES 3.0 (overlay step 35) and falls back cleanly (CPU skinning, ES 3.0
+  variants); effects that need compute — VFX Graph particles, compute effects —
+  are still missing. Unity 2018/2019 keep ES 3.2 (they need 3.x features), so
+  their compute still fails (`GLSL compilation failed`, `Kernel at index (N) is
+  invalid`; triage lists both). Unity 2022.3 GLES builds get 3.0 by the same
+  rule but no test pass has compared them yet. Titles that ship Vulkan run on
+  MoltenVK, which has compute. The full fix is GLES 3.1 compute in the GL path.
 - **Squashed picture** in at least one title: frames render, the
   view looks compressed. Under test: foveated rendering (`KL_VRR=0`), then a
   unified eye frustum (`KL_OVRP_UNIFY_FRUSTUM=1`).
-- **The GLES level Unity is told.** Klepton describes ES 3.2 (ANGLE is 3.0), so
-  Unity picks ES 3.1+ shader variants — SSBO instancing (`'std430' : invalid
-  layout qualifier`), sampler units equal to explicit locations (units in the
-  hundreds: `Invalid texture unit!` even with the cap raised) — and compute.
-  `KL_GLES_VERSION=3.0` (overlay step 17) describes 3.0 instead; it is a
-  switch until a test pass (`test --env KL_GLES_VERSION=3.0`) shows which
-  titles are better for it.
 - **`GL_INVALID_FRAMEBUFFER_OPERATION` once a frame** in GLES Unity titles,
   reported by Unity's native-plugin GL check, on the eye-texture framebuffer.
-  Next: a run with `KL_GLFB_ERRSCAN=0x506 KL_TRACE_FBO=1` names the call.
-- **Video into a texture.** Unity's VideoPlayer renders through a
-  `SurfaceTexture`, which Klepton does not have (a flat video app waits
-  forever: `AndroidVideoMedia surface creation stalled`), MediaCodec in
-  byte-buffer mode (no surface) returns no output, and the AVPro video plugin
-  cannot create its player. All are media work in Klepton's `kl_mediandk.c`
-  and its Java media classes.
+  Gone in the Unity 2021+ titles tested with ES 3.0 (step 35); for the rest, a
+  run with `KL_GLFB_ERRSCAN=0x506 KL_TRACE_FBO=1` names the call.
+- **Passthrough** is refused (`XR_FB_passthrough` absent, OVRPlugin's
+  `InitializeInsightPassthrough` unsupported). Mixed-reality titles that expect
+  it draw their few objects on black. The fix is a compositor feature: show the
+  room behind a transparent passthrough layer.
+- **Media.** A VideoPlayer clip with sound plays silent: Klepton's
+  `AMediaExtractor` exposes only the video track and `AMediaCodec` has no audio
+  decoder. Unity's VideoPlayer renders through a `SurfaceTexture`, which Klepton
+  does not have (a flat video app waits forever: `AndroidVideoMedia surface creation
+  stalled`), and MediaCodec in byte-buffer mode returns no output. The AVPro
+  video plugin's Java player (`com/RenderHeads/AVProVideo`) is unbound, so it
+  cannot create its player; it needs a binding over Klepton's video decoder.
+  All are media work in Klepton's `kl_mediandk.c` and its Java media classes.
+- **The OpenSL ES recorder freeze**: in titles that open the recorder from
+  their main thread, every guest thread stops at `[sl] record state ->
+  STOPPED`. Under diagnosis with step 36's call log.
+- **A GPU hang** in one title: the GPU firmware reports a lockup, Compositor
+  Services invalidates the layer renderer and the render loop ends. The hung
+  work is most likely ANGLE's Metal work for the title's GL frame. Next: a run
+  with Metal shader validation to find the draw.
+- **A depth buffer allocated every frame** in one Vulkan Unity title (about 100
+  in 1.5 s, where others make 3 to 6): memory climbs by gigabytes in a second
+  and the process is killed for memory with no crash report. Why Unity
+  reallocates is not established; next, a count of live attachment images and
+  the memory each is bound to.
 - **Hand tracking in OpenXR titles.** metavision's hands reach titles through
   OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
 - **An OpenXR title exits on its own about 5 s in**, after its first frames,
@@ -130,9 +152,6 @@ OVRPlugin call in order — the step where a title stops is the last one.
 - **MoltenVK faults on the first frame** in titles that replay a secondary
   command buffer beginning a render pass. Step 24's first option did not stop
   it; graphics jobs are now forced off as well — awaiting a test pass.
-- **Unreal titles** run with a picture since steps 21 and 26 (compute stand-in,
-  DoubleWide eye layers). Their eye layer is large (about 9700x3900, three
-  stages) because the engine sizes it itself; it is not capped.
 - **Dwell Control inside an immersive title** is untested (see ACCESSIBILITY.md).
 - Titles whose code is 32-bit only, Flutter, Quill's own engine or Unreal 5 are
   not generated (8 of 54 in the archive).

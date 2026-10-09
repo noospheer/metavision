@@ -1709,3 +1709,544 @@ patch(A, "    atomic_fetch_add_explicit(&g_frames_played, take, memory_order_rel
          "metavision: hidden test pass")
 print("overlay: hidden test passes (MV_HIDDEN=1): nothing shown or heard")
 PYEOF
+
+# 31 — kl_env_* is async-signal-safe. Darwin's getenv takes __environ_lock (an
+# os_unfair_lock). bionic sem_post is the one semaphore call a signal handler may
+# make (Boehm's stop-the-world suspend handler does), and klb_sem_post asks
+# kl_env_on("KL_TRACE_SIG") on every call. When the GC signal lands on a thread
+# that is already inside getenv, the handler's getenv locks the same lock again,
+# and libplatform kills the process ("Trying to recursively lock an
+# os_unfair_lock"). The lookup now walks environ without that lock, and
+# sem_post/pthread_kill read their trace flag once.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+rt = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+patch(f"{rt}/kl_env.c", "#include <strings.h>\n",
+      "#include <strings.h>\n\n"
+      "// metavision: lock-free environment lookup (step 31). Darwin's getenv takes\n"
+      "// __environ_lock; these helpers are reached from guest signal handlers\n"
+      "// (sem_post inside a GC suspend handler), where re-taking that lock on a\n"
+      "// thread interrupted inside getenv is a fatal recursive-lock abort.\n"
+      "extern char **environ;\n"
+      "static const char *kl_env_get(const char *name) {\n"
+      "    size_t n = strlen(name);\n"
+      "    for (char **e = environ; e && *e; e++)\n"
+      "        if (strncmp(*e, name, n) == 0 && (*e)[n] == '=') return *e + n + 1;\n"
+      "    return NULL;\n"
+      "}\n"
+      "#define getenv(n) kl_env_get(n)\n",
+      "metavision: lock-free environment lookup")
+P = f"{rt}/libc/kl_pthread.c"
+patch(P, '    if (kl_env_on("KL_TRACE_SIG", 0)) {\n        static _Atomic int n;\n',
+         '    static int mv_trace = -1;   // metavision: read once (step 31), this runs in signal handlers\n'
+         '    if (mv_trace < 0) mv_trace = kl_env_on("KL_TRACE_SIG", 0);\n'
+         '    if (mv_trace) {\n        static _Atomic int n;\n',
+         "metavision: read once (step 31)")
+patch(P, '    if (kl_env_on("KL_TRACE_SIG", 0))\n        fprintf(stderr, "  [sig] pthread_kill(',
+         '    static int mv_trace_kill = -1;   // metavision: read once (step 31)\n'
+         '    if (mv_trace_kill < 0) mv_trace_kill = kl_env_on("KL_TRACE_SIG", 0);\n'
+         '    if (mv_trace_kill)\n        fprintf(stderr, "  [sig] pthread_kill(',
+         "mv_trace_kill")
+print("overlay: kl_env lookups lock-free (signal-safe); sem_post trace flag read once")
+PYEOF
+
+# 32 — socketpair gets step 11's flag handling. The shim table is searched
+# first-match, and kl_libc_table.h (included at the top of g_shim) already has
+# KL_FWD(socketpair), so the E("socketpair", kl_socketpair) step 11 appended was
+# never reached: Linux's SOCK_NONBLOCK|SOCK_CLOEXEC went to Darwin, which refused
+# it with EPROTONOSUPPORT. Rust's tokio builds its signal pipe that way at
+# startup, panics in a function that cannot unwind, and aborts. Put the entry
+# ahead of the generated forwards, in place of step 11's dead one.
+python3 - "$K/runtime/libc/kl_shim.c" <<'PYEOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+marker = "metavision: socketpair ahead of the generated forward"
+if marker not in s:
+    if "metavision: socketpair flags" not in s:
+        sys.exit("overlay: step 32 needs step 11 (kl_socketpair)")
+    old = 'static const kl_entry g_shim[] = {\n#include "kl_libc_table.h"\n'
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    # Step 11's own entry, below the include, was never reached: drop it so the
+    # name is listed once (its marker text stays, for step 11's idempotence).
+    old11 = '    E("socket", kl_socket), E("socketpair", kl_socketpair),   // metavision: socketpair flags\n'
+    if s.count(old11) != 1:
+        sys.exit(f"overlay: step 32 cannot find step 11's entry in {path}")
+    s = s.replace(old11, '    E("socket", kl_socket),   // metavision: socketpair flags — socketpair is first in g_shim (step 32)\n')
+    s = s.replace(old,
+        'static const kl_entry g_shim[] = {\n'
+        '    // metavision: socketpair ahead of the generated forward (step 32) — the\n'
+        '    // lookup is first-match, and the table below forwards socketpair raw.\n'
+        '    E("socketpair", kl_socketpair),\n'
+        '#include "kl_libc_table.h"\n')
+    open(path, "w").write(s)
+print("overlay: socketpair resolved to the flag-translating shim")
+PYEOF
+
+# 33 — Android 12's Build fields. With SDK_INT at 32 (step 15), Unity reads
+# Build.SOC_MODEL (API 31+) and strlen()s the result; unanswered, it was null and
+# the render thread faulted in strlen. SOC_MANUFACTURER/SOC_MODEL describe the
+# Quest 2's SoC, and ro.soc.* say the same. Any other Build String field with no
+# value answers "unknown", as Android does for an unset build property
+# (Build.UNKNOWN), instead of a null nothing on Android ever returns.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+rt = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+J = f"{rt}/kl_jni.c"
+fp = ('    KLJ_FSTR("android/os/Build", "FINGERPRINT",\n'
+      '             "oculus/hollywood/hollywood:10/SQ3A.220605.009.A1/1:user/release-keys"),\n')
+patch(J, fp, fp +
+      '    // metavision: Android 12 SoC fields (step 33) — the Quest 2\'s XR2 (SM8250 family).\n'
+      '    KLJ_FSTR("android/os/Build", "SOC_MANUFACTURER", "QTI"),\n'
+      '    KLJ_FSTR("android/os/Build", "SOC_MODEL",        "SM8250"),\n',
+      "metavision: Android 12 SoC fields")
+patch(J, '    KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);\n',
+      '    if (want == \'L\' && (strcmp(w->cls, "android/os/Build") == 0 ||\n'
+      '                        strcmp(w->cls, "android/os/Build$VERSION") == 0)) {\n'
+      '        // metavision: Build.UNKNOWN for an unset build string (step 33)\n'
+      '        static void *mv_unknown;\n'
+      '        if (!mv_unknown) {\n'
+      '            void *u = kl_jni_new_string("unknown");\n'
+      '            klj_as_object(u)->pinned = 1;\n'
+      '            mv_unknown = u;\n'
+      '        }\n'
+      '        KLJ_LOG("no host value for field %s.%s %s -> \\"unknown\\"", w->cls, w->name, w->sig);\n'
+      '        return (klj_val){.l = mv_unknown};\n'
+      '    }\n'
+      '    KLJ_LOG("no host value for field %s.%s %s", w->cls, w->name, w->sig);\n',
+      "metavision: Build.UNKNOWN for an unset build string")
+patch(f"{rt}/libc/kl_libc.c", '    {"ro.hardware",             "HARDWARE"},\n',
+      '    {"ro.hardware",             "HARDWARE"},\n'
+      '    {"ro.soc.manufacturer",     "SOC_MANUFACTURER"},   // metavision: Android 12 SoC (step 33)\n'
+      '    {"ro.soc.model",            "SOC_MODEL"},\n',
+      "metavision: Android 12 SoC (step 33)")
+print("overlay: Build.SOC_MANUFACTURER/SOC_MODEL; unset Build strings read unknown")
+PYEOF
+
+# 34 — path-mapped libc entries must come BEFORE the generated forward table.
+# kl_shim_lookup takes the first match in g_shim[], and g_shim[] opens with
+# kl_libc_table.h, whose KL_FWD(truncate), KL_FWD(symlink), ... hand the guest's
+# path straight to the host. Step 19's truncate/symlink entries sat below the
+# include and were never reached: Unity's AssetBundle cache still could not
+# reserve its archive header under /sdcard ("Unable to reserve header in the
+# archive file", then "Failed to decompress data for the AssetBundle"). Every
+# path-taking forward gets a mapped twin, listed ahead of the include (after
+# step 32's socketpair line); step 19's own entries move up here rather than
+# being listed twice. statfs is not forwarded by the table, so step 19's
+# E("statfs") already wins and stays where it is.
+python3 - "$K/runtime/libc" <<'PYEOF'
+import sys
+d = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:50]!r}")
+    open(path, "w").write(s.replace(old, new))
+L = f"{d}/kl_libc.c"
+if "metavision: truncate/symlink" not in open(L).read():
+    sys.exit("overlay: step 34 needs step 19 (klb_truncate/klb_symlink)")
+patch(L, "int klb_access(const char *path, int mode) {\n",
+      "// metavision: the rest of the path-taking forwards, with /sdcard mapped (step 34)\n"
+      "#include <utime.h>\n#include <sys/time.h>\n"
+      "int klb_chmod(const char *path, unsigned mode) { KL_GUEST_PATH(path); return chmod(_p, (mode_t)mode); }\n"
+      "int klb_chown(const char *path, unsigned u, unsigned g) { KL_GUEST_PATH(path); return chown(_p, u, g); }\n"
+      "int klb_lchown(const char *path, unsigned u, unsigned g) { KL_GUEST_PATH(path); return lchown(_p, u, g); }\n"
+      "int klb_mkfifo(const char *path, unsigned mode) { KL_GUEST_PATH(path); return mkfifo(_p, (mode_t)mode); }\n"
+      "long klb_readlink(const char *path, char *buf, size_t n) { KL_GUEST_PATH(path); return readlink(_p, buf, n); }\n"
+      "int klb_remove(const char *path) { KL_GUEST_PATH(path); return remove(_p); }\n"
+      "int klb_rmdir(const char *path) { KL_GUEST_PATH(path); return rmdir(_p); }\n"
+      "int klb_utime(const char *path, const struct utimbuf *t) { KL_GUEST_PATH(path); return utime(_p, t); }\n"
+      "int klb_utimes(const char *path, const struct timeval t[2]) { KL_GUEST_PATH(path); return utimes(_p, t); }\n"
+      "int klb_link(const char *a, const char *b) {\n"
+      "    char ka[1024], kb[1024];\n"
+      "    return link(kl_guest_path(a, ka, sizeof ka), kl_guest_path(b, kb, sizeof kb));\n"
+      "}\n\n"
+      "int klb_access(const char *path, int mode) {\n", "metavision: the rest of the path-taking forwards")
+S = f"{d}/kl_shim.c"
+patch(S, "X(klb_getauxval)\n",
+      "X(klb_getauxval)\n"
+      "X(klb_chmod) X(klb_chown) X(klb_lchown) X(klb_mkfifo) X(klb_readlink)   // metavision (step 34)\n"
+      "X(klb_remove) X(klb_rmdir) X(klb_utime) X(klb_utimes) X(klb_link)\n", "X(klb_rmdir)")
+s = open(S).read()
+marker = "metavision: path-mapped entries first"
+if marker not in s:
+    # Anchored on the include alone, so step 32's socketpair line (inserted
+    # between the array head and the include) stays first and untouched.
+    inc = '#include "kl_libc_table.h"\n'
+    head = "static const kl_entry g_shim[] = {\n"
+    if s.count(inc) != 1 or s.count(head) != 1 or s.index(head) > s.index(inc):
+        sys.exit(f"overlay: anchor moved upstream in {S}: {inc!r} inside g_shim[]")
+    old19 = '    E("truncate", klb_truncate), E("symlink", klb_symlink),   // metavision: /sdcard paths\n'
+    if s.count(old19) != 1:
+        sys.exit("overlay: step 34 needs step 19's truncate/symlink entries")
+    s = s.replace(old19, "    // metavision: truncate/symlink are listed at the head of g_shim (step 34)\n")
+    s = s.replace(inc,
+        '    // metavision: path-mapped entries first (step 34); the first match wins,\n'
+        '    // and the generated table below forwards these names to the host unmapped.\n'
+        '    E("truncate", klb_truncate), E("symlink", klb_symlink), E("link", klb_link),\n'
+        '    E("chmod", klb_chmod), E("chown", klb_chown), E("lchown", klb_lchown),\n'
+        '    E("mkfifo", klb_mkfifo), E("readlink", klb_readlink), E("remove", klb_remove),\n'
+        '    E("rmdir", klb_rmdir), E("utime", klb_utime), E("utimes", klb_utimes),\n'
+        + inc)
+    open(S, "w").write(s)
+print("overlay: path-mapped libc entries ahead of the forward table")
+PYEOF
+
+# 35 — GLES 3.0 described to Unity 2021+ by default (builds on step 17). The
+# ANGLE-on-Metal context is a hard ES 3.0, but Klepton describes 3.2, so every
+# GLES Unity 2021+ title runs compute that never compiled ("Shader
+# Internal-Skinning.main: GLSL compilation failed", tens of thousands of "Kernel
+# at index (N) is invalid" a run, GL_INVALID_FRAMEBUFFER_OPERATION by the
+# thousand) and draws errors or black where GPU skinning matters. Told 3.0, it
+# skins on the CPU and takes its ES 3.0 variants; in a test pass that turned 4
+# of 4 GPU-skinning titles into passes. The year comes from the libunity build
+# in the process; Unity 2018/2019 still need 3.x, so they keep 3.2. An explicit
+# KL_GLES_VERSION (or kl_egl_set_gles_version) still wins.
+python3 - "$K/runtime/gfx/kl_egl.c" <<'PYEOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+marker = "metavision: ES 3.0 for newer Unity"
+if marker not in s:
+    if "metavision: KL_GLES_VERSION" not in s:
+        sys.exit("overlay: step 35 needs step 17 (KL_GLES_VERSION)")
+    def rep(old, new):
+        global s
+        if s.count(old) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+        s = s.replace(old, new)
+    # A helper ahead of mv_es_env (step 17's text, so step 17 must run first).
+    rep("// Read lazily, after klepton.env and the launch environment are in place.\n"
+        "static void mv_es_env(void) {\n",
+        "// metavision: ES 3.0 for newer Unity (step 35) — the year of the libunity build in this\n"
+        "// process, from its revision-stamped version (\"2021.3.45f2_<hex>\"); 0 if none.\n"
+        "static int mv_unity_year(void) {\n"
+        "    kl_image *u = kl_find_image(\"libunity.so\");\n"
+        "    if (!u) return 0;\n"
+        "    const char *b = (const char *)kl_base(u);\n"
+        "    size_t n = kl_span(u);\n"
+        "    for (size_t i = 0; i + 24 < n; i++) {\n"
+        "        if (b[i] != '2' || b[i + 1] != '0' || b[i + 4] != '.') continue;\n"
+        "        if (i && b[i - 1] >= '0' && b[i - 1] <= '9') continue;\n"
+        "        size_t j = i + 5;\n"
+        "        while (j < n && ((b[j] >= '0' && b[j] <= '9') || b[j] == '.')) j++;\n"
+        "        if (j >= n || !(b[j] == 'f' || b[j] == 'p' || b[j] == 'a' || b[j] == 'b')) continue;\n"
+        "        j++;\n"
+        "        while (j < n && b[j] >= '0' && b[j] <= '9') j++;\n"
+        "        if (j + 13 >= n || b[j] != '_') continue;\n"
+        "        size_t k = j + 1, hex = 0;\n"
+        "        while (k < n && ((b[k] >= '0' && b[k] <= '9') || (b[k] >= 'a' && b[k] <= 'f'))) { k++; hex++; }\n"
+        "        if (hex < 8) continue;\n"
+        "        return (b[i] - '0') * 1000 + (b[i + 1] - '0') * 100 + (b[i + 2] - '0') * 10 + (b[i + 3] - '0');\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n"
+        "// Read lazily, after klepton.env and the launch environment are in place.\n"
+        "static void mv_es_env(void) {\n")
+    # No KL_GLES_VERSION: a 2021+ Unity is told the truth about the ANGLE context
+    # (ES 3.0). It then skips compute (GPU skinning, VFX Graph) instead of running
+    # kernels that never compiled, and takes its ES 3.0 shader variants.
+    rep("        fprintf(stderr, \"  [gl] GLES level described: %d.%d (KL_GLES_VERSION)\\n\", ma, mi);\n"
+        "    }\n}\n",
+        "        fprintf(stderr, \"  [gl] GLES level described: %d.%d (KL_GLES_VERSION)\\n\", ma, mi);\n"
+        "    } else if (!v) {\n"
+        "        int y = mv_unity_year();\n"
+        "        if (y >= 2021) {\n"
+        "            g_es_major = 3; g_es_minor = 0;\n"
+        "            fprintf(stderr, \"  [gl] GLES level described: 3.0 (Unity %d: the context is ES 3.0; \"\n"
+        "                            \"no compute)\\n\", y);\n"
+        "        }\n"
+        "    }\n}\n")
+    open(path, "w").write(s)
+    print("overlay: GLES 3.0 described to Unity 2021+")
+PYEOF
+
+# 36 — OpenSL ES recorder call log (diagnostic). In every title that opens the
+# OpenSL recorder the log reaches "[sl] record state -> STOPPED" and never
+# RECORDING; in some, every guest thread that logs goes silent at that line and
+# frame submission stops for the rest of the run, while the CoreAudio mic and
+# the guest's player keep running. Reading the code finds no deadlock, so each
+# recorder entry point is logged on entry (first 24 calls each) with the calling
+# thread: a call that never returns is the last line printed.
+python3 - "$K/runtime/media/kl_opensl.c" <<'PYEOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+marker = "metavision: recorder call log"
+if marker not in s:
+    def rep(old, new):
+        global s
+        if s.count(old) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+        s = s.replace(old, new)
+    # Every recorder entry point, logged on ENTRY (the first 24 calls each), with
+    # the calling thread: a call that never returns is the last line printed.
+    helper = ("// metavision: recorder call log (step 36) — entry, thread, and queue state.\n"
+              "static void mv_rec_log(const char *what, unsigned *n, long a, long b) {\n"
+              "    if ((*n)++ >= 24) return;\n"
+              "    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);\n"
+              "    fprintf(stderr, \"  [sl-rec] %s(%ld, %ld) tid=%llu\\n\", what, a, b, (unsigned long long)tid);\n"
+              "}\n")
+    rep("static SLresult rec_bq_Enqueue(SLBufferQueueItf self, const void *buf, SLuint32 size) {\n"
+        "    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n",
+        "static SLresult rec_bq_Enqueue(SLBufferQueueItf self, const void *buf, SLuint32 size) {\n"
+        "    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n"
+        "    { static unsigned n; mv_rec_log(\"Enqueue size/count\", &n, (long)size, (long)r->count); }\n")
+    rep("static SLresult rec_bq_Clear(SLBufferQueueItf self) {\n    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n",
+        "static SLresult rec_bq_Clear(SLBufferQueueItf self) {\n    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n"
+        "    { static unsigned n; mv_rec_log(\"Clear count\", &n, (long)r->count, 0); }\n")
+    rep("static SLresult rec_bq_GetState(SLBufferQueueItf self, SLBufferQueueState *st) {\n    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n",
+        "static SLresult rec_bq_GetState(SLBufferQueueItf self, SLBufferQueueState *st) {\n    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n"
+        "    { static unsigned n; mv_rec_log(\"GetState count/filled\", &n, (long)r->count, (long)r->filled); }\n")
+    rep("                                        void (*cb)(SLBufferQueueItf, void *), void *ctx) {\n    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n",
+        "                                        void (*cb)(SLBufferQueueItf, void *), void *ctx) {\n    kl_sl_recorder *r = KL_SL_REC_BQ_R(self);\n"
+        "    { static unsigned n; mv_rec_log(\"RegisterCallback cb\", &n, cb != NULL, 0); }\n")
+    rep("static SLresult rec_SetRecordState(SLRecordItf self, SLuint32 state) {\n    kl_sl_recorder *r = KL_SL_REC_R(self);\n",
+        "static SLresult rec_SetRecordState(SLRecordItf self, SLuint32 state) {\n    kl_sl_recorder *r = KL_SL_REC_R(self);\n"
+        "    { static unsigned n; mv_rec_log(\"SetRecordState state/in_cb\", &n, (long)state, (long)r->in_cb); }\n")
+    rep("static SLresult rec_GetRecordState(SLRecordItf self, SLuint32 *st) {\n",
+        "static SLresult rec_GetRecordState(SLRecordItf self, SLuint32 *st) {\n"
+        "    { static unsigned n; mv_rec_log(\"GetRecordState state\", &n, (long)KL_SL_REC_R(self)->state, 0); }\n")
+    rep("    kl_sl_recorder *r = obj_as_recorder(self);\n    if (r) recorder_stop(r);\n}\n",
+        "    kl_sl_recorder *r = obj_as_recorder(self);\n"
+        "    if (r) { static unsigned n; mv_rec_log(\"Destroy started\", &n, r->started, 0); }\n"
+        "    if (r) recorder_stop(r);\n}\n")
+    rep("// ---- SLObjectItf ----\nstatic SLresult obj_Realize(SLObjectItf self, SLboolean async) {\n",
+        helper + "// ---- SLObjectItf ----\nstatic SLresult obj_Realize(SLObjectItf self, SLboolean async) {\n")
+    rep("    if (r && !r->started) {\n        r->started = r->running = 1;\n",
+        "    if (r) { static unsigned n; mv_rec_log(\"Realize started\", &n, r->started, 0); }\n"
+        "    if (r && !r->started) {\n        r->started = r->running = 1;\n")
+    rep("        r->filled++;\n        if (cb) cb((SLBufferQueueItf)&r->bq_vt, cb_ctx);\n",
+        "        r->filled++;\n"
+        "        { static unsigned n; mv_rec_log(\"callback -> guest, filled\", &n, (long)r->filled, 0); }\n"
+        "        if (cb) cb((SLBufferQueueItf)&r->bq_vt, cb_ctx);\n"
+        "        { static unsigned n; mv_rec_log(\"callback <- guest, filled\", &n, (long)r->filled, 0); }\n")
+    open(path, "w").write(s)
+    print("overlay: OpenSL ES recorder call log")
+PYEOF
+
+# 37 — KL_OVRP_VERSION=<x.y.z>: the OVRPlugin version described to the guest
+# (default unchanged: Klepton's 1.60.0). The C# wrapper gates each native call on
+# the version it reads, so at 1.60.0 newer entry points (OpenXR action states,
+# OVRP_1_95_0) are refused in C# without reaching native code, and SDK helpers log
+# "Error getting action name" every frame. A switch so a test pass can A/B it:
+# a higher number opens newer C# paths, which may reach entry points Klepton
+# stops on by name.
+python3 - "$K/runtime/xr/kl_ovrp.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "metavision: KL_OVRP_VERSION" not in s:
+    a = '#define KLOVRP_VERSION "1.60.0"\n'
+    if s.count(a) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {a!r}")
+    s = s.replace(a,
+        "// metavision: KL_OVRP_VERSION (step 37) — the plugin version described to the guest.\n"
+        "// Unset or malformed: Klepton's 1.60.0. Read lazily, after klepton.env.\n"
+        "static const char *mv_ovrp_version(void) {\n"
+        "    static const char *v;\n"
+        "    if (!v) {\n"
+        "        const char *e = kl_env_str(\"KL_OVRP_VERSION\", NULL);\n"
+        "        unsigned ma, mi, pa;\n"
+        "        if (e && sscanf(e, \"%u.%u.%u\", &ma, &mi, &pa) == 3 && ma == 1) {\n"
+        "            v = strdup(e);\n"
+        "            fprintf(stderr, \"  [ovrp] plugin version described: %s (KL_OVRP_VERSION)\\n\", v);\n"
+        "        } else {\n"
+        "            v = \"1.60.0\";\n"
+        "        }\n"
+        "    }\n"
+        "    return v;\n"
+        "}\n"
+        "#define KLOVRP_VERSION mv_ovrp_version()\n", 1)
+    open(p, "w").write(s)
+    print("overlay: KL_OVRP_VERSION switch")
+PYEOF
+
+# 38 — Application SpaceWarp eye layers get real motion-vector storage. A Unity
+# title built with SpaceWarp on asks ovrp_GetLayerTextureSpaceWarp for each
+# stage's motion-vector colour and depth textures, and its display provider
+# treats a refusal as "eye textures could not be created": one frame, then no
+# XR frame ever begins again (main loop alive, picture black). Three parts:
+#   - the eye-layer desc reports a motion-vector size (it stayed zero, and the
+#     provider sizes that storage from it alone);
+#   - the entry point has the real seven-argument shape (layer, stage, eye, then
+#     four NULL-checked out pointers: x3 = motion colour, x5 = motion depth);
+#   - kl_vulkan allocates the two images (RGBA16F colour, D32S8 depth) per stage.
+# Nothing consumes motion vectors here: the visionOS compositor reprojects on its
+# own, so the guest renders into storage nobody reads. GL guests keep the refusal.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+root = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:70]!r}")
+    open(path, "w").write(s.replace(old, new))
+
+V = f"{root}/gfx/kl_vulkan.c"
+patch(V,
+      "unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,\n",
+      "// metavision: SpaceWarp storage (step 38). Images the guest renders into and\n"
+      "// nothing reads: kind 0 = motion-vector colour, kind 1 = its depth. Cached per\n"
+      "// (kind, stage, eye); a different shape allocates afresh and keeps the old one,\n"
+      "// as kl_vulkan_layer_image does. Called from the guest's render thread at setup.\n"
+      "struct mv_aux_img { VkImage img; unsigned w, h; int fmt, layers; };\n"
+      "unsigned long long kl_vulkan_aux_image(int kind, int stage, int eye, unsigned w,\n"
+      "                                       unsigned h, int vk_format, int layers) {\n"
+      "    static struct mv_aux_img aux[2][KLVK_EYE_STAGES][2];\n"
+      "    if (!kl_vulkan_guest_active() || !g_devs[0]) return 0;\n"
+      "    if (kind < 0 || kind > 1 || stage < 0 || stage >= KLVK_EYE_STAGES ||\n"
+      "        eye < 0 || eye > 1 || !w || !h) return 0;\n"
+      "    if (layers < 1) layers = 1;\n"
+      "    if (layers > 2) layers = 2;\n"
+      "    if (layers > 1) eye = 0;            // Array layout: one image, a layer per eye\n"
+      "    struct mv_aux_img *s = &aux[kind][stage][eye];\n"
+      "    if (s->img && s->w == w && s->h == h && s->fmt == vk_format && s->layers == layers)\n"
+      "        return (uint64_t)(uintptr_t)s->img;\n"
+      "    VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |\n"
+      "                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |\n"
+      "                          (kind ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT\n"
+      "                                : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);\n"
+      "    VkDeviceMemory mem = VK_NULL_HANDLE;\n"
+      "    VkImage img = klvk_image_alloc(g_devs[0], (VkFormat)vk_format, w, h,\n"
+      "                                   (uint32_t)layers, 1, u, &mem);\n"
+      "    if (img == VK_NULL_HANDLE) return 0;\n"
+      "    *s = (struct mv_aux_img){ img, w, h, vk_format, layers };\n"
+      "    VKI(\"spacewarp %s stage %d = VkImage %p (%ux%u, format %d, %d layer(s))\\n\",\n"
+      "        kind ? \"depth\" : \"motion\", stage, (void *)img, w, h, vk_format, layers);\n"
+      "    return (uint64_t)(uintptr_t)img;\n"
+      "}\n\n"
+      "unsigned long long kl_vulkan_eye_image_layers(int stage, int eye, unsigned w, unsigned h,\n",
+      "metavision: SpaceWarp storage (step 38)")
+
+O = f"{root}/xr/kl_ovrp.c"
+patch(O,
+      "    d->mv_depth_format = mv_depth_format;\n}\n",
+      "    d->mv_depth_format = mv_depth_format;\n"
+      "    // metavision: SpaceWarp motion-vector size (step 38). A layer flagged\n"
+      "    // SpaceWarpDataAllocation (0x100) sizes its motion-vector storage from this\n"
+      "    // field alone; zero made a 0x0 texture. A quarter of the eye in each axis:\n"
+      "    // nothing reads the vectors, so the smallest honest size is the cheapest.\n"
+      "    if (layer_flags & 0x100)\n"
+      "        d->mv_texture_size = (ovrp_sizei){ (w + 3) / 4, (h + 3) / 4 };\n"
+      "}\n",
+      "metavision: SpaceWarp motion-vector size (step 38)")
+
+old_fn = (
+    "static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye,\n"
+    "                                                uint64_t *motion, uint64_t *depth) {\n"
+    "    ovrp_hit(\"ovrp_GetLayerTextureSpaceWarp\");\n"
+    "    (void)layer_id; (void)stage; (void)eye;\n"
+    "    if (!motion || !depth) return OVRP_FAIL_INVALID_PARAM;\n"
+    "    *motion = 0;\n"
+    "    *depth = 0;\n"
+    "    return OVRP_FAIL_UNSUPPORTED;\n"
+    "}\n")
+new_fn = (
+    "// metavision: SpaceWarp textures served (step 38). The real entry point takes\n"
+    "// seven arguments and NULL-checks all four out pointers; the Unity provider\n"
+    "// reads x3 (motion colour) and x5 (motion depth, on Vulkan) as 64-bit handles\n"
+    "// and leaves x4/x6 alone, so those are not written (their width is unmeasured).\n"
+    "// Refusing here stops a SpaceWarp title's frame loop after one frame.\n"
+    "unsigned long long kl_vulkan_aux_image(int kind, int stage, int eye, unsigned w,\n"
+    "                                       unsigned h, int vk_format, int layers);\n"
+    "static uint64_t klovrp_GetLayerTextureSpaceWarp(int layer_id, int stage, int eye,\n"
+    "                                                uint64_t *motion, void *motion_aux,\n"
+    "                                                uint64_t *depth, void *depth_aux) {\n"
+    "    ovrp_hit(\"ovrp_GetLayerTextureSpaceWarp\");\n"
+    "    if (!motion || !motion_aux || !depth || !depth_aux) return OVRP_FAIL_INVALID_PARAM;\n"
+    "    *motion = 0;\n"
+    "    *depth = 0;\n"
+    "    if ((unsigned)stage >= KLOVRP_MAX_STAGES || (unsigned)eye > 1)\n"
+    "        return OVRP_FAIL_INVALID_PARAM;\n"
+    "    struct klovrp_layer *l = klovrp_layer(layer_id);\n"
+    "    if (!l || !l->is_eye || !kl_vulkan_guest_active()) return OVRP_FAIL_UNSUPPORTED;\n"
+    "    int w = l->desc.mv_texture_size.w, h = l->desc.mv_texture_size.h;\n"
+    "    if (w < 1 || h < 1) return OVRP_FAIL_UNSUPPORTED;\n"
+    "    int layers = l->desc.layout == KLOVRP_LAYOUT_ARRAY ? 2 : 1;\n"
+    "    unsigned long long m = kl_vulkan_aux_image(0, stage, eye, (unsigned)w, (unsigned)h,\n"
+    "                                               97 /* R16G16B16A16_SFLOAT */, layers);\n"
+    "    unsigned long long dp = kl_vulkan_aux_image(1, stage, eye, (unsigned)w, (unsigned)h,\n"
+    "                                                130 /* D32_SFLOAT_S8_UINT */, layers);\n"
+    "    if (!m || !dp) return OVRP_FAIL_UNSUPPORTED;\n"
+    "    *motion = m;\n"
+    "    *depth = dp;\n"
+    "    static int said;\n"
+    "    if (!said++)\n"
+    "        fprintf(stderr, \"  [ovrp] GetLayerTextureSpaceWarp: layer %d stage %d -> motion %#llx, \"\n"
+    "                        \"depth %#llx (%dx%d, %d layer(s)); nothing consumes them\\n\",\n"
+    "                layer_id, stage, m, dp, w, h, layers);\n"
+    "    return OVRP_SUCCESS;\n"
+    "}\n")
+patch(O, old_fn, new_fn, "metavision: SpaceWarp textures served (step 38)")
+print("overlay: Application SpaceWarp layers get motion-vector storage")
+PYEOF
+
+# 39 — diagnostic: live large render targets on the Vulkan path. A title was
+# killed for memory a few seconds in while creating a full-size two-layer depth
+# target every frame; whether they are never destroyed or destroyed but still
+# backed is the question. Every large attachment image (1024x1024 or more) is
+# tracked from create to destroy, and the live count is logged as it grows.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/gfx/kl_vulkan.c"
+s = open(p).read()
+marker = "metavision: large render-target census"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,\n",
+        "// metavision: large render-target census (step 39) — diagnostic.\n"
+        "static pthread_mutex_t mv_rt_lock = PTHREAD_MUTEX_INITIALIZER;\n"
+        "static VkImage mv_rt[1024];\n"
+        "static unsigned mv_rt_live, mv_rt_made, mv_rt_gone, mv_rt_said;\n"
+        "static void mv_rt_add(VkImage img, const VkImageCreateInfo *ci) {\n"
+        "    if (!img || !ci || !(ci->usage & 0x30u)) return;   // colour or depth attachment\n"
+        "    if ((uint64_t)ci->extent.width * ci->extent.height < 1024u * 1024u) return;\n"
+        "    pthread_mutex_lock(&mv_rt_lock);\n"
+        "    for (unsigned i = 0; i < 1024; i++) if (!mv_rt[i]) { mv_rt[i] = img; break; }\n"
+        "    mv_rt_live++; mv_rt_made++;\n"
+        "    if (mv_rt_live > mv_rt_said + 7 || mv_rt_made <= 4) {\n"
+        "        mv_rt_said = mv_rt_live;\n"
+        "        fprintf(stderr, \"  [vk-rt] large render targets live %u (made %u, destroyed %u); last %ux%u fmt %d layers %u usage %#x\\n\",\n"
+        "                mv_rt_live, mv_rt_made, mv_rt_gone, ci->extent.width, ci->extent.height,\n"
+        "                (int)ci->format, ci->arrayLayers, ci->usage);\n"
+        "    }\n"
+        "    pthread_mutex_unlock(&mv_rt_lock);\n"
+        "}\n"
+        "static void mv_rt_del(VkImage img) {\n"
+        "    if (!img) return;\n"
+        "    pthread_mutex_lock(&mv_rt_lock);\n"
+        "    for (unsigned i = 0; i < 1024; i++) if (mv_rt[i] == img) { mv_rt[i] = 0; mv_rt_live--; mv_rt_gone++; break; }\n"
+        "    pthread_mutex_unlock(&mv_rt_lock);\n"
+        "}\n\n"
+        "static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInfo *ci,\n")
+    s = sub(s, "    if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);\n",
+               "    if (r == VK_SUCCESS && out) klvk_img_reg_add(*out);\n"
+               "    if (r == VK_SUCCESS && out) mv_rt_add(*out, ci);   // metavision (step 39)\n")
+    s = sub(s, "    klvk_img_reg_del(img);\n",
+               "    klvk_img_reg_del(img);\n    mv_rt_del(img);   // metavision (step 39)\n")
+    open(p, "w").write(s)
+print("overlay: Vulkan large render-target census (diagnostic)")
+PYEOF
