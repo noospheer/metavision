@@ -1334,3 +1334,69 @@ if "metavision: no adapter preference" not in s:
     open(p, "w").write(s)
     print("overlay: ovrp_GetDisplayAdapterId2 answers no adapter preference")
 PYEOF
+
+# 24 — Unity's boot.config gains vulkan-disable-secondary-commandbuffers=1.
+# Replaying a secondary command buffer whose draws begin a render pass faults
+# in MoltenVK (MVKRenderSubpass::populateMTLRenderPassDescriptor, a NULL
+# attachment); Unity records straight into primaries with this option, which
+# every Unity build in the archive reads. boot.config is read through both
+# asset doors (Java AssetManager.open and the NDK's AAssetManager_open), so both
+# serve a patched copy from the app's tmp folder. Harmless on GLES.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+rt = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+N = f"{rt}/guest/kl_ndk.c"
+patch(N, "static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {\n",
+      "// metavision: boot.config with the options metavision needs appended (step 24).\n"
+      "// Returns the patched copy's path, or `path` itself when it is not a boot.config.\n"
+      "const char *kl_mv_bootcfg(const char *path, char *buf, size_t cap);\n"
+      "const char *kl_mv_bootcfg(const char *path, char *buf, size_t cap) {\n"
+      "    static const char suffix[] = \"/bin/Data/boot.config\";\n"
+      "    size_t n = strlen(path), sl = sizeof suffix - 1;\n"
+      "    if (n < sl || strcmp(path + n - sl, suffix) != 0) return path;\n"
+      "    static const char *const add[] = { \"vulkan-disable-secondary-commandbuffers=1\" };\n"
+      "    FILE *in = fopen(path, \"rb\");\n"
+      "    if (!in) return path;\n"
+      "    char body[65536]; size_t len = fread(body, 1, sizeof body - 1, in); fclose(in);\n"
+      "    body[len] = 0;\n"
+      "    const char *tmp = getenv(\"TMPDIR\");\n"
+      "    snprintf(buf, cap, \"%s/mv-boot.config\", tmp && *tmp ? tmp : \"/tmp\");\n"
+      "    FILE *out = fopen(buf, \"wb\");\n"
+      "    if (!out) return path;\n"
+      "    fwrite(body, 1, len, out);\n"
+      "    if (len && body[len - 1] != '\\n') fputc('\\n', out);\n"
+      "    for (size_t i = 0; i < sizeof add / sizeof add[0]; i++) {\n"
+      "        size_t k = strcspn(add[i], \"=\");\n"
+      "        char key[96]; snprintf(key, sizeof key, \"%.*s=\", (int)k, add[i]);\n"
+      "        if (!strstr(body, key)) fprintf(out, \"%s\\n\", add[i]);\n"
+      "    }\n"
+      "    fclose(out);\n"
+      "    static int said;\n"
+      "    if (!said++) fprintf(stderr, \"  [mv] boot.config: vulkan-disable-secondary-commandbuffers=1\\n\");\n"
+      "    return buf;\n"
+      "}\n\n"
+      "static void *kl_AAssetManager_open(void *mgr, const char *fname, int mode) {\n",
+      "metavision: boot.config with the options")
+patch(N, "    snprintf(path, sizeof path, \"%s/%s\", g_asset_root, fname);\n    FILE *f = fopen(path, \"rb\");\n"
+         "    if (!f) f = kl_obbmap_fopen(path, \"rb\");",
+      "    snprintf(path, sizeof path, \"%s/%s\", g_asset_root, fname);\n"
+      "    char mvb[1200];   // metavision: boot.config (step 24)\n"
+      "    FILE *f = fopen(kl_mv_bootcfg(path, mvb, sizeof mvb), \"rb\");\n"
+      "    if (!f) f = kl_obbmap_fopen(path, \"rb\");", "metavision: boot.config (step 24)")
+S = f"{rt}/jni/kl_jni_services.c"
+patch(S, "    snprintf(path, sizeof path, \"%s/%s\", g_assets_dir, rel);\n    FILE *f = fopen(path, \"rb\");\n"
+         "    KLJ_LOG(\"AssetManager.open(",
+      "    snprintf(path, sizeof path, \"%s/%s\", g_assets_dir, rel);\n"
+      "    extern const char *kl_mv_bootcfg(const char *, char *, size_t);   // metavision: boot.config (step 24)\n"
+      "    char mvb[1200];\n"
+      "    FILE *f = fopen(kl_mv_bootcfg(path, mvb, sizeof mvb), \"rb\");\n"
+      "    KLJ_LOG(\"AssetManager.open(", "metavision: boot.config (step 24)")
+print("overlay: boot.config gains vulkan-disable-secondary-commandbuffers=1")
+PYEOF
