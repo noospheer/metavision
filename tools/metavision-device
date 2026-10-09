@@ -773,6 +773,14 @@ async def cmd_test(a):
                     key = todo[0]                 # popped once done: a drop re-runs it
                     v = await one(rsd, pc, afc, key)
                     todo.pop(0)
+                    if v["verdict"] == "asleep":
+                        # Backgrounded mid-run: the headset, not the title. Run it
+                        # again once the headset is drawing.
+                        state["items"][key] = {}
+                        todo.insert(0, key)
+                        save()
+                        await wait_awake(rsd, pc, afc, good or key)
+                        continue
                     if v["frames"] > 0:
                         good, dark = key, []
                     elif v["verdict"] == "black" and not v.get("iters"):

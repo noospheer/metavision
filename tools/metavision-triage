@@ -151,10 +151,14 @@ def verdict(d: Path, exited=None):
     _started, pics, ending, notes, serious = r
     # The compositor ticks whenever the app is in front of a wearer, picture
     # or not: no ticks at all is a headset asleep or off, not a black title.
-    iters = max((int(m.group(1)) for m in ITERS.finditer((d / "klepton-boot.log").read_text(errors="replace"))),
-                default=0)
+    log = (d / "klepton-boot.log").read_text(errors="replace")
+    iters = max((int(m.group(1)) for m in ITERS.finditer(log)), default=0)
     if ending.startswith(("crashed", "killed")):
         v = "crashed"
+    elif "backgrounded — exiting" in log:
+        # The app went behind something (the headset taken off, the Home view):
+        # a clean exit that says nothing about the title.
+        v, ending = "asleep", "sent to the background (headset off, or another app in front)"
     elif ending.startswith("stopped"):
         v = "stopped"
     elif exited is not None:
