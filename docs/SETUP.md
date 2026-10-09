@@ -264,6 +264,11 @@ title started (menus placed in the world) and from where the head now faces
 as well (`MV_AUTOPLAY_HEAD=0` holds it still): the pose the title sees looks
 around, turns right round once a minute, steps about and crouches.
 
+A pass is **hidden** by default: each title runs, is screenshotted and has its
+audio measured as usual, but nothing is drawn over passthrough and nothing is
+heard (`MV_HIDDEN=1`, `.mixed` immersion), so the headset can be worn for other
+things meanwhile. `--visible` shows and plays each title.
+
 Every run also saves **screenshots** of the eye the title drew, every 15 s
 (`MetavisionShots`), pulled beside the logs as `shot_NN.png`; triage reports
 **BLACK CONTENT** when every one is dark or a flat colour — frames presented

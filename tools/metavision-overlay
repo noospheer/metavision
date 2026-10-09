@@ -1641,3 +1641,43 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: window metrics (display bounds); empty MIDI device list")
 PYEOF
+
+# 30 — hidden test passes (MV_HIDDEN=1, MetavisionShots.hidden): the title runs,
+# is screenshotted and targeted and its audio level measured as usual, but the
+# compositor draws no eye, panels or loading skybox (the space is .mixed, so the
+# wearer sees the room) and the CoreAudio output is zeroed after the ring is
+# read. metavision-device test sets it by default (--visible to watch).
+python3 - "$K" <<'PYEOF'
+import sys
+k = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+C = f"{k}/visionos/Sources/KleptonCompositor.swift"
+patch(C, "            ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, 1)\n",
+         "            ? Self.cyclingClear() : MTLClearColorMake(0, 0, 0, MetavisionShots.hidden ? 0 : 1)   // metavision: hidden clear\n",
+         "metavision: hidden clear")
+patch(C, "            u.visible = alloc == nil ? 0 : 1\n",
+         "            u.visible = alloc == nil || MetavisionShots.hidden ? 0 : 1   // metavision: hidden eye\n",
+         "metavision: hidden eye")
+patch(C, "        guard overlaysEnabled, let pipe = overlayPipeline else { return 0 }\n",
+         "        guard overlaysEnabled, !MetavisionShots.hidden, let pipe = overlayPipeline else { return 0 }   // metavision: hidden panels\n",
+         "metavision: hidden panels")
+patch(C, "        } else if let tex = loadingVideoTexture() {\n",
+         "        } else if !MetavisionShots.hidden, let tex = loadingVideoTexture() {   // metavision: hidden skybox\n",
+         "metavision: hidden skybox")
+A = f"{k}/runtime/media/kl_audio.c"
+patch(A, "    atomic_fetch_add_explicit(&g_frames_played, take, memory_order_relaxed);\n    atomic_store_explicit(&g_r, r + take, memory_order_release);\n",
+         "    {   // metavision: hidden test pass — read the ring as usual, play nothing (step 30)\n"
+         "        static int mv_mute = -1;\n"
+         "        if (mv_mute < 0) { const char *h = getenv(\"MV_HIDDEN\"); mv_mute = h && strcmp(h, \"0\") != 0; }\n"
+         "        if (mv_mute) memset(dst, 0, want * g_out_ch * sizeof(float));\n"
+         "    }\n"
+         "    atomic_fetch_add_explicit(&g_frames_played, take, memory_order_relaxed);\n    atomic_store_explicit(&g_r, r + take, memory_order_release);\n",
+         "metavision: hidden test pass")
+print("overlay: hidden test passes (MV_HIDDEN=1): nothing shown or heard")
+PYEOF

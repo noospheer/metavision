@@ -697,6 +697,11 @@ async def cmd_test(a):
             before = set(await cr.ls("/", depth=1))
         env = {"MV_AUTOSTART": title, "MV_INPUT_MODE": "auto" if mode == "cycle" else mode,
                **dict(kv.split("=", 1) for kv in (a.env or []))}
+        if not a.visible:
+            # Out of the wearer's way: nothing drawn over passthrough, nothing
+            # heard; logs, screenshots and audio levels are taken as usual.
+            env.setdefault("MV_HIDDEN", "1")
+            env.setdefault("KL_FULL", "0")
         if not a.no_play:
             env["MV_AUTOPLAY"] = "1"
             if mode == "cycle":
@@ -1025,6 +1030,7 @@ def main():
     p.add_argument("--env", action="append", metavar="KEY=VALUE",
                    help="runtime switch for every run (repeatable), e.g. --env KL_GLES_VERSION=3.0")
     p.add_argument("--no-play", action="store_true", help="no scripted input: just open each title")
+    p.add_argument("--visible", action="store_true", help="show and play each title in the headset (default: hidden, so the wearer sees the room)")
     p.add_argument("--ddi", default="build/ddi"); p.add_argument("--bundle")
     p = sub.add_parser("register"); p.add_argument("--udid", required=True); p.add_argument("--name", default="Vision Pro")
     a = ap.parse_args()

@@ -16,6 +16,11 @@ import Metal
 enum MetavisionShots {
     static let enabled: Bool = getenv("MV_AUTOPLAY").map { String(cString: $0) == "1" } ?? false
         || getenv("MV_SHOTS") != nil
+    /// MV_HIDDEN=1 (the test pass's default): the title runs and is captured
+    /// as usual, but nothing is shown or heard — the compositor draws no eye
+    /// and no panels over passthrough, and the audio output is silenced — so
+    /// the headset can be worn for other things while a pass runs.
+    static let hidden: Bool = getenv("MV_HIDDEN").map { String(cString: $0) != "0" } ?? false
     private static let every: Double = 15
     private static let width = 768
     nonisolated(unsafe) private static var last: Double = 0
