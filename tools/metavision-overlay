@@ -999,3 +999,231 @@ if "metavision: Locale.toString" not in s:
     open(p, "w").write(s)
     print("overlay: Locale.toString")
 PYEOF
+
+# 17 — KL_GLES_VERSION=<major>.<minor>: the GLES level described to the guest
+# (default unchanged: Klepton's 3.2). Unity sets its compute/SSBO capability
+# from the level alone (ES 3.1+), never from GL_MAX_COMPUTE_* (the ES 3.0 ANGLE
+# context already answers those 0, and Unity runs compute anyway: "Internal-
+# Skinning.compute: Kernel at index (N) is invalid"), and on ES 3.1+ it takes
+# shader variants whose sampler units equal their explicit locations (units in
+# the hundreds: "Invalid texture unit!"). Describing 3.0 should make it fall
+# back cleanly — CPU skinning, VFX Graph unsupported, ES 3.0 variants. A switch
+# so a test pass can A/B it per title before any default changes.
+python3 - "$K/runtime/gfx/kl_egl.c" <<'PYEOF'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+if "metavision: KL_GLES_VERSION" not in s:
+    def rep(old, new):
+        global s
+        if s.count(old) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+        s = s.replace(old, new)
+    rep("void kl_egl_set_gles_version(int major, int minor) {\n"
+        "    g_es_major = major; g_es_minor = minor;\n}\n",
+        "static int mv_es_set;   // metavision: KL_GLES_VERSION — an explicit set wins\n"
+        "void kl_egl_set_gles_version(int major, int minor) {\n"
+        "    g_es_major = major; g_es_minor = minor; mv_es_set = 1;\n}\n"
+        "// Read lazily, after klepton.env and the launch environment are in place.\n"
+        "static void mv_es_env(void) {\n"
+        "    static int done;\n"
+        "    if (done || mv_es_set) return;\n"
+        "    done = 1;\n"
+        "    const char *v = getenv(\"KL_GLES_VERSION\");\n"
+        "    int ma, mi;\n"
+        "    if (v && sscanf(v, \"%d.%d\", &ma, &mi) == 2 && ma >= 2 && ma <= 3) {\n"
+        "        g_es_major = ma; g_es_minor = mi;\n"
+        "        fprintf(stderr, \"  [gl] GLES level described: %d.%d (KL_GLES_VERSION)\\n\", ma, mi);\n"
+        "    }\n"
+        "}\n")
+    rep("    case GL_VERSION:\n", "    case GL_VERSION:\n        mv_es_env();\n")
+    rep("    case GL_SHADING_LANGUAGE_VERSION:\n", "    case GL_SHADING_LANGUAGE_VERSION:\n        mv_es_env();\n")
+    rep("    if (pname == GL_MAJOR_VERSION) { params[0] = g_es_major; return 1; }\n",
+        "    mv_es_env();\n    if (pname == GL_MAJOR_VERSION) { params[0] = g_es_major; return 1; }\n")
+    rep("    case 0x821B /* MAJOR_VERSION */: data[0] = 3; return 1;\n"
+        "    case 0x821C /* MINOR_VERSION */: data[0] = 2; return 1;\n",
+        "    case 0x821B /* MAJOR_VERSION */: mv_es_env(); data[0] = g_es_major; return 1;\n"
+        "    case 0x821C /* MINOR_VERSION */: mv_es_env(); data[0] = g_es_minor; return 1;\n")
+    open(path, "w").write(s)
+    print("overlay: KL_GLES_VERSION switch")
+PYEOF
+
+# 18 — semaphores: re-initialising the same sem_t reuses its slot, and the table
+# holds 16384. Klepton backs bionic sem_t with a fixed slot table; a guest that
+# sem_init()s the same sem_t again without destroying it (legal in practice on
+# Linux, where sem_t is plain memory) burned a slot each time until sem_init
+# failed with ENOSPC — Unity: "Failed to open a semaphore (No space left on
+# device)", then a crash.
+python3 - "$K/runtime/libc/kl_pthread.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "metavision: sem owner" not in s:
+    def rep(a, b):
+        global s
+        if s.count(a) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {p}: {a[:50]!r}")
+        s = s.replace(a, b)
+    rep("#define KL_MAX_SEMS 1024\n", "#define KL_MAX_SEMS 16384   // metavision: sem owner — was 1024\n")
+    rep("                                    // rule in klb_sem_destroy\n} kl_sem;",
+        "                                    // rule in klb_sem_destroy\n"
+        "    int                 *owner;     // metavision: the sem_t it was initialised in\n} kl_sem;")
+    rep("int klb_sem_init(int *s, int pshared, unsigned value) {\n    (void)pshared;\n    int i = 0;\n",
+        "int klb_sem_destroy(int *s);\n"
+        "int klb_sem_init(int *s, int pshared, unsigned value) {\n    (void)pshared;\n"
+        "    // metavision: the same sem_t initialised again, no destroy between: reuse its slot\n"
+        "    { int prev = *s;\n"
+        "      if (prev > 0 && prev < KL_MAX_SEMS && g_sems[prev].d && g_sems[prev].owner == s) klb_sem_destroy(s); }\n"
+        "    int i = 0;\n")
+    rep("    g_sems[i].initial = (int)value;\n", "    g_sems[i].initial = (int)value;\n    g_sems[i].owner = s;\n")
+    open(p, "w").write(s)
+    print("overlay: semaphores — re-init reuses its slot, 16384 slots")
+PYEOF
+
+# 19 — statfs/truncate/symlink with the guest's /sdcard paths mapped. statfs
+# went to the host with the guest path (its sibling statvfs maps it), and
+# truncate/symlink were not shimmed at all, so Unity's cache could not reserve
+# space under /sdcard: "Unable to reserve header in the archive file", then
+# "Failed to decompress data for the AssetBundle" — every title that caches
+# downloaded AssetBundles or checks free space.
+python3 - "$K/runtime/libc" <<'PYEOF'
+import sys
+d = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:50]!r}")
+    open(path, "w").write(s.replace(old, new))
+L = f"{d}/kl_libc.c"
+patch(L, "int klb_statfs(const char *path, void *out) {\n    struct statfs d;\n    if (statfs(path, &d) != 0) return -1;\n",
+      "int klb_statfs(const char *path, void *out) {\n    struct statfs d;\n"
+      "    char kp[1024]; path = kl_guest_path(path, kp, sizeof kp);   // metavision: /sdcard paths\n"
+      "    if (statfs(path, &d) != 0) return -1;\n", "metavision: /sdcard paths")
+patch(L, "int klb_access(const char *path, int mode) {\n",
+      "// metavision: truncate/symlink with the guest's /sdcard paths mapped (the\n"
+      "// link's target is left as given: relative targets are the common case)\n"
+      "int klb_truncate(const char *path, long long len) { KL_GUEST_PATH(path); return truncate(_p, (off_t)len); }\n"
+      "int klb_symlink(const char *target, const char *path) { KL_GUEST_PATH(path); return symlink(target, _p); }\n\n"
+      "int klb_access(const char *path, int mode) {\n", "metavision: truncate/symlink")
+S = f"{d}/kl_shim.c"
+patch(S, "X(klb_statvfs) X(klb_fstatvfs) X(klb_sendfile)",
+      "X(klb_statvfs) X(klb_fstatvfs) X(klb_sendfile) X(klb_truncate) X(klb_symlink)", "X(klb_truncate)")
+patch(S, '    E("statvfs", klb_statvfs), E("fstatvfs", klb_fstatvfs),',
+      '    E("statvfs", klb_statvfs), E("fstatvfs", klb_fstatvfs),\n'
+      '    E("truncate", klb_truncate), E("symlink", klb_symlink),   // metavision: /sdcard paths',
+      'E("truncate", klb_truncate)')
+print("overlay: statfs/truncate/symlink map /sdcard paths")
+PYEOF
+
+# 20 — GL_EXT_texture_norm16, forwarded only when ANGLE itself offers it.
+# Klepton's curated extension string never names it, so Unity found no 16-bit
+# normalized render format ("Failed to create RenderTexture with RGBA16 UNorm").
+python3 - "$K/runtime/gfx" <<'PYEOF'
+import sys
+d = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:50]!r}")
+    open(path, "w").write(s.replace(old, new))
+G = f"{d}/kl_glfb.c"; E = f"{d}/kl_egl.c"
+patch(G, "int kl_glfb_init(void) {\n",
+      "static int g_mv_angle_norm16;   // metavision: norm16 (decl)\n"
+      "int kl_glfb_angle_has_norm16(void) { return g_mv_angle_norm16; }\n"
+      "int kl_glfb_init(void) {\n", "metavision: norm16 (decl)")
+patch(G, '                strstr(ext, "GL_EXT_color_buffer_half_float") ? "yes" : "NO");\n    }\n',
+      '                strstr(ext, "GL_EXT_color_buffer_half_float") ? "yes" : "NO");\n'
+      '        g_mv_angle_norm16 = strstr(ext, "GL_EXT_texture_norm16") != NULL;   // metavision: norm16\n'
+      '        fprintf(stderr, "  [glfb] EXT_texture_norm16=%s\\n", g_mv_angle_norm16 ? "yes" : "NO");\n'
+      '    }\n', "metavision: norm16\n")
+patch(E, "static int klgl_ext_count(void) {\n    if (g_es_major < 3) return 0;\n",
+      "int kl_glfb_angle_has_norm16(void);   // metavision: norm16 — forwarded only when ANGLE has it\n"
+      "static const char *klgl_ext_at(int i) {\n"
+      "    int base = (int)(sizeof g_gl_extensions / sizeof g_gl_extensions[0]) - 2;  // before the multiview pair\n"
+      "    int extra = kl_glfb_angle_has_norm16() ? 1 : 0;\n"
+      "    if (i < base) return g_gl_extensions[i];\n"
+      "    if (extra && i == base) return \"GL_EXT_texture_norm16\";\n"
+      "    return g_gl_extensions[base + (i - base - extra)];\n"
+      "}\n"
+      "static int klgl_ext_count(void) {\n    if (g_es_major < 3) return 0;\n", "metavision: norm16 — forwarded")
+patch(E, "    if (!klgl_want_multiview()) n -= 2;\n    return n;\n",
+      "    if (!klgl_want_multiview()) n -= 2;\n"
+      "    return n + (kl_glfb_angle_has_norm16() ? 1 : 0);   // metavision: norm16 count\n", "metavision: norm16 count")
+patch(E, "    static char ver[64], glsl[64], exts[256];\n",
+      "    static char ver[64], glsl[64], exts[512];   // metavision: room for forwarded extensions\n",
+      "metavision: room for forwarded")
+patch(E, "            strlcat(exts, g_gl_extensions[i], sizeof exts);\n",
+      "            strlcat(exts, klgl_ext_at(i), sizeof exts);   // metavision: norm16 string\n", "metavision: norm16 string")
+patch(E, "        return g_gl_extensions[index];\n",
+      "        return klgl_ext_at((int)index);   // metavision: norm16 stringi\n", "metavision: norm16 stringi")
+print("overlay: GL_EXT_texture_norm16 when ANGLE offers it")
+PYEOF
+
+# 21 — compute shaders in Unreal titles: a no-op stand-in so the program links.
+# ANGLE's context is ES 3.0 (no compute); Unreal enables compute from the ES
+# level and treats a failed compute link as fatal (FailedComputeProgramLink),
+# then crashes. A compute shader becomes a trivial vertex shader that brings a
+# trivial fragment shader when attached, so the program links and dispatches do
+# nothing (GPU-compute effects are missing). Unreal only: Unity falls back from
+# an invalid kernel, and a "valid" one writing nothing would be worse there.
+python3 - "$K/runtime/gfx/kl_glfb.c" <<'PYEOF'
+import sys
+G = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:50]!r}")
+    open(path, "w").write(s.replace(old, new))
+patch(G, "static void klfb_ShaderSource(uint32_t shader, int32_t count,\n",
+      "// metavision: compute stand-in for Unreal (see tools/metavision-overlay step 21)\n"
+      "static uint32_t g_mv_fake_cs[512]; static unsigned g_mv_nfake;\n"
+      "static int mv_is_fake_cs(uint32_t s) {\n"
+      "    for (unsigned i = 0; i < g_mv_nfake; i++) if (g_mv_fake_cs[i] == s) return 1;\n"
+      "    return 0;\n"
+      "}\n"
+      "static void klfb_ShaderSource(uint32_t shader, int32_t count,\n", "metavision: compute stand-in for Unreal")
+patch(G, "                              const char *const *strings, const int32_t *lengths) {\n    if (strings && count > 0) {\n",
+      "                              const char *const *strings, const int32_t *lengths) {\n"
+      "    if (mv_is_fake_cs(shader) && g_real_ShaderSource) {   // metavision: compute stand-in source\n"
+      "        static const char *vs = \"#version 300 es\\nvoid main() { gl_Position = vec4(0.0); }\\n\";\n"
+      "        g_real_ShaderSource(shader, 1, &vs, NULL);\n"
+      "        return;\n"
+      "    }\n"
+      "    if (strings && count > 0) {\n", "metavision: compute stand-in source")
+patch(G, "    kl_glfb_make_current();\n    uint32_t name = g_real_CreateShader ? g_real_CreateShader(type) : 0;\n",
+      "    kl_glfb_make_current();\n"
+      "    if (type == 0x91B9 /* COMPUTE_SHADER */ && (kl_find_image(\"libUE4.so\") || kl_find_image(\"libUnreal.so\"))) {\n"
+      "        uint32_t cs = g_real_CreateShader ? g_real_CreateShader(0x8B31 /* VERTEX */) : 0;   // metavision: compute stand-in create\n"
+      "        if (cs && g_mv_nfake < 512) g_mv_fake_cs[g_mv_nfake++] = cs;\n"
+      "        static int said;\n"
+      "        if (!said++) fprintf(stderr, \"  [glfb] compute shader on ES 3.0: no-op stand-in so the program links (dispatches do nothing)\\n\");\n"
+      "        return cs;\n"
+      "    }\n"
+      "    uint32_t name = g_real_CreateShader ? g_real_CreateShader(type) : 0;\n", "metavision: compute stand-in create")
+patch(G, "static void (*g_real_DeleteShader)(uint32_t);\n",
+      "static void (*g_real_AttachShader)(uint32_t, uint32_t);   // metavision: compute stand-in attach\n"
+      "static void klfb_AttachShader(uint32_t prog, uint32_t sh) {\n"
+      "    if (g_real_AttachShader) g_real_AttachShader(prog, sh);\n"
+      "    if (!mv_is_fake_cs(sh) || !g_real_CreateShader || !g_real_ShaderSource || !g_real_CompileShader) return;\n"
+      "    static uint32_t fs;\n"
+      "    if (!fs) {\n"
+      "        static const char *src = \"#version 300 es\\nprecision mediump float;\\nout vec4 o;\\nvoid main() { o = vec4(0.0); }\\n\";\n"
+      "        fs = g_real_CreateShader(0x8B30 /* FRAGMENT */);\n"
+      "        g_real_ShaderSource(fs, 1, &src, NULL);\n"
+      "        g_real_CompileShader(fs);\n"
+      "    }\n"
+      "    if (fs && g_real_AttachShader) g_real_AttachShader(prog, fs);\n"
+      "}\n"
+      "static void (*g_real_DeleteShader)(uint32_t);\n", "metavision: compute stand-in attach")
+patch(G, '    {"glCreateShader",  (void *)klfb_CreateShader,  (void **)&g_real_CreateShader},\n',
+      '    {"glCreateShader",  (void *)klfb_CreateShader,  (void **)&g_real_CreateShader},\n'
+      '    {"glAttachShader",  (void *)klfb_AttachShader,  (void **)&g_real_AttachShader},   // metavision: compute stand-in (thunk)\n',
+      "metavision: compute stand-in (thunk)")
+print("overlay: compute stand-in for Unreal titles")
+PYEOF

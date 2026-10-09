@@ -23,6 +23,13 @@ that will not start, and what is still open.
 | **ELF TLS** (`R_AARCH64_TLSDESC`, relocation 1031) — libraries built for API 29+ | `translated dylib present but failed to load: unhandled relocation type 1031` (Meta Interaction SDK, Meta body tracking, …) | a TLS-descriptor resolver: each thread's own copy of the library's TLS block, from `PT_TLS`, offset from the thread pointer the guest reads | overlay step 14 |
 | `libandroid.so` opened by name | `could not load libandroid.so` (Unreal, Unity probes) | a handle whose symbols are Klepton's own NDK functions | `shims/mv_shims.c` |
 | Klepton presents **Android 10 (API 29)**; Unity 2022.3 accepts a Vulkan driver from a vendor it does not know (Apple, through MoltenVK) only from API 30 | Vulkan titles fall back to a GLES2 context: `Desired shader compiler platform 5 is not available in shader blob`, missing or broken rendering (every Unity 2022.3 + Oculus XR title) | present Android 12L (API 32), what a Quest on current firmware reports — Java `Build.VERSION`, the `ro.build.version.sdk` property and NativeActivity agree | overlay step 15 |
+| `Locale.toString()` unbound | `strlen(NULL)` at start | Java's `lang_COUNTRY` form | overlay step 16 |
+| semaphore slots: re-`sem_init` of the same `sem_t` burned a slot each time (1024 total) | `Failed to open a semaphore (No space left on device)`, then a crash | the same `sem_t` reuses its slot; 16384 slots | overlay step 18 |
+| `statfs` / `truncate` / `symlink` saw the guest's `/sdcard` paths unmapped | `Unable to reserve header in the archive file`, `Failed to decompress data for the AssetBundle` | map them like their siblings | overlay step 19 |
+| `GL_EXT_texture_norm16` never advertised | `Failed to create RenderTexture with RGBA16 UNorm` | forwarded when ANGLE offers it | overlay step 20 |
+| compute shaders in **Unreal** titles (ANGLE is ES 3.0) | `glLinkProgram FAILED — No compiled shaders` (`FailedComputeProgramLink`), then a crash | a no-op stand-in so the program links; GPU-compute effects are missing | overlay step 21 |
+| OpenXR action states (`ovrp_GetActionState*`) an SDK helper defines (stylus profiles) | `Error getting action name` every frame | success + inactive value, as a Quest with no such device answers | `shims/mv_shims.c` |
+| Meta XR Audio's plugin: refused by Klepton (it trips visionOS AMFI) | `DllNotFoundException: MetaXRAudioUnity` every frame | a stand-in answering 0 everywhere: audio plays unspatialised | `shims/mv_shims.c` |
 | the launcher did not carry **MoltenVK** | every Vulkan title black: `MoltenVK is not vendored` | the launcher build wraps it like ANGLE | `tools/metavision-launcher` |
 | a hand-launched app has no environment, and every Klepton diagnostic is an environment switch | — | `Documents/klepton.env`, read before configure | `tools/metavision-overlay`, `metavision-device env` |
 
@@ -90,8 +97,28 @@ OVRPlugin call in order — the step where a title stops is the last one.
 - **Squashed picture** in at least one title: frames render, the
   view looks compressed. Under test: foveated rendering (`KL_VRR=0`), then a
   unified eye frustum (`KL_OVRP_UNIFY_FRUSTUM=1`).
-- **The boot window stays open** beside the immersive scene after a title
-  starts. Harmless; the launcher should hide it once a title is drawing.
+- **The GLES level Unity is told.** Klepton describes ES 3.2 (ANGLE is 3.0), so
+  Unity picks ES 3.1+ shader variants — SSBO instancing (`'std430' : invalid
+  layout qualifier`), sampler units equal to explicit locations (units in the
+  hundreds: `Invalid texture unit!` even with the cap raised) — and compute.
+  `KL_GLES_VERSION=3.0` (overlay step 17) describes 3.0 instead; it is a
+  switch until a test pass (`test --env KL_GLES_VERSION=3.0`) shows which
+  titles are better for it.
+- **`GL_INVALID_FRAMEBUFFER_OPERATION` once a frame** in GLES Unity titles,
+  reported by Unity's native-plugin GL check, on the eye-texture framebuffer.
+  Next: a run with `KL_GLFB_ERRSCAN=0x506 KL_TRACE_FBO=1` names the call.
+- **Video into a texture.** Unity's VideoPlayer renders through a
+  `SurfaceTexture`, which Klepton does not have (a flat video app waits
+  forever: `AndroidVideoMedia surface creation stalled`), and MediaCodec in
+  byte-buffer mode (no surface) returns no output. Both are media work in
+  Klepton's `kl_mediandk.c`.
+- **Microphone.** Klepton's guest microphone is off by default (`KL_MIC=1`
+  turns it on), and `AudioManager.getDevices` lists no input, so a title that
+  takes `Microphone.devices[0]` throws every frame.
+- **Hand tracking in OpenXR titles.** metavision's hands reach titles through
+  OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
+- **Memory growth on the Vulkan path** in at least one title (killed within
+  seconds; `test` now keeps the jetsam report and triage names it).
 - **Unreal titles** (3 in the archive) are untested past build.
 - **Dwell Control inside an immersive title** is untested (see ACCESSIBILITY.md).
 - Titles whose code is 32-bit only, Flutter, Quill's own engine or Unreal 5 are

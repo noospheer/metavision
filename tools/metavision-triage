@@ -158,7 +158,7 @@ def verdict(d: Path, exited=None):
     else:
         v = "pass"
     summary = f"{pics} frames, {ending}"
-    first = [n for n in notes if n.startswith(("could not load", "Unity error"))][:1]
+    first = [n for n in notes if n.startswith(("SILENT", "could not load", "Unity error"))][:1]
     if first:
         summary += "; " + first[0]
     return {"verdict": v, "summary": summary, "frames": pics, "iters": iters}

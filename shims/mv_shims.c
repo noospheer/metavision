@@ -325,9 +325,20 @@ static const char *base_name(const char *p) {
 // those functions to every image already; the handle just makes dlsym find
 // them, where a plain dlopen looks for the file among the title's libraries.
 static char g_ndk_handle;
+
+// Meta XR Audio's native plugin: Klepton refuses it by name (it patches its own
+// code pages, which visionOS kills a process for), so every P/Invoke into it
+// threw DllNotFoundException each frame. A stand-in whose every entry point
+// answers 0 — ovrAudio's success, no effect definitions, NULL handles — leaves
+// audio unspatialised instead of throwing.
+static char g_zero_handle;
+static const char *const k_zero_libs[] = { "MetaXRAudioUnity", "libMetaXRAudioUnity.so" };
+static long mv_zero(void) { return 0; }
 static const char *const k_ndk_libs[] = { "libandroid.so", "libnativewindow.so" };
 
 static void *mv_dlopen(const char *path, int flags) {
+    for (size_t i = 0; path && i < sizeof k_zero_libs / sizeof k_zero_libs[0]; i++)
+        if (strcmp(base_name(path), k_zero_libs[i]) == 0) return &g_zero_handle;
     for (size_t i = 0; path && i < sizeof k_ndk_libs / sizeof k_ndk_libs[0]; i++)
         if (strcmp(base_name(path), k_ndk_libs[i]) == 0) return &g_ndk_handle;
     if (path && strcmp(base_name(path), "libossdk.oculus.so") == 0) {
@@ -381,13 +392,38 @@ static int32_t mv_ovrp_dominant_hand(int32_t *out) {
     return OVRP_SUCCESS;
 }
 
+// OpenXR actions an SDK helper defines on its own (a stylus profile, …): with
+// no such device bound, OVRPlugin answers success and an inactive value — a
+// false button, a zero axis, an identity pose — and that is what is true here.
+// Signatures per OVRPlugin's C#: (string actionName, ref/out value), and
+// GetActionStatePose2 adds a Hand before the out-param. Posef is {qx,qy,qz,qw,px,py,pz}.
+static int32_t mv_ovrp_action_bool(const char *n, int32_t *out) { (void)n; if (out) *out = 0; return 0; }
+static int32_t mv_ovrp_action_float(const char *n, float *out) { (void)n; if (out) *out = 0; return 0; }
+static int32_t mv_ovrp_action_vec2(const char *n, float *out) { (void)n; if (out) out[0] = out[1] = 0; return 0; }
+static int32_t mv_ovrp_action_pose(const char *n, float *pose) {
+    (void)n;
+    if (pose) { memset(pose, 0, 7 * sizeof *pose); pose[3] = 1; }
+    return 0;
+}
+static int32_t mv_ovrp_action_pose2(const char *n, int32_t hand, float *pose) {
+    (void)hand;
+    return mv_ovrp_action_pose(n, pose);
+}
+
 static const struct { const char *name; void *fn; } k_ovrp_answers[] = {
-    { "ovrp_GetDominantHand", (void *)mv_ovrp_dominant_hand },
+    { "ovrp_GetDominantHand",       (void *)mv_ovrp_dominant_hand },
+    { "ovrp_GetActionStateBoolean", (void *)mv_ovrp_action_bool },
+    { "ovrp_GetActionStateFloat",   (void *)mv_ovrp_action_float },
+    { "ovrp_GetActionStateVector2", (void *)mv_ovrp_action_vec2 },
+    { "ovrp_GetActionStatePose",    (void *)mv_ovrp_action_pose },
+    { "ovrp_GetActionStatePose2",   (void *)mv_ovrp_action_pose2 },
 };
 
 static void *mv_dlsym(void *handle, const char *name) {
     if (handle == &g_ossdk_handle)
         return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
+    if (handle == &g_zero_handle)
+        return (void *)mv_zero;                      // Meta XR Audio stand-in: 0 everywhere
     if (handle == &g_ndk_handle)
         return name ? kl_shim_lookup(name) : NULL;   // Klepton's NDK functions, or NULL
     if (name && kl_ovrp_is_handle(handle)) {

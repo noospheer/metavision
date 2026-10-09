@@ -158,6 +158,11 @@ int main(void) {
     void *ndk = dlo("/system/lib64/libandroid.so", 0);
     assert(ndk && ndk != (void *)0x1234 && g_real_dlopen_calls == before + 1);
     assert(dls(ndk, "ptrace") == kl_shim_lookup("ptrace"));
+    // Meta XR Audio stand-in: never reaches klb_dlopen; every symbol answers 0
+    void *mxa = dlo("/data/app/x/lib/arm64/libMetaXRAudioUnity.so", 0);
+    assert(mxa && g_real_dlopen_calls == before + 1);
+    long (*z)(void) = (long (*)(void))dls(mxa, "ovrAudio_CreateContext");
+    assert(z && z() == 0);
 
     // OVRPlugin capability questions answer "no" through the plugin handle only
     int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetBodyTrackingEnabled");
@@ -165,6 +170,12 @@ int main(void) {
     test_hands(dls);
     int32_t (*dh)(int32_t *) = (int32_t (*)(int32_t *))dls(&g_fake_ovrp, "ovrp_GetDominantHand");
     int32_t hand = 0; assert(dh(&hand) == 0 && hand == 2);
+    // action states: success, inactive
+    int32_t (*ab)(const char *, int32_t *) = (int32_t (*)(const char *, int32_t *))dls(&g_fake_ovrp, "ovrp_GetActionStateBoolean");
+    int32_t on = 1; assert(ab("tip", &on) == 0 && on == 0);
+    int32_t (*ap2)(const char *, int32_t, float *) = (int32_t (*)(const char *, int32_t, float *))dls(&g_fake_ovrp, "ovrp_GetActionStatePose2");
+    float pose[7] = { 9, 9, 9, 9, 9, 9, 9 };
+    assert(ap2("aim_left", 0, pose) == 0 && pose[3] == 1 && pose[0] == 0 && pose[6] == 0);
     assert(dls(&g_fake_ovrp, "ovrp_GetNodePoseState3") == (void *)0x9abc);   // Klepton's own: untouched
     assert(dls((void *)0x1234, "ovrp_GetHandTrackingEnabled") == (void *)0x9abc);
 
