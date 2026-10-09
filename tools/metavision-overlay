@@ -973,3 +973,29 @@ patch(f"{rt}/guest/kl_nativeactivity.c", "    g_act.sdkVersion       = 29;\n",
       "    g_act.sdkVersion       = 32;   // metavision: Android 12L\n", "metavision: Android 12L")
 print("overlay: Android 12L (API 32)")
 PYEOF
+
+# 16 — Locale.toString(): Java's lang_COUNTRY form. Klepton binds the Locale
+# getters but not toString, so a title building a locale string got null and
+# Unity ran strlen(NULL) at start.
+python3 - "$K/runtime/jni/kl_jni_services.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "metavision: Locale.toString" not in s:
+    a = 'static klj_val klj_Locale_getDefault(void *env, void *self, const klj_val *a, int n) {\n'
+    b = '    {"java/util/Locale", "toLanguageTag", "()Ljava/lang/String;", klj_Locale_toLanguageTag},\n'
+    if s.count(a) != 1 or s.count(b) != 1:
+        sys.exit("overlay: Locale anchors moved upstream")
+    s = s.replace(a,
+        "// metavision: Locale.toString — Java's lang_COUNTRY form.\n"
+        "static klj_val mv_Locale_toString(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)self; (void)a; (void)n;\n"
+        "    char lang[16], country[16], out[40];\n"
+        "    klj_locale_parts(lang, sizeof lang, country, sizeof country);\n"
+        "    snprintf(out, sizeof out, country[0] ? \"%s_%s\" : \"%s\", lang, country);\n"
+        "    return (klj_val){.l = kl_jni_new_string(out)};\n"
+        "}\n\n" + a, 1)
+    s = s.replace(b, b + '    {"java/util/Locale", "toString", "()Ljava/lang/String;", mv_Locale_toString},   // metavision: Locale.toString\n', 1)
+    open(p, "w").write(s)
+    print("overlay: Locale.toString")
+PYEOF

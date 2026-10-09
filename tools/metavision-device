@@ -731,7 +731,7 @@ async def cmd_test(a):
             except Exception:
                 pass
             for n in sorted(set(await cr.ls("/", depth=1)) - before):
-                if n.endswith(".ips") and ("metavision" in n.lower() or "klepton" in n.lower()):
+                if n.endswith(".ips") and any(k in n.lower() for k in ("metavision", "klepton", "jetsam")):
                     (out / posixpath.basename(n)).write_bytes(await cr.afc.get_file_contents(n))
                     got.append(posixpath.basename(n))
         v = triage.verdict(out, exited=exited)

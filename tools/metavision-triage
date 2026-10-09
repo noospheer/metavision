@@ -107,7 +107,10 @@ def triage(d: Path):
             bug = json.loads(ips.read_text(errors="replace").split("\n", 1)[0]).get("bug_type")
         except Exception:
             bug = None
-        if bug in ("309", "109", None):           # a crash (or unreadable: assume one)
+        if bug == "298":                          # JetsamEvent: the system reclaimed memory
+            if "metavision" in ips.read_text(errors="replace"):
+                ending = f"killed: out of memory (jetsam, {ips.name})"
+        elif bug in ("309", "109", None):         # a crash (or unreadable: assume one)
             ending = "crashed: " + ips_summary(ips)
         else:                                     # 202 cpu_resource and co.: a diagnostic
             notes.append(f"system diagnostic report ({bug}): {ips.name.split('-')[0]}")
@@ -142,7 +145,7 @@ def verdict(d: Path, exited=None):
     # or not: no ticks at all is a headset asleep or off, not a black title.
     iters = max((int(m.group(1)) for m in ITERS.finditer((d / "klepton-boot.log").read_text(errors="replace"))),
                 default=0)
-    if ending.startswith("crashed"):
+    if ending.startswith(("crashed", "killed")):
         v = "crashed"
     elif ending.startswith("stopped"):
         v = "stopped"
