@@ -154,6 +154,10 @@ int main(void) {
     assert(again && ((void **)again[0])[5] != NULL);  // and its methods are callable too
     assert(dlo("/system/lib64/libfoo.so", 0) == (void *)0x1234 && g_real_dlopen_calls == before + 1);
     assert(dls((void *)0x1234, "x") == (void *)0x9abc);
+    // libandroid.so by name: a handle whose symbols are Klepton's own NDK functions
+    void *ndk = dlo("/system/lib64/libandroid.so", 0);
+    assert(ndk && ndk != (void *)0x1234 && g_real_dlopen_calls == before + 1);
+    assert(dls(ndk, "ptrace") == kl_shim_lookup("ptrace"));
 
     // OVRPlugin capability questions answer "no" through the plugin handle only
     int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetBodyTrackingEnabled");

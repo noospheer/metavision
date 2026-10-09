@@ -320,7 +320,16 @@ static const char *base_name(const char *p) {
     return b ? b + 1 : p;
 }
 
+// Android's own NDK libraries, opened by name rather than linked (Unreal and
+// Unity probe libandroid.so for ANativeWindow_* and friends). Klepton serves
+// those functions to every image already; the handle just makes dlsym find
+// them, where a plain dlopen looks for the file among the title's libraries.
+static char g_ndk_handle;
+static const char *const k_ndk_libs[] = { "libandroid.so", "libnativewindow.so" };
+
 static void *mv_dlopen(const char *path, int flags) {
+    for (size_t i = 0; path && i < sizeof k_ndk_libs / sizeof k_ndk_libs[0]; i++)
+        if (strcmp(base_name(path), k_ndk_libs[i]) == 0) return &g_ndk_handle;
     if (path && strcmp(base_name(path), "libossdk.oculus.so") == 0) {
         static int said;
         if (!said++) fprintf(stderr, "  [mv-shim] %s -> stand-in (Quest OS telemetry; nothing is sent)\n", path);
@@ -379,6 +388,8 @@ static const struct { const char *name; void *fn; } k_ovrp_answers[] = {
 static void *mv_dlsym(void *handle, const char *name) {
     if (handle == &g_ossdk_handle)
         return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
+    if (handle == &g_ndk_handle)
+        return name ? kl_shim_lookup(name) : NULL;   // Klepton's NDK functions, or NULL
     if (name && kl_ovrp_is_handle(handle)) {
         void *h = mv_hands_ovrp(name);   // hand tracking: mv_hands.c
         if (h) return h;
