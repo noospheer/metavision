@@ -116,13 +116,24 @@ def triage(d: Path):
         except Exception:
             bug = None
         if bug == "298":                          # JetsamEvent: the system reclaimed memory
-            if "metavision" in ips.read_text(errors="replace"):
+            # Only when it killed THIS run: a report pulled alongside can be an
+            # earlier process's, so match the pid the log was written by.
+            pid = (re.search(r"metavision\[(\d+):", text) or [None, None])[1]
+            try:
+                procs = json.loads(ips.read_text(errors="replace").split("\n", 1)[1]).get("processes", [])
+            except Exception:
+                procs = []
+            if any(p.get("name") == "metavision" and (pid is None or str(p.get("pid")) == pid)
+                   and p.get("reason") for p in procs):
                 ending = f"killed: out of memory (jetsam, {ips.name})"
         elif bug in ("309", "109", None):         # a crash (or unreadable: assume one)
             ending = "crashed: " + ips_summary(ips)
         else:                                     # 202 cpu_resource and co.: a diagnostic
             notes.append(f"system diagnostic report ({bug}): {ips.name.split('-')[0]}")
     serious = sum(n for k, n in errs.items() if SERIOUS.search(k))
+    top = max(((n, k) for k, n in errs.items() if SERIOUS.search(k)), default=None)
+    if top:   # the error that decides an ERRORS verdict, named first
+        notes.insert(0, f"serious x{top[0]}: {top[1][:140]}")
     return started, pics, ending, notes, serious
 
 
@@ -165,12 +176,18 @@ def verdict(d: Path, exited=None):
         v, ending = "crashed", f"exited by itself after {exited} s"
     elif pics == 0 or any(n.startswith("BLACK CONTENT") for n in notes):
         v = "black"
-    elif serious or any(n.startswith(("could not load", "SILENT")) for n in notes):
+    elif serious or any(n.startswith("could not load") for n in notes):
         v = "errors"
+    elif any(n.startswith("SILENT") for n in notes):
+        v = "silent"   # drew, no serious error, but never made a sound
     else:
         v = "pass"
     summary = f"{pics} frames, {ending}"
-    first = [n for n in notes if n.startswith(("BLACK CONTENT", "SILENT", "could not load", "Unity error"))][:1]
+    # The note that decided the verdict comes first in the summary.
+    lead = {"errors": ("serious", "could not load"), "silent": ("SILENT",),
+            "black": ("BLACK CONTENT",)}.get(v, ())
+    first = [n for n in notes if lead and n.startswith(lead)][:1] or \
+            [n for n in notes if n.startswith(("BLACK CONTENT", "SILENT", "could not load", "Unity error"))][:1]
     if first:
         summary += "; " + first[0]
     return {"verdict": v, "summary": summary, "frames": pics, "iters": iters}

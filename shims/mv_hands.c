@@ -131,6 +131,16 @@ void mv_hands_set_enabled(int on) {
     pthread_mutex_unlock(&g_lock);
 }
 
+// Whether the headset sees this hand now (and hand tracking is on): what the
+// OVRPlugin controller state reports as a connected hand for a hands-only title.
+int mv_hands_tracked(int hand) {
+    if (hand < 0 || hand > 1) return 0;
+    pthread_mutex_lock(&g_lock);
+    int t = g_enabled && g_hand[hand].tracked;
+    pthread_mutex_unlock(&g_lock);
+    return t;
+}
+
 void mv_hands_publish(int hand, int tracked, const float *model, const float *root,
                       const float *pointer, const float *pinch, double time_s) {
     if (hand < 0 || hand > 1) return;
