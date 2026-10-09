@@ -33,7 +33,8 @@ UNITY_E = re.compile(r"^E/Unity: (.*)", re.M)
 HANDS = "[mv-hands] the title reads hand state"
 # Errors that mean something visibly does not work, not just noise.
 SERIOUS = re.compile(r"Exception|GLSL compilation failed|Kernel at index|Shader error|"
-                     r"Failed to (create|compile|load)|is not supported", re.I)
+                     r"Failed to (create|compile|load)|is not supported|shader compiler platform", re.I)
+AUDIO = re.compile(r"guest PCM so far: peak (\d+)/")
 
 
 RUNTIME_LIBS = {"libvulkan.so", "libvulkan.so.1", "libEGL.so", "libGLESv2.so", "libGLESv3.so", "libOpenSLES.so",
@@ -83,6 +84,9 @@ def triage(d: Path):
         errs[k] = errs.get(k, 0) + 1
     for k, n in sorted(errs.items(), key=lambda kv: -kv[1])[:3]:
         notes.append(f"Unity error x{n}: {k}")
+    peaks = [int(m.group(1)) for m in AUDIO.finditer(text)]
+    if peaks and max(peaks) == 0:
+        notes.append("SILENT: the title produced no sound (audio peak 0)")
     if HANDS in text:
         notes.append("uses hand tracking")
     said = len(re.findall(r'\[mv-autoplay\][^\n]* say "', text))
@@ -146,7 +150,7 @@ def verdict(d: Path, exited=None):
         v, ending = "crashed", f"exited by itself after {exited} s"
     elif pics == 0:
         v = "black"
-    elif serious or any(n.startswith("could not load") for n in notes):
+    elif serious or any(n.startswith(("could not load", "SILENT")) for n in notes):
         v = "errors"
     else:
         v = "pass"
