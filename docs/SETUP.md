@@ -337,6 +337,20 @@ results (logs, screenshots, verdicts) come back encrypted with the guest key.
 cannot show memory limits, GPU speed or the real eye, hand and microphone
 hardware — the headset pass stays the last word on those.
 
+**Its GPU is not the headset's, and rendering diverges.** Measured on the
+`macos-26` runner (visionOS 26.5 simulator):
+
+- Vulkan titles (MoltenVK): the simulator's Metal refuses draws with a non-zero
+  base vertex and layered (both-eye) attachments, so every draw fails and the
+  eye stays black. Argument buffers abort outright, so `metavision-sim` runs
+  MoltenVK without them (`MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`).
+- GLES titles (ANGLE): compressed texture uploads take a simulator-only path
+  that has crashed reading past its source.
+
+So the simulator pass answers *does it boot, load, link and reach its render
+loop* — JNI, loader, files, audio, input, crashes before the first frame — and
+the headset answers *does it look right*.
+
 ### One app for every title: the metavision launcher
 
 ```bash
