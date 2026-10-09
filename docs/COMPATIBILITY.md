@@ -30,6 +30,7 @@ that will not start, and what is still open.
 | compute shaders in **Unreal** titles (ANGLE is ES 3.0) | `glLinkProgram FAILED — No compiled shaders` (`FailedComputeProgramLink`), then a crash | a no-op stand-in so the program links; GPU-compute effects are missing | overlay step 21 |
 | OpenXR action states (`ovrp_GetActionState*`) an SDK helper defines (stylus profiles) | `Error getting action name` every frame | success + inactive value, as a Quest with no such device answers | `shims/mv_shims.c` |
 | Meta XR Audio's plugin: refused by Klepton (it trips visionOS AMFI) | `DllNotFoundException: MetaXRAudioUnity` every frame | a stand-in answering 0 everywhere: audio plays unspatialised | `shims/mv_shims.c` |
+| the guest **microphone** was off for every title, and `AudioManager.getDevices` listed no input | a title taking `Microphone.devices[0]` throws every frame; voice features hear nothing | the launcher arms the microphone for titles whose manifest asks for `RECORD_AUDIO` (off for the rest, set on every pick), and the device list shows one built-in mic while it is armed; hands-free voice keeps its input either way | overlay step 22 |
 | the launcher did not carry **MoltenVK** | every Vulkan title black: `MoltenVK is not vendored` | the launcher build wraps it like ANGLE | `tools/metavision-launcher` |
 | a hand-launched app has no environment, and every Klepton diagnostic is an environment switch | — | `Documents/klepton.env`, read before configure | `tools/metavision-overlay`, `metavision-device env` |
 
@@ -112,9 +113,6 @@ OVRPlugin call in order — the step where a title stops is the last one.
   forever: `AndroidVideoMedia surface creation stalled`), and MediaCodec in
   byte-buffer mode (no surface) returns no output. Both are media work in
   Klepton's `kl_mediandk.c`.
-- **Microphone.** Klepton's guest microphone is off by default (`KL_MIC=1`
-  turns it on), and `AudioManager.getDevices` lists no input, so a title that
-  takes `Microphone.devices[0]` throws every frame.
 - **Hand tracking in OpenXR titles.** metavision's hands reach titles through
   OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
 - **Memory growth on the Vulkan path** in at least one title (killed within

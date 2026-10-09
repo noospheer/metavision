@@ -110,3 +110,9 @@ build time; `tools/metavision-overlay` wires it into `KleptonControllers.swift`
 (the merge of hands and Sense controllers into synthetic Touch controllers)
 and lets the audio session record when voice is on, the same way Klepton's own
 microphone toggle does. Nothing in `vendor/klepton` is committed changed.
+
+## The microphone
+
+Titles that ask for the microphone in their Android manifest (`RECORD_AUDIO`)
+get it — visionOS asks once — and other titles do not. Hands-free voice
+commands use the microphone in every title, independently of this.
