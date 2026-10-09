@@ -146,11 +146,22 @@ def cmd_run(a):
         for kv in a.env or []:
             k, v = kv.split("=", 1)
             env["SIMCTL_CHILD_" + k] = v
-        line = sh("xcrun", "simctl", "launch", "--terminate-running-process", udid(), s["bundle"], env=env)
-        try:
-            pid = int(line.strip().split(":")[-1])
-        except ValueError:
-            pid = -1
+        # FrontBoard can take a while to learn about a freshly installed app
+        # ("unknown to FrontBoard"): retry rather than lose the title.
+        pid = -1
+        for attempt in range(6):
+            line = sh("xcrun", "simctl", "launch", "--terminate-running-process", udid(), s["bundle"],
+                      env=env, check=False)
+            try:
+                pid = int(line.strip().splitlines()[-1].split(":")[-1])
+                break
+            except (ValueError, IndexError):
+                time.sleep(10)
+        if pid < 0:
+            print(f"[{i}/{len(names)}] {t}: could not be launched: {line.strip()[-300:]}", flush=True)
+            results["items"][f"{t}@cycle"] = {"verdict": "crashed", "summary": "simulator could not launch the app"}
+            (out / "state.json").write_text(json.dumps(results, indent=1))
+            continue
         print(f"[{i}/{len(names)}] {t}: pid {pid}", end="", flush=True)
         t0, exited = time.time(), None
         while time.time() - t0 < a.seconds:
