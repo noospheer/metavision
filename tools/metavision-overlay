@@ -1484,3 +1484,99 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: DoubleWide eye layers keep both eyes on one slice")
 PYEOF
+
+# 27 — system services stay alive, and ActivityManager answers its memory
+# questions. getSystemService cached each manager without pinning it, so the
+# first JNI frame pop freed it and every later call handed the guest a dangling
+# pointer (GetObjectClass "on an untagged pointer"): the memory-advice library
+# then read zero memory everywhere and judged the device critically low. The
+# managers are pinned like klj_singleton's, and getMemoryClass,
+# getLargeMemoryClass, isLowRamDevice and Debug's native-heap sizes are
+# answered from the same budget /proc/meminfo reports.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/jni/kl_jni_android.c"
+s = open(p).read()
+marker = "metavision: pinned service managers"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "        if (!cache[i]) cache[i] = kl_jni_new_object(services[i].cls);\n",
+               "        if (!cache[i]) {   // metavision: pinned service managers (step 27)\n"
+               "            cache[i] = kl_jni_new_object(services[i].cls);\n"
+               "            if (cache[i]) ((klj_object *)cache[i])->pinned = 1;\n"
+               "        }\n")
+    s = sub(s, "// ---- com.vrchat.android.plugin.Info ----\n",
+        "// metavision (step 27): the rest of ActivityManager's memory answers, from kl_mem_*.\n"
+        "static klj_val mv_am_memclass(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n;\n"
+        "    uint64_t mb = kl_mem_budget_bytes() >> 20;\n"
+        "    return (klj_val){.j = mb > 1024 ? 512 : mb / 2};\n"
+        "}\n"
+        "static klj_val mv_am_largememclass(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n;\n"
+        "    uint64_t mb = kl_mem_budget_bytes() >> 20;\n"
+        "    return (klj_val){.j = mb > 2048 ? 1024 : mb / 2};\n"
+        "}\n"
+        "static klj_val mv_am_lowram(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = 0};\n"
+        "}\n"
+        "static klj_val mv_dbg_heapsize(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = kl_mem_budget_bytes()};\n"
+        "}\n"
+        "static klj_val mv_dbg_heapfree(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n; return (klj_val){.j = kl_mem_available_bytes()};\n"
+        "}\n"
+        "static klj_val mv_dbg_heapalloc(void *e, void *s, const klj_val *a, int n) {\n"
+        "    (void)e; (void)s; (void)a; (void)n;\n"
+        "    uint64_t t = kl_mem_budget_bytes(), f = kl_mem_available_bytes();\n"
+        "    return (klj_val){.j = t > f ? t - f : 0};\n"
+        "}\n\n"
+        "// ---- com.vrchat.android.plugin.Info ----\n")
+    old = '    {"android/app/ActivityManager", "getMemoryInfo", "(Landroid/app/ActivityManager$MemoryInfo;)V", klj_ActivityManager_getMemoryInfo},\n'
+    s = sub(s, old, old +
+        '    {"android/app/ActivityManager", "getMemoryClass", "()I", mv_am_memclass},   // metavision (step 27)\n'
+        '    {"android/app/ActivityManager", "getLargeMemoryClass", "()I", mv_am_largememclass},\n'
+        '    {"android/app/ActivityManager", "isLowRamDevice", "()Z", mv_am_lowram},\n'
+        '    {"android/os/Debug", "getNativeHeapSize", "()J", mv_dbg_heapsize},\n'
+        '    {"android/os/Debug", "getNativeHeapFreeSize", "()J", mv_dbg_heapfree},\n'
+        '    {"android/os/Debug", "getNativeHeapAllocatedSize", "()J", mv_dbg_heapalloc},\n')
+    open(p, "w").write(s)
+print("overlay: system service managers pinned; ActivityManager memory answers")
+PYEOF
+
+# 28 — /proc/<own pid>/... is /proc/self/..., and oom_score exists. Android code
+# (the memory-advice library among it) names its own pid rather than "self",
+# which missed the synthetic tree entirely; oom_score reads 0 — nothing here is
+# lined up to be killed ahead of the foreground app.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/libc/kl_libc.c"
+s = open(p).read()
+marker = "metavision: /proc/<pid> is /proc/self"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    if (!g_procroot[0]) return KL_GP_PASS();\n    // The memory files are rebuilt",
+        "    if (!g_procroot[0]) return KL_GP_PASS();\n"
+        "    static __thread char mv_self[256];   // metavision: /proc/<pid> is /proc/self (step 28); may be returned\n"
+        "    {\n"
+        "        char pfx[32];\n"
+        "        int k = snprintf(pfx, sizeof pfx, \"/proc/%d/\", (int)getpid());\n"
+        "        if (k > 0 && strncmp(path, pfx, (size_t)k) == 0) {\n"
+        "            snprintf(mv_self, sizeof mv_self, \"/proc/self/%s\", path + k);\n"
+        "            path = mv_self;\n"
+        "        }\n"
+        "    }\n"
+        "    // The memory files are rebuilt")
+    s = sub(s, "    proc_put(\"/proc/self/status\", buf);\n}\n",
+        "    proc_put(\"/proc/self/status\", buf);\n"
+        "    proc_put(\"/proc/self/oom_score\", \"0\\n\");   // metavision (step 28)\n"
+        "    proc_put(\"/proc/self/oom_score_adj\", \"0\\n\");\n}\n")
+    open(p, "w").write(s)
+print("overlay: /proc/<pid> resolves to /proc/self; oom_score present")
+PYEOF
