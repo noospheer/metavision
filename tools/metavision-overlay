@@ -1400,3 +1400,29 @@ patch(S, "    snprintf(path, sizeof path, \"%s/%s\", g_assets_dir, rel);\n    FI
       "    KLJ_LOG(\"AssetManager.open(", "metavision: boot.config (step 24)")
 print("overlay: boot.config gains vulkan-disable-secondary-commandbuffers=1")
 PYEOF
+
+# 25 — the microphone's voice processing leaves the title's own sound alone.
+# VoiceProcessingIO (the capture unit) ducks and processes every other output in
+# the app while it runs: speech came through clean but music crackled once a
+# title opened the mic, with the guest's own PCM well short of full scale. The
+# ducking is set to its minimum, with Apple's "advanced" (voice-activity) ducking off.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+p = f"{sys.argv[1]}/media/kl_audio.c"
+s = open(p).read()
+marker = "metavision: no ducking of other audio"
+old = "        if (vp != noErr || ag != noErr) {\n"
+new = ("        // metavision: no ducking of other audio (step 25)\n"
+       "        if (__builtin_available(iOS 17.0, macOS 14.0, visionOS 1.0, *)) {\n"
+       "            AUVoiceIOOtherAudioDuckingConfiguration dc = { .mEnableAdvancedDucking = false,\n"
+       "                                                           .mDuckingLevel = kAUVoiceIOOtherAudioDuckingLevelMin };\n"
+       "            OSStatus dk = AudioUnitSetProperty(g_cap_unit, kAUVoiceIOProperty_OtherAudioDuckingConfiguration,\n"
+       "                                               kAudioUnitScope_Global, 0, &dc, sizeof dc);\n"
+       "            fprintf(stderr, \"  [au] VPIO other-audio ducking: minimum (%d)\\n\", (int)dk);\n"
+       "        }\n" + old)
+if marker not in s:
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    open(p, "w").write(s.replace(old, new))
+print("overlay: microphone voice processing no longer ducks the title's audio")
+PYEOF
