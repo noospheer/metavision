@@ -611,6 +611,16 @@ def _triage_module():
     return mod
 
 
+def hands_only(tree):
+    """The title's manifest REQUIRES hand tracking: autoplay opens it with a 22 s
+    two-hand start gesture (MetavisionAutoplay), so its runs get that much longer."""
+    m = Path(__file__).resolve().parent.parent / "build" / "guests" / tree / "AndroidManifest.xml"
+    if not m.is_file():
+        return False
+    return any('"oculus.software.handtracking"' in el and 'android:required="true"' in el
+               for el in re.findall(r"<uses-feature\b[^>]*>", m.read_text(errors="replace")))
+
+
 async def cmd_test(a):
     """Unattended pass: every title, in every input mode, driven by scripted
     input (MV_AUTOPLAY) through that mode's own path — synthetic controllers
@@ -712,8 +722,9 @@ async def cmd_test(a):
             print(f"[{total - len(todo) + 1}/{total}] {title} ({mode}): pid {pid}", end="", flush=True)
         exited = None
         early = None
+        cap = 25 if probe else state["seconds"] + (25 if hands_only(tree) else 0)   # + the start gesture
         seen, text = 0, ""                     # --adaptive: the boot log read so far
-        while time.time() - t0 < (25 if probe else state["seconds"]):
+        while time.time() - t0 < cap:
             await asyncio.sleep(5)
             if await pc.process_identifier_for_bundle_identifier(bundle) != pid:
                 exited = round(time.time() - t0)

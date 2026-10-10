@@ -64,6 +64,13 @@ enum MetavisionAutoplay {
     private static var headStart: Double = 0
     static let cycle: Double = getenv("MV_AUTOPLAY_CYCLE").flatMap { Double(String(cString: $0)) } ?? 0
     private static let cycleModes: [MetavisionHandsFree.Mode] = [.hands, .handsfree, .auto]
+    /// A hands-only title (MV_HANDS_ONLY, set by the launcher from its manifest)
+    /// is opened with a two-hand start gesture first: such titles commonly wait
+    /// for both hands near the face, or for both hands' thumb and index tips
+    /// touching, held for seconds, before they start what they draw.
+    private static var handsOnly: Bool { getenv("MV_HANDS_ONLY").map { String(cString: $0) == "1" } ?? false }
+    private static let gestureFrom = 1.0, gestureLen = 22.0
+    private static var gestureSaid = false
     private static var headNow_ = ""
     private static let headLock = NSLock()
     /// Written on the render thread, read on the controller thread.
@@ -167,8 +174,11 @@ enum MetavisionAutoplay {
             aimFrom = o + SIMD3<Float>(0, -0.04, 0)
         }
 
+        let gesture = handsOnly && t >= gestureFrom && t < gestureFrom + gestureLen
         if cycle > 0 {
-            let m = cycleModes[min(Int(t / cycle), cycleModes.count - 1)]
+            // The start gesture's time comes before the cycle, so every mode keeps its share.
+            let tc = handsOnly ? max(0, t - gestureFrom - gestureLen) : t
+            let m = cycleModes[min(Int(tc / cycle), cycleModes.count - 1)]
             if MetavisionHandsFree.shared.mode != m {
                 MetavisionHandsFree.shared.setMode(m, remember: false)
                 NSLog("[mv-autoplay] t=%.1fs mode cycle: %@", t, m.rawValue as NSString)
@@ -183,7 +193,9 @@ enum MetavisionAutoplay {
         let path = viaHandsFree ? "hands-free" : "controllers+hands"
         if path != lastPath { lastPath = path; NSLog("[mv-autoplay] input path: %@", path as NSString) }
 
-        let what = viaHandsFree
+        let what = gesture
+            ? twoHandGesture(head: hp, heading: facing, now: now)
+            : viaHandsFree
             ? handsFree(step: step, head: base, aim: aim)
             : controllersAndHands(step: step, phase: phase, now: now, head: base, heading: heading, aim: aim,
                                   rightAt: aimFrom)
@@ -272,6 +284,24 @@ enum MetavisionAutoplay {
     /// A plausible open hand in its wrist frame (metres; palm down, fingers
     /// along -Z), in OVR bone order; the thumb tip closes on the index tip as
     /// `pinch` goes to 1.
+    /// Both hands up in front of the face, palms down, no pinch, held still:
+    /// middle knuckles about 0.33 m from the eye, thumb tips 3.4 cm and index
+    /// tips 3.0 cm apart (publishHand's hand model) — inside the common gates of
+    /// "hands within 0.4 m of the head" and "fingertips within 5 cm".
+    private static func twoHandGesture(head hp: SIMD3<Float>, heading q: simd_quatf, now: Double) -> String {
+        let d: Float = 0.035
+        let rp = hp + q.act(SIMD3<Float>( d, -0.15, -0.20))
+        let lp = hp + q.act(SIMD3<Float>(-d, -0.15, -0.20))
+        kl_ovrp_set_hand_motion(1, rp.x, rp.y, rp.z, q.imag.x, q.imag.y, q.imag.z, q.real, 0, 0, 0, 0, 0, 0)
+        kl_ovrp_set_hand_motion(0, lp.x, lp.y, lp.z, q.imag.x, q.imag.y, q.imag.z, q.real, 0, 0, 0, 0, 0, 0)
+        kl_ovrp_set_controller_input(1, 0, 0, 0, 0, 0, 0)
+        kl_ovrp_set_controller_input(0, 0, 0, 0, 0, 0, 0)
+        publishHand(1, at: rp, q, pinch: 0, grip: false, now: now)
+        publishHand(0, at: lp, q, pinch: 0, grip: false, now: now)
+        if !gestureSaid { gestureSaid = true; NSLog("[mv-autoplay] two-hand start gesture for a hands-only title (%.0f s)", gestureLen) }
+        return " + two-hand gesture (hands at face, thumb and index tips touching)"
+    }
+
     private static func publishHand(_ hand: Int, at p: SIMD3<Float>, _ q: simd_quatf,
                                     pinch: Float, grip: Bool, now: Double) {
         let s: Float = hand == 1 ? 1 : -1          // left hand: mirrored across X

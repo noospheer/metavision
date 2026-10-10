@@ -308,6 +308,13 @@ Autoplay also **presses Unity UI buttons directly** (`MV_AUTOPLAY_UI`, on with
 Button, Toggle or Dropdown, skipping labels that read like leaving the title
 (quit, exit, back, home, reset). Each press is logged with its label
 (`[mv-autoplay-ui] pressed 'English'`).
+
+A **hands-only** title (its manifest requires `oculus.software.handtracking`)
+is opened with a **two-hand start gesture**: both hands up in front of the
+face, thumb and index tips touching, held still for 22 s. Such titles commonly
+wait for both hands near the head, or for fingertips of both hands touching for
+seconds, before they start what they draw. The mode cycle starts after it, and
+the run gets 25 s more.
 The fix loop is: `test` → `metavision-triage` → fix → rebuild and install →
 `test --failed`, until nothing is left.
 
