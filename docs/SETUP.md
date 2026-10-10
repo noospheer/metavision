@@ -284,12 +284,30 @@ the script supplies.
 After each run the title's boot log, the runtime's crash log and any system
 crash report (`.ips`) are pulled to `build/test/<run>/<title>/<mode>/` and
 judged by `tools/metavision-triage`: **pass**, **errors** (exceptions,
-shader/compute failures, a library that would not load), **black** (never
-drew), **stopped** (an unimplemented entry point), **asleep** (sent to the
+shader/compute failures, a library that would not load; the summary names the
+error that decided it), **black** (never drew, or every screenshot empty),
+**dark** (at most one screenshot with content: a sparse scene, or only the
+controllers), **silent** (drew, no serious error, but never made a sound),
+**stopped** (an unimplemented entry point), **asleep** (sent to the
 background mid-run — the headset taken off; re-run, not counted) or
 **crashed** (a fault, a crash report, or an exit on its own). Progress is saved after every run: a
 dropped connection reconnects and carries on, running `test` again resumes an
 unfinished pass, and `test --failed` re-runs only what did not pass last time.
+
+Runs are **adaptive**: each lasts at most `--seconds` (60), but once past
+`--min-seconds` (35) the runner reads the new part of the title's log every
+5 s and ends the run as soon as it has drawn (two screenshots with content),
+made sound, cycled through the hands and hands-free modes and logged nothing
+serious. A healthy title takes about 40 s; a problem title gets the full
+minute. `--no-adaptive` always runs the full time. The headset can come off at
+any point: the runner sees it asleep, puts the run back, and `test` again
+carries on.
+
+Autoplay also **presses Unity UI buttons directly** (`MV_AUTOPLAY_UI`, on with
+`MV_AUTOPLAY`): every 4 s from 10 s in, the least-pressed active, interactable
+Button, Toggle or Dropdown, skipping labels that read like leaving the title
+(quit, exit, back, home, reset). Each press is logged with its label
+(`[mv-autoplay-ui] pressed 'English'`).
 The fix loop is: `test` → `metavision-triage` → fix → rebuild and install →
 `test --failed`, until nothing is left.
 

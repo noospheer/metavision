@@ -641,7 +641,7 @@ async def cmd_test(a):
         if m not in MODES:
             sys.exit(f"unknown mode {m}: {', '.join(MODES)}")
     if a.seconds is None:
-        a.seconds = 95 if modes == ["cycle"] else 75
+        a.seconds = 60 if modes == ["cycle"] else 60
     titles = a.targets or list(rows)
     try:   # only what the launcher build carries
         import zipfile
@@ -711,11 +711,32 @@ async def cmd_test(a):
         if not probe:
             print(f"[{total - len(todo) + 1}/{total}] {title} ({mode}): pid {pid}", end="", flush=True)
         exited = None
+        early = None
+        seen, text = 0, ""                     # --adaptive: the boot log read so far
         while time.time() - t0 < (25 if probe else state["seconds"]):
             await asyncio.sleep(5)
             if await pc.process_identifier_for_bundle_identifier(bundle) != pid:
                 exited = round(time.time() - t0)
                 break
+            # Adaptive: once the minimum is up, read only the log's new bytes and
+            # end the run as soon as it has shown everything a pass needs.
+            if a.adaptive and not probe and time.time() - t0 >= a.min_seconds:
+                try:
+                    size = (await afc.stat("Documents/klepton-boot.log"))["st_size"]
+                    if size > seen:
+                        h = await afc.fopen("Documents/klepton-boot.log")
+                        try:
+                            await afc.fseek(h, seen)
+                            text += (await afc.fread(h, size - seen)).decode(errors="replace")
+                        finally:
+                            await afc.fclose(h)
+                        seen = size
+                    ok, _missing = triage.healthy_so_far(text)
+                    if ok:
+                        early = round(time.time() - t0)
+                        break
+                except Exception:
+                    pass
         if exited is None:
             try:
                 await pc.kill(pid)
@@ -766,7 +787,11 @@ async def cmd_test(a):
         v = triage.verdict(out, exited=exited)
         state["items"][key] = {"verdict": v["verdict"], "summary": v["summary"], "exited_after": exited}
         save()
-        print(f"  -> {v['verdict'].upper()}: {v['summary']}", flush=True)
+        if early is not None:
+            state["items"][key]["ended_early"] = early
+            save()
+        print(f"  -> {v['verdict'].upper()}: {v['summary']}"
+              + (f" [healthy at {early} s, ended early]" if early is not None else ""), flush=True)
         return v
 
     async def wait_awake(rsd, pc, afc, good):
@@ -1036,7 +1061,11 @@ def main():
     p = sub.add_parser("ddi"); p.add_argument("--dir", default="build/ddi")
     sub.add_parser("tunnel")
     p = sub.add_parser("test"); p.add_argument("targets", nargs="*")
-    p.add_argument("--seconds", type=int, help="how long each run lasts (default 95 for cycle, else 75)")
+    p.add_argument("--seconds", type=int, help="the longest a run lasts (default 60)")
+    p.add_argument("--no-adaptive", dest="adaptive", action="store_false",
+                   help="always run the full --seconds (default: end a run early once it has drawn, made "
+                        "sound, cycled through hands and hands-free, and logged nothing serious)")
+    p.add_argument("--min-seconds", type=int, default=35, help="the shortest an adaptive run lasts (default 35)")
     p.add_argument("--modes", default="cycle",
                    help="cycle (default: one launch per title, all three modes in turn), "
                         "or any of hands,handsfree,auto as separate launches")

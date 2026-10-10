@@ -3004,14 +3004,17 @@ PYEOF
 
 # 51 — the views left on a destroyed render target go with it. A title made a
 # full-size depth target every frame and destroyed it, but never destroyed its
-# five image views. On a mobile driver a leaked view is a few bytes; on Metal a
-# texture view retains its parent texture, so each frame's ~75 MB depth texture
-# stayed alive and the process was killed for memory within two seconds (step
-# 48's census: device memory flat, image views +5 a frame). Views made on a
-# large attachment image (the step 39 census set) are recorded; when that image
-# is destroyed, the views still open on it are destroyed first, and the guest's
-# own later destroy of one of them is swallowed. Using a view after its image is
-# destroyed is invalid Vulkan, so a correct guest cannot notice.
+# five image views. In MoltenVK an image view holds a reference on its image (and
+# its Metal view retains the parent texture), so each frame's ~75 MB depth image
+# was never freed and the process was killed for memory within two seconds
+# (step 48's census: device memory flat, image views +5 a frame). Views made on a
+# large attachment image (the step 39 census set) are tracked; when that image is
+# destroyed, the views still open on it are destroyed first and leave the table.
+# Their handles go into a short ring: a guest's own later destroy of one is
+# swallowed, unless a new view has since been created on that same handle (the
+# allocator reuses them), which takes it off the ring. Using a view after its
+# image is destroyed is invalid Vulkan, so a correct guest cannot notice. The
+# census line also counts the guest's own view destroys.
 python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
 import sys
 p = sys.argv[1]
@@ -3027,21 +3030,33 @@ if marker not in s:
     s = sub(s, "static void VKAPI_CALL mv_DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {\n",
         "// " + marker + "\n"
         "#define MV_RV_N 4096\n"
+        "#define MV_RV_RING 256\n"
         "static pthread_mutex_t mv_rv_lock = PTHREAD_MUTEX_INITIALIZER;\n"
-        "static struct { VkImageView v; VkImage img; int skip; } mv_rv[MV_RV_N];\n"
-        "static unsigned mv_rv_reaped;\n"
+        "static struct { VkImageView v; VkImage img; } mv_rv[MV_RV_N];     // live, tracked\n"
+        "static VkImageView mv_rv_ring[MV_RV_RING];                         // reaped, not yet destroyed by the guest\n"
+        "static unsigned mv_rv_ring_at, mv_rv_reaped, mv_rv_full_said;\n"
+        "static _Atomic unsigned long mv_guest_view_destroys;\n"
         "static int mv_rt_has(VkImage img);   // step 39's census set\n"
+        "static void mv_view_map_del(VkImageView v) {   // the upstream view->image map, which never shrank\n"
+        "    pthread_mutex_lock(&g_view_map_lock);\n"
+        "    for (int i = g_view_map_n - 1; i >= 0; i--)\n"
+        "        if (g_view_map[i].view == v) { g_view_map[i] = g_view_map[--g_view_map_n]; break; }\n"
+        "    pthread_mutex_unlock(&g_view_map_lock);\n"
+        "}\n"
+        "static void mv_rv_ring_drop(VkImageView v) {   // caller holds mv_rv_lock\n"
+        "    for (int i = 0; i < MV_RV_RING; i++) if (mv_rv_ring[i] == v) mv_rv_ring[i] = VK_NULL_HANDLE;\n"
+        "}\n"
         "static void mv_rv_note(VkImageView v, VkImage img) {   // a new view\n"
-        "    if (!v || !mv_rt_has(img)) return;\n"
+        "    if (!v) return;\n"
+        "    int track = mv_rt_has(img);\n"
         "    pthread_mutex_lock(&mv_rv_lock);\n"
-        "    int free_i = -1;\n"
-        "    for (int i = 0; i < MV_RV_N; i++) {\n"
-        "        if (mv_rv[i].v == v && mv_rv[i].skip) {   // a reaped handle reused: keep its skip\n"
-        "            free_i = -2; break;\n"
-        "        }\n"
-        "        if (!mv_rv[i].v && free_i == -1) free_i = i;\n"
+        "    mv_rv_ring_drop(v);                 // a reused handle is a new, live view\n"
+        "    if (track) {\n"
+        "        int i;\n"
+        "        for (i = 0; i < MV_RV_N; i++) if (!mv_rv[i].v) { mv_rv[i].v = v; mv_rv[i].img = img; break; }\n"
+        "        if (i == MV_RV_N && !mv_rv_full_said++)\n"
+        "            fprintf(stderr, \"  [vk] view tracking table full: further views are not reaped\\n\");\n"
         "    }\n"
-        "    if (free_i >= 0) { mv_rv[free_i].v = v; mv_rv[free_i].img = img; mv_rv[free_i].skip = 0; }\n"
         "    pthread_mutex_unlock(&mv_rv_lock);\n"
         "}\n"
         "static void mv_rv_reap(VkDevice dev, VkImage img) {        // its image is going\n"
@@ -3050,28 +3065,40 @@ if marker not in s:
         "    if (!real || !img) return;\n"
         "    pthread_mutex_lock(&mv_rv_lock);\n"
         "    for (int i = 0; i < MV_RV_N; i++)\n"
-        "        if (mv_rv[i].v && mv_rv[i].img == img && !mv_rv[i].skip) {\n"
-        "            real(dev, mv_rv[i].v, NULL);\n"
-        "            mv_rv[i].skip = 1;\n"
+        "        if (mv_rv[i].v && mv_rv[i].img == img) {\n"
+        "            VkImageView v = mv_rv[i].v;\n"
+        "            mv_rv[i].v = VK_NULL_HANDLE;\n"
+        "            real(dev, v, NULL);\n"
+        "            mv_view_map_del(v);\n"
         "            mv_views_live--;\n"
+        "            mv_rv_ring[mv_rv_ring_at++ % MV_RV_RING] = v;\n"
         "            if (mv_rv_reaped++ < 4)\n"
         "                fprintf(stderr, \"  [vk] view %p destroyed with its render target %p \"\n"
-        "                        \"(the guest left it open)\\n\", (void *)mv_rv[i].v, (void *)img);\n"
+        "                        \"(the guest left it open)\\n\", (void *)v, (void *)img);\n"
         "        }\n"
         "    pthread_mutex_unlock(&mv_rv_lock);\n"
         "}\n"
         "static int mv_rv_forget(VkImageView v) {   // the guest destroys a view: 1 = already gone\n"
         "    int gone = 0;\n"
         "    pthread_mutex_lock(&mv_rv_lock);\n"
-        "    for (int i = 0; i < MV_RV_N; i++)\n"
-        "        if (mv_rv[i].v == v) { gone = mv_rv[i].skip; mv_rv[i].v = VK_NULL_HANDLE; mv_rv[i].skip = 0; break; }\n"
+        "    for (int i = 0; i < MV_RV_RING; i++)\n"
+        "        if (mv_rv_ring[i] == v) { mv_rv_ring[i] = VK_NULL_HANDLE; gone = 1; break; }\n"
+        "    if (!gone)\n"
+        "        for (int i = 0; i < MV_RV_N; i++) if (mv_rv[i].v == v) { mv_rv[i].v = VK_NULL_HANDLE; break; }\n"
         "    pthread_mutex_unlock(&mv_rv_lock);\n"
         "    return gone;\n"
         "}\n"
         "static void VKAPI_CALL mv_DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {\n")
     s = sub(s, "    if (v) mv_views_live--;\n",
-               "    if (v && mv_rv_forget(v)) return;   // metavision (step 51): went with its image\n"
+               "    if (v) mv_guest_view_destroys++;   // metavision (step 51)\n"
+               "    if (v) mv_view_map_del(v);\n"
+               "    if (v && mv_rv_forget(v)) return;   // went with its image\n"
                "    if (v) mv_views_live--;\n")
+    s = sub(s, "                \"allocation(s); image views live %ld\\n\", mv_rt_who,\n"
+               "                mv_mem_bytes >> 20, mv_mem_count, (long)mv_views_live);\n",
+               "                \"allocation(s); image views live %ld (guest destroyed %lu)\\n\", mv_rt_who,\n"
+               "                mv_mem_bytes >> 20, mv_mem_count, (long)mv_views_live,\n"
+               "                (unsigned long)mv_guest_view_destroys);\n")
     s = sub(s, "static void mv_rt_del(VkImage img) {\n",
                "static int mv_rt_has(VkImage img) {   // metavision (step 51)\n"
                "    int has = 0;\n"
@@ -3090,4 +3117,258 @@ if marker not in s:
                "    if (klvk_ivr == VK_SUCCESS && out && ci) mv_rv_note(*out, ci->image);   // metavision (step 51)\n")
     open(p, "w").write(s)
 print("overlay: views left open on a destroyed render target are destroyed with it")
+PYEOF
+
+# 52 — autoplay presses Unity UI buttons for certain. The scripted input aims at
+# what the screen shows and clicks, so a menu button at the edge of view (a
+# language choice, a start button) was pressed only by luck. Between frames, on
+# the thread that just rendered one (where managed calls are safe), the managed
+# probe now lists the enabled Unity UI selectables (Selectable.allSelectables),
+# keeps the active, interactable Buttons, Toggles and Dropdowns, and every few
+# seconds presses the least-pressed one through its own OnSubmit (Press /
+# InternalToggle / Show as fallbacks). Labels that read like leaving the title
+# (quit, exit, back, home, reset...) are skipped; each control is pressed at most
+# MV_AUTOPLAY_UI_MAX times (3). On with MV_AUTOPLAY (test runs); MV_AUTOPLAY_UI=0
+# turns it off; _FROM (10 s) and _EVERY (4 s) set the timing. Each press is
+# logged with the control's label.
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: deterministic UI presses (step 52)"
+code = r'''// metavision: deterministic UI presses (step 52)
+#include <time.h>
+#include <ctype.h>
+static struct {
+    Il2CppClass *(*parent)(Il2CppClass *);
+    const char *(*ns)(Il2CppClass *);
+    int (*generic)(const MethodInfo *);
+} mvx;
+static double mv_now(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+static const MethodInfo *mv_m(Il2CppClass *k, const char *n, int c) {   // walks parent classes
+    const MethodInfo *m = k ? il.class_get_method_from_name(k, n, c) : NULL;
+    return (m && mvx.generic && mvx.generic(m)) ? NULL : m;
+}
+static int mv_b(Il2CppObject *o, const MethodInfo *m) {
+    if (!m) return 1;
+    Il2CppObject *r = invoke_on(o, m, NULL, "ui.bool");
+    return r && *(uint8_t *)il.object_unbox(r);
+}
+static void mv_utf8(Il2CppObject *s, char *o, size_t cap) {
+    size_t j = 0; o[0] = 0;
+    if (!s) return;
+    int32_t n = *(int32_t *)((uint8_t *)s + STR_LEN);
+    const uint16_t *c = (const uint16_t *)((uint8_t *)s + STR_CHARS);
+    for (int32_t i = 0; i < n && j + 4 < cap; i++) {
+        unsigned u = c[i];
+        if (u < 0x20) u = ' ';
+        if (u < 0x80) o[j++] = (char)u;
+        else if (u < 0x800) { o[j++] = (char)(0xC0 | u >> 6); o[j++] = (char)(0x80 | (u & 63)); }
+        else { o[j++] = (char)(0xE0 | u >> 12); o[j++] = (char)(0x80 | ((u >> 6) & 63)); o[j++] = (char)(0x80 | (u & 63)); }
+    }
+    o[j] = 0;
+}
+static const char *mv_kind(Il2CppClass *k) {
+    for (; k; k = mvx.parent(k)) {
+        const char *s = mvx.ns(k), *n = il.class_get_name(k);
+        if (!s || !n) continue;
+        if (!strcmp(s, "UnityEngine.UI") &&
+            (!strcmp(n, "Button") || !strcmp(n, "Toggle") || !strcmp(n, "Dropdown"))) return n;
+        if (!strcmp(s, "TMPro") && !strcmp(n, "TMP_Dropdown")) return "Dropdown";
+    }
+    return NULL;
+}
+static int mv_unsafe(const char *s) {   // labels that read like leaving the title
+    static const char *bad[] = { "quit", "exit", "leave", "logout", "log out", "sign out",
+                                 "main menu", "home", "back", "delete", "reset", "restart", 0 };
+    char l[128]; size_t i = 0;
+    for (; s[i] && i < 127; i++) l[i] = (char)tolower((unsigned char)s[i]);
+    l[i] = 0;
+    for (int b = 0; bad[b]; b++)
+        for (char *q = strstr(l, bad[b]); q; q = strstr(q + 1, bad[b]))
+            if (q == l || !isalpha((unsigned char)q[-1])) return 1;
+    return 0;
+}
+static struct { int32_t id; uint16_t n; } mv_seen[256];
+static unsigned mv_nseen;
+static uint16_t *mv_tries(int32_t id) {
+    for (unsigned i = 0; i < mv_nseen; i++) if (mv_seen[i].id == id) return &mv_seen[i].n;
+    if (mv_nseen == 256) return NULL;
+    mv_seen[mv_nseen].id = id;
+    return &mv_seen[mv_nseen++].n;
+}
+static void mv_uipress_tick(void) {
+    static int on = -1;
+    static double t0, next, every;
+    static unsigned maxt;
+    if (on < 0) {
+        on = kl_env_on("MV_AUTOPLAY_UI", kl_env_on("MV_AUTOPLAY", 0));
+        every = kl_env_uint("MV_AUTOPLAY_UI_EVERY", 4); if (!every) every = 4;
+        maxt = kl_env_uint("MV_AUTOPLAY_UI_MAX", 3);
+    }
+    if (!on) return;
+    double now = mv_now();
+    if (!t0) { t0 = now; next = now + kl_env_uint("MV_AUTOPLAY_UI_FROM", 10); }
+    if (now < next) return;
+    next = now + every;
+    if (!mprobe_init()) { on = 0; return; }
+    static const MethodInfo *m_arr, *m_list, *m_int, *m_act, *m_go, *m_name, *m_id, *m_child, *m_txt, *m_tmp;
+    static Il2CppObject *t_txt, *t_tmp;
+    static int bound;
+    if (!bound) {
+        bound = 1;
+        kl_image *im = kl_find_image("libil2cpp.so");
+        *(void **)&mvx.parent  = kl_sym(im, "il2cpp_class_get_parent");
+        *(void **)&mvx.ns      = kl_sym(im, "il2cpp_class_get_namespace");
+        *(void **)&mvx.generic = kl_sym(im, "il2cpp_method_is_generic");
+        Il2CppClass *sel = find_class("UnityEngine.UI", "Selectable"), *k;
+        if (!sel || !mvx.parent || !mvx.ns) { fprintf(stderr, "[mv-autoplay-ui] off: no Unity UI\n"); on = 0; return; }
+        m_arr   = mv_m(sel, "get_allSelectablesArray", 0);
+        m_list  = mv_m(sel, "get_allSelectables", 0);
+        m_int   = mv_m(sel, "IsInteractable", 0);
+        m_act   = mv_m(sel, "get_isActiveAndEnabled", 0);
+        m_go    = mv_m(sel, "get_gameObject", 0);
+        m_child = mv_m(sel, "GetComponentInChildren", 2);
+        m_name  = mv_m(sel, "get_name", 0);
+        m_id    = mv_m(sel, "GetInstanceID", 0);
+        if ((k = find_class("TMPro", "TMP_Text")))      { t_tmp = il.type_get_object(il.class_get_type(k)); m_tmp = mv_m(k, "get_text", 0); }
+        if ((k = find_class("UnityEngine.UI", "Text"))) { t_txt = il.type_get_object(il.class_get_type(k)); m_txt = mv_m(k, "get_text", 0); }
+        fprintf(stderr, "[mv-autoplay-ui] on: every %.0fs via %s\n", every,
+                m_arr ? "allSelectablesArray" : m_list ? "allSelectables" : "NONE");
+        if (!m_arr && !m_list) { on = 0; return; }
+    }
+    Il2CppObject *c = invoke(m_arr ? m_arr : m_list, NULL, "Selectable.all"), *a = c;
+    if (!c) return;
+    uint32_t n;
+    if (m_arr) n = il.array_length(c);
+    else { a = *(Il2CppObject **)((uint8_t *)c + 16); n = (uint32_t)*(int32_t *)((uint8_t *)c + 24); }
+    if (!a) return;
+    if (n > 128) n = 128;
+    Il2CppObject *v[128];
+    memcpy(v, (uint8_t *)a + ARR_DATA, n * sizeof *v);
+    Il2CppObject *pick = 0; const char *pk = 0; uint16_t *ptr = 0;
+    char pl[96] = "", pg[64] = "", skip[96] = "";
+    unsigned cand = 0, nskip = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        Il2CppObject *o = v[i]; const char *kind;
+        if (!o || !(kind = mv_kind(il.object_get_class(o)))) continue;
+        if (!mv_b(o, m_act) || !mv_b(o, m_int)) continue;
+        char lab[96] = "", go[64] = ""; uint8_t f = 0;
+        Il2CppObject *g = invoke_on(o, m_go, NULL, "go");
+        if (g) mv_utf8(invoke_on(g, m_name, NULL, "name"), go, sizeof go);
+        Il2CppObject *types[2] = { t_tmp, t_txt };
+        const MethodInfo *gets[2] = { m_tmp, m_txt };
+        for (int t = 0; t < 2 && !lab[0]; t++)
+            if (types[t] && gets[t] && m_child) {
+                void *ar[2] = { types[t], &f };
+                Il2CppObject *tc = invoke_on(o, m_child, ar, "label");
+                if (tc) mv_utf8(invoke_on(tc, gets[t], NULL, "text"), lab, sizeof lab);
+            }
+        if (mv_unsafe(lab) || mv_unsafe(go)) { nskip++; snprintf(skip, sizeof skip, "%s", lab[0] ? lab : go); continue; }
+        Il2CppObject *ib = invoke_on(o, m_id, NULL, "id");
+        uint16_t *tr = mv_tries(ib ? *(int32_t *)il.object_unbox(ib) : (int32_t)(intptr_t)o);
+        if (!tr || *tr >= maxt) continue;
+        cand++;
+        if (!pick || *tr < *ptr) {
+            pick = o; pk = kind; ptr = tr;
+            snprintf(pl, sizeof pl, "%s", lab); snprintf(pg, sizeof pg, "%s", go);
+        }
+    }
+    double t = now - t0;
+    if (!pick) {
+        fprintf(stderr, "[mv-autoplay-ui] t=%.1fs nothing to press (%u selectables, %u skipped%s%s%s)\n",
+                t, n, nskip, skip[0] ? " e.g. '" : "", skip, skip[0] ? "'" : "");
+        return;
+    }
+    Il2CppObject *exc = 0; void *nul[1] = { 0 }; const char *how = "OnSubmit";
+    const MethodInfo *m = mv_m(il.object_get_class(pick), "OnSubmit", 1);
+    if (m) il.runtime_invoke(m, pick, nul, &exc);
+    if (!m || exc) {
+        exc = 0;
+        how = !strcmp(pk, "Button") ? "Press" : !strcmp(pk, "Toggle") ? "InternalToggle" : "Show";
+        if ((m = mv_m(il.object_get_class(pick), how, 0))) il.runtime_invoke(m, pick, NULL, &exc);
+        else how = "none";
+    }
+    (*ptr)++;
+    fprintf(stderr, "[mv-autoplay-ui] t=%.1fs pressed '%s' (%s go=%s via %s%s, try %u, %u candidates, %u skipped)\n",
+            t, pl[0] ? pl : pg, pk, pg, how, exc ? " THREW" : "", *ptr, cand, nskip);
+}
+
+'''
+if marker not in s:
+    old = "void kl_mprobe_tick(unsigned frame) {\n"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old!r}")
+    s = s.replace(old, code + old + "    mv_uipress_tick();   // metavision (step 52)\n")
+    open(p, "w").write(s)
+print("overlay: autoplay presses Unity UI buttons directly (MV_AUTOPLAY_UI)")
+PYEOF
+
+# 53 — getSystemService("midi") answers a MidiManager. Android on a Quest has
+# the MIDI service; it answered null here, and a title polling it every frame
+# threw a NullReferenceException every frame. The manager it now gets lists no
+# devices (MidiManager.getDevices, step 29), which is what a Quest with nothing
+# plugged in says.
+python3 - "$K/runtime/jni/kl_jni_android.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the MIDI service (step 53)"
+if marker not in s:
+    old = '        {"batterymanager", "android/os/BatteryManager"},\n'
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old, old + '        {"midi",         "android/media/midi/MidiManager"},   // ' + marker + '\n')
+    open(p, "w").write(s)
+print("overlay: getSystemService(\"midi\") answers a MidiManager with no devices")
+PYEOF
+
+# 54 — a wake written to a full eventfd is not an error. eventfd is emulated
+# with a self-connected AF_UNIX datagram socket (kl_libc_slink.c). A busy
+# guest I/O reactor (Rust's mio/tokio) writes its 8-byte wake far more often
+# than it reads, the socket queue fills, and Darwin refuses the next datagram
+# with ENOBUFS, which the reactor treats as fatal ("failed to wake I/O driver")
+# and panics. A real eventfd only adds to its counter. A failed 8-byte write to
+# one of these sockets is answered as written: a wake already pending keeps the
+# fd readable, which is all the write promises.
+python3 - "$K/runtime/libc/kl_shim.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a full eventfd still takes a wake (step 54)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "metavision: socketpair ahead of the generated forward" not in s:
+        sys.exit("overlay: step 54 needs step 32")
+    s = sub(s, "static const kl_entry g_shim[] = {\n",
+        "// " + marker + "\n"
+        "#include <sys/un.h>\n"
+        "static int mv_is_efd(int fd) {   // the emulated eventfd's socket name\n"
+        "    struct sockaddr_un a; socklen_t l = sizeof a;\n"
+        "    memset(&a, 0, sizeof a);\n"
+        "    if (getsockname(fd, (struct sockaddr *)&a, &l) != 0 || a.sun_family != AF_UNIX) return 0;\n"
+        "    return strstr(a.sun_path, \"/kl-efd-\") != NULL;\n"
+        "}\n"
+        "static ssize_t mv_write(int fd, const void *buf, size_t n) {\n"
+        "    ssize_t r = write(fd, buf, n);\n"
+        "    if (r < 0 && n == 8 && (errno == ENOBUFS || errno == EAGAIN) && mv_is_efd(fd)) {\n"
+        "        static _Atomic unsigned said;\n"
+        "        if (said++ < 2) fprintf(stderr, \"  [efd] wake on a full eventfd taken as written\\n\");\n"
+        "        return (ssize_t)n;\n"
+        "    }\n"
+        "    return r;\n"
+        "}\n"
+        "static const kl_entry g_shim[] = {\n")
+    s = sub(s, '    E("socketpair", kl_socketpair),\n    // metavision: path-mapped entries first (step 34)',
+               '    E("socketpair", kl_socketpair),\n'
+               '    E("write", mv_write),   // metavision (step 54): ahead of the raw forward\n'
+               '    // metavision: path-mapped entries first (step 34)')
+    open(p, "w").write(s)
+print("overlay: a wake written to a full emulated eventfd is taken as written")
 PYEOF

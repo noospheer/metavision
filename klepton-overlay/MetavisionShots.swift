@@ -96,7 +96,7 @@ enum MetavisionShots {
             }
         }
         let n = Double(ow * oh)
-        let mean = sum / n, spread = (sumSq / n - mean * mean).squareRoot()
+        let mean = sum / n, spread = max(0, sumSq / n - mean * mean).squareRoot()   // rounding can dip below 0: NaN
         let url = dir.appendingPathComponent(String(format: "shot_%02d.png", index))
         out.withUnsafeMutableBytes { raw in
             guard let ctx = CGContext(data: raw.baseAddress, width: ow, height: oh, bitsPerComponent: 8,
