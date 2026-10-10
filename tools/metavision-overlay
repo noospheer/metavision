@@ -4313,7 +4313,7 @@ if marker not in s:
     new = (
         "    {   // " + marker + "\n"
         "        static const MethodInfo *m_cam, *m_gofind, *m_gotf, *m_ctf, *m_tpos, *m_hvalid, *m_hconf;\n"
-        "        static Il2CppObject *hand_type, *jobj[12];\n"
+        "        static Il2CppObject *hand_type;   // a Type object: the runtime keeps it\n"
         "        static char jname[12][48];\n"
         "        static unsigned nj;\n"
         "        static int res;\n"
@@ -4337,7 +4337,7 @@ if marker not in s:
         "            snprintf(buf, sizeof buf, \"%s\", spec);\n"
         "            for (char *tok = strtok(buf, \",\"); tok && nj < 12; tok = strtok(NULL, \",\")) {\n"
         "                snprintf(jname[nj], sizeof jname[0], \"%s\", tok);\n"
-        "                jobj[nj++] = il.string_new(tok);\n"
+        "                nj++;\n"
         "            }\n"
         "        }\n"
         "        float cp[3] = { 0, 0, 0 };\n"
@@ -4350,7 +4350,10 @@ if marker not in s:
         "        if (have_cam) fprintf(stderr, \"(%.2f,%.2f,%.2f)\", cp[0], cp[1], cp[2]);\n"
         "        else          fprintf(stderr, \"?\");\n"
         "        for (unsigned i = 0; i < nj; i++) {\n"
-        "            void *ga[1] = { jobj[i] };\n"
+        "            // A new string each time, held on this stack (which the GC scans):\n"
+        "            // one kept in a static from the first probe was collected, and a\n"
+        "            // later GameObject.Find read freed memory.\n"
+        "            void *ga[1] = { il.string_new(jname[i]) };\n"
         "            Il2CppObject *go = invoke(m_gofind, ga, \"GameObject.Find\");\n"
         "            Il2CppObject *tf = go ? invoke_on(go, m_gotf, NULL, \"GameObject.transform\") : NULL;\n"
         "            Il2CppObject *po = tf ? invoke_on(tf, m_tpos, NULL, \"Transform.position\") : NULL;\n"
@@ -4438,4 +4441,177 @@ if marker not in s:
         "        }\n")
     open(p, "w").write(s)
 print("overlay: a title that quits ends the app (KL_EXIT_ON_QUIT)")
+PYEOF
+
+# 62 — the input probe runs only when KL_PROBE_INPUT asks for it (it read the
+# switch and ignored it), and its axis names are made where they are used. They were
+# il2cpp strings made once and kept in a static, which the collector does not
+# see as a reference: once collected, each probe passed freed memory to
+# Input.GetAxis. (Step 60's joint names had the same fault and crashed a title
+# inside GameObject.Find; it makes its strings at the call too.)
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: axis names made at the call (step 62)"
+if marker not in s:
+    old = "            void *args[1] = { axis_str[i] };\n"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old, "            void *args[1] = { il.string_new(AXES[i]) };   // " + marker + "\n")
+    # ...and the probe honours its switch: it read KL_PROBE_INPUT and never
+    # looked at the answer, so every Unity title ran it (managed calls, class
+    # constructors, scene searches every 120 frames) whether asked or not.
+    old = "    if (frame < from || frame % every) return;\n"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old, "    if (!on || frame < from || frame % every) return;   // metavision: KL_PROBE_INPUT honoured (step 62)\n")
+    open(p, "w").write(s)
+print("overlay: the input probe honours KL_PROBE_INPUT; its axis names are made where they are used")
+PYEOF
+
+# 63 — diagnostic (KL_TRACE_VK_LIFE=1): does the guest see its GPU work finish?
+# A title made a new full-size depth target every frame and destroyed the
+# image but not its views (a Metal view keeps its parent's storage), climbing
+# to the memory limit in a second. An engine reuses a pooled render target, and
+# runs its deferred destruction, only once the frame that used it is known to
+# be complete — through fences or timeline semaphores. Once a second (every ten
+# after the first minute) one line gives: submits (and how many carried a
+# fence), vkWaitForFences calls and results, vkGetFenceStatus results,
+# timeline-semaphore reads and waits with the last value seen, queue/device
+# idle waits, large attachment images made/destroyed/live, image views made/
+# destroyed/live, and the process footprint.
+python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Vulkan lifecycle trace (step 63)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    for need in ("metavision: memory and view census (step 48)", "metavision: large render-target census (step 39)"):
+        if need not in s:
+            sys.exit(f"overlay: step 63 needs {need!r}")
+    s = sub(s, "static const entry g_ours[] = {\n",
+        "// " + marker + " — diagnostic, KL_TRACE_VK_LIFE=1.\n"
+        "static int mv_life_on(void) {\n"
+        "    static int on = -1;\n"
+        "    if (on < 0) on = kl_env_on(\"KL_TRACE_VK_LIFE\", 0);\n"
+        "    return on;\n"
+        "}\n"
+        "static _Atomic unsigned long mv_life_sub, mv_life_subf, mv_life_wf, mv_life_wf_ok, mv_life_wf_to,\n"
+        "    mv_life_fs, mv_life_fs_ok, mv_life_fs_nr, mv_life_rf, mv_life_sv, mv_life_sw, mv_life_idle,\n"
+        "    mv_life_vmade, mv_life_vgone, mv_life_tsig;\n"
+        "static _Atomic unsigned long long mv_life_semval, mv_life_sigval;\n"
+        "static void mv_life_tick(void) {\n"
+        "    static double t0, next;\n"
+        "    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);\n"
+        "    double now = ts.tv_sec + ts.tv_nsec * 1e-9;\n"
+        "    if (!t0) { t0 = now; next = now + 1; return; }\n"
+        "    if (now < next) return;\n"
+        "    next = now + (now - t0 < 60 ? 1 : 10);\n"
+        "    unsigned long long fp = 0;\n"
+        "    { task_vm_info_data_t ti; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;\n"
+        "      if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &cnt) == KERN_SUCCESS) fp = ti.phys_footprint >> 20; }\n"
+        "    fprintf(stderr, \"  [vk-life] t=%.0fs submits %lu (fenced %lu) | waitFences %lu (ok %lu, timeout %lu) \"\n"
+        "            \"fenceStatus %lu (ready %lu, not ready %lu) resetFences %lu | timeline: signals %lu (last %llu) \"\n"
+        "            \"reads %lu waits %lu (last value %llu) | idle waits %lu | large images made %u destroyed %u live %u \"\n"
+        "            \"| views made %lu destroyed %lu live %ld | footprint %llu MiB\\n\",\n"
+        "            now - t0, mv_life_sub, mv_life_subf, mv_life_wf, mv_life_wf_ok, mv_life_wf_to,\n"
+        "            mv_life_fs, mv_life_fs_ok, mv_life_fs_nr, mv_life_rf, mv_life_tsig, mv_life_sigval,\n"
+        "            mv_life_sv, mv_life_sw, mv_life_semval, mv_life_idle, mv_rt_made, mv_rt_gone, mv_rt_live,\n"
+        "            mv_life_vmade, mv_life_vgone, (long)mv_views_live, fp);\n"
+        "}\n"
+        "static void mv_life_submit(uint32_t n, const VkSubmitInfo *si, VkFence fence) {\n"
+        "    if (!mv_life_on()) return;\n"
+        "    mv_life_sub++;\n"
+        "    if (fence) mv_life_subf++;\n"
+        "    for (uint32_t i = 0; si && i < n; i++)\n"
+        "        for (const VkBaseInStructure *b = si[i].pNext; b; b = b->pNext)\n"
+        "            if (b->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {\n"
+        "                const VkTimelineSemaphoreSubmitInfo *t = (const VkTimelineSemaphoreSubmitInfo *)b;\n"
+        "                if (t->signalSemaphoreValueCount && t->pSignalSemaphoreValues) {\n"
+        "                    mv_life_tsig++;\n"
+        "                    mv_life_sigval = t->pSignalSemaphoreValues[t->signalSemaphoreValueCount - 1];\n"
+        "                }\n"
+        "            }\n"
+        "    mv_life_tick();\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_WaitForFences(VkDevice dev, uint32_t n, const VkFence *f, VkBool32 all, uint64_t to) {\n"
+        "    static PFN_vkWaitForFences real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkWaitForFences)real_gdpa(dev, \"vkWaitForFences\");\n"
+        "    VkResult r = real ? real(dev, n, f, all, to) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "    if (mv_life_on()) { mv_life_wf++; if (r == VK_SUCCESS) mv_life_wf_ok++; else if (r == VK_TIMEOUT) mv_life_wf_to++; }\n"
+        "    return r;\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_GetFenceStatus(VkDevice dev, VkFence f) {\n"
+        "    static PFN_vkGetFenceStatus real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkGetFenceStatus)real_gdpa(dev, \"vkGetFenceStatus\");\n"
+        "    VkResult r = real ? real(dev, f) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "    if (mv_life_on()) { mv_life_fs++; if (r == VK_SUCCESS) mv_life_fs_ok++; else if (r == VK_NOT_READY) mv_life_fs_nr++; }\n"
+        "    return r;\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_ResetFences(VkDevice dev, uint32_t n, const VkFence *f) {\n"
+        "    static PFN_vkResetFences real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkResetFences)real_gdpa(dev, \"vkResetFences\");\n"
+        "    if (mv_life_on()) mv_life_rf++;\n"
+        "    return real ? real(dev, n, f) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_GetSemaphoreCounterValue(VkDevice dev, VkSemaphore sem, uint64_t *v) {\n"
+        "    static PFN_vkGetSemaphoreCounterValue real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkGetSemaphoreCounterValue)real_gdpa(dev, \"vkGetSemaphoreCounterValue\");\n"
+        "    if (!real && real_gdpa) real = (PFN_vkGetSemaphoreCounterValue)real_gdpa(dev, \"vkGetSemaphoreCounterValueKHR\");\n"
+        "    VkResult r = real ? real(dev, sem, v) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "    if (mv_life_on()) { mv_life_sv++; if (r == VK_SUCCESS && v) mv_life_semval = *v; }\n"
+        "    return r;\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_WaitSemaphores(VkDevice dev, const VkSemaphoreWaitInfo *wi, uint64_t to) {\n"
+        "    static PFN_vkWaitSemaphores real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkWaitSemaphores)real_gdpa(dev, \"vkWaitSemaphores\");\n"
+        "    if (!real && real_gdpa) real = (PFN_vkWaitSemaphores)real_gdpa(dev, \"vkWaitSemaphoresKHR\");\n"
+        "    if (mv_life_on()) mv_life_sw++;\n"
+        "    return real ? real(dev, wi, to) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_QueueWaitIdle(VkQueue q) {\n"
+        "    static PFN_vkQueueWaitIdle real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkQueueWaitIdle)real_gdpa(g_devs[0] ? g_devs[0]->dev : NULL, \"vkQueueWaitIdle\");\n"
+        "    if (mv_life_on()) mv_life_idle++;\n"
+        "    return real ? real(q) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "}\n"
+        "static VkResult VKAPI_CALL mv_DeviceWaitIdle(VkDevice dev) {\n"
+        "    static PFN_vkDeviceWaitIdle real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkDeviceWaitIdle)real_gdpa(dev, \"vkDeviceWaitIdle\");\n"
+        "    if (mv_life_on()) mv_life_idle++;\n"
+        "    return real ? real(dev) : VK_ERROR_INITIALIZATION_FAILED;\n"
+        "}\n\n"
+        "static const entry g_ours[] = {\n")
+    s = sub(s, "    { \"vkDestroyImageView\", (PFN_vkVoidFunction)mv_DestroyImageView },\n",
+        "    { \"vkDestroyImageView\", (PFN_vkVoidFunction)mv_DestroyImageView },\n"
+        "    { \"vkWaitForFences\",    (PFN_vkVoidFunction)mv_WaitForFences },     // " + marker + "\n"
+        "    { \"vkGetFenceStatus\",   (PFN_vkVoidFunction)mv_GetFenceStatus },\n"
+        "    { \"vkResetFences\",      (PFN_vkVoidFunction)mv_ResetFences },\n"
+        "    { \"vkGetSemaphoreCounterValue\",    (PFN_vkVoidFunction)mv_GetSemaphoreCounterValue },\n"
+        "    { \"vkGetSemaphoreCounterValueKHR\", (PFN_vkVoidFunction)mv_GetSemaphoreCounterValue },\n"
+        "    { \"vkWaitSemaphores\",    (PFN_vkVoidFunction)mv_WaitSemaphores },\n"
+        "    { \"vkWaitSemaphoresKHR\", (PFN_vkVoidFunction)mv_WaitSemaphores },\n"
+        "    { \"vkQueueWaitIdle\",     (PFN_vkVoidFunction)mv_QueueWaitIdle },\n"
+        "    { \"vkDeviceWaitIdle\",    (PFN_vkVoidFunction)mv_DeviceWaitIdle },\n")
+    # the counters the hooks above feed, declared with the step 48 census
+    s = sub(s, "static _Atomic long mv_views_live;\n",
+        "static _Atomic long mv_views_live;\n"
+        "static _Atomic unsigned long mv_life_vmade, mv_life_vgone;   // " + marker + "\n")
+    s = s.replace("    mv_life_vmade, mv_life_vgone, mv_life_tsig;\n", "    mv_life_tsig;\n", 1)
+    s = sub(s, "    if (v) mv_views_live--;\n", "    if (v) { mv_views_live--; mv_life_vgone++; }\n")
+    s = sub(s, "    if (klvk_ivr == VK_SUCCESS) mv_views_live++;   // metavision (step 48)\n",
+               "    if (klvk_ivr == VK_SUCCESS) { mv_views_live++; mv_life_vmade++; }   // metavision (steps 48, 63)\n")
+    s = sub(s, "static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,\n",
+               "static void mv_life_submit(uint32_t n, const VkSubmitInfo *si, VkFence fence);   // " + marker + "\n"
+               "static VkResult VKAPI_CALL klvk_QueueSubmit(VkQueue q, uint32_t n,\n")
+    s = sub(s, "    VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;\n    // Same thread, same queue",
+               "    mv_life_submit(n, si, fence);   // " + marker + "\n"
+               "    VkResult r = real ? real(q, n, si, fence) : VK_ERROR_INITIALIZATION_FAILED;\n    // Same thread, same queue")
+    open(p, "w").write(s)
+print("overlay: Vulkan lifecycle trace (KL_TRACE_VK_LIFE, diagnostic)")
 PYEOF

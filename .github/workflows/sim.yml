@@ -25,6 +25,10 @@ on:
         description: "seconds per title"
         required: true
         default: "95"
+      env:
+        description: "runtime switches for every title, KEY=VALUE separated by spaces"
+        required: false
+        default: ""
 
 jobs:
   sim:
@@ -133,7 +137,12 @@ jobs:
           tools/metavision-sim stage build/simdata
 
       - name: Test pass
-        run: tools/metavision-sim run --seconds "${{ github.event.inputs.seconds }}" --out build/simtest/run
+        env:
+          SWITCHES: ${{ github.event.inputs.env }}
+        run: |
+          args=()
+          for kv in $SWITCHES; do args+=(--env "$kv"); done
+          tools/metavision-sim run --seconds "${{ github.event.inputs.seconds }}" --out build/simtest/run "${args[@]}"
 
       - name: Encrypt results
         if: always()

@@ -712,6 +712,10 @@ async def cmd_test(a):
             # heard; logs, screenshots and audio levels are taken as usual.
             env.setdefault("MV_HIDDEN", "1")
             env.setdefault("KL_FULL", "0")
+        if hands_only(tree):
+            # What the hand gate sees (camera, joint distances, each Hand's
+            # flags): the input probe, off everywhere else for its side effects.
+            env.setdefault("KL_PROBE_INPUT", "1")
         if not a.no_play:
             env["MV_AUTOPLAY"] = "1"
             if mode == "cycle":

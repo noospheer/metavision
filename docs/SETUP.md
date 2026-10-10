@@ -364,7 +364,7 @@ workflow on it:
 
 ```bash
 tools/metavision-sim-data <set> mv_<title> ... --upload --repo <you>/<private-repo>
-gh workflow run sim -f set=<set>          # -f seconds=95 per title
+gh workflow run sim -f set=<set>          # -f seconds=95 per title, -f env="KEY=VALUE ..." switches
 tools/metavision-sim-results              # latest run -> build/simtest/<run>/, triaged
 ```
 
