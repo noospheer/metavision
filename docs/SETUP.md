@@ -269,8 +269,10 @@ audio measured as usual, but nothing is drawn over passthrough and nothing is
 heard (`MV_HIDDEN=1`, `.mixed` immersion), so the headset can be worn for other
 things meanwhile. `--visible` shows and plays each title.
 
-Every run also saves **screenshots** of the eye the title drew, every 15 s
-(`MetavisionShots`), pulled beside the logs as `shot_NN.png`; triage reports
+Every run also saves **screenshots** of the eye the title drew, every 10 s from
+the first picture (`MetavisionShots`), pulled beside the logs as `shot_NN.png`.
+A shot has content when it is lit and varied, or detailed (1.5% of its pixels
+on a sharp edge: a starfield or thin grid is dim but drawn); triage reports
 **BLACK CONTENT** when every one is dark or a flat colour — frames presented
 but nothing in them. In hands-free the commands are **spoken** —
 synthesised speech replaces the microphone's input, so the recogniser is
@@ -287,7 +289,7 @@ judged by `tools/metavision-triage`: **pass**, **errors** (exceptions,
 shader/compute failures, a library that would not load; the summary names the
 error that decided it), **black** (never drew, or every screenshot empty),
 **dark** (at most one screenshot with content: a sparse scene, or only the
-controllers), **silent** (drew, no serious error, but never made a sound),
+controllers; a serious error outranks it), **silent** (drew, no serious error, but never made a sound),
 **stopped** (an unimplemented entry point), **asleep** (sent to the
 background mid-run — the headset taken off; re-run, not counted) or
 **crashed** (a fault, a crash report, or an exit on its own). Progress is saved after every run: a
@@ -298,7 +300,8 @@ Runs are **adaptive**: each lasts at most `--seconds` (60), but once past
 `--min-seconds` (35) the runner reads the new part of the title's log every
 5 s and ends the run as soon as it has drawn (two screenshots with content),
 made sound, cycled through the hands and hands-free modes and logged nothing
-serious. A healthy title takes about 40 s; a problem title gets the full
+serious — the same tests the final verdict applies, so a run ends early only
+when it would pass. A healthy title takes about 40 s; a problem title gets the full
 minute. `--no-adaptive` always runs the full time. The headset can come off at
 any point: the runner sees it asleep, puts the run back, and `test` again
 carries on.
