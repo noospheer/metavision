@@ -3001,3 +3001,93 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: denormal float literals kept as bit casts in GLSL ES 3.00+ shaders")
 PYEOF
+
+# 51 — the views left on a destroyed render target go with it. A title made a
+# full-size depth target every frame and destroyed it, but never destroyed its
+# five image views. On a mobile driver a leaked view is a few bytes; on Metal a
+# texture view retains its parent texture, so each frame's ~75 MB depth texture
+# stayed alive and the process was killed for memory within two seconds (step
+# 48's census: device memory flat, image views +5 a frame). Views made on a
+# large attachment image (the step 39 census set) are recorded; when that image
+# is destroyed, the views still open on it are destroyed first, and the guest's
+# own later destroy of one of them is swallowed. Using a view after its image is
+# destroyed is invalid Vulkan, so a correct guest cannot notice.
+python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: views go with their render target (step 51)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "metavision: memory and view census (step 48)" not in s:
+        sys.exit("overlay: step 51 needs step 48 (the view census)")
+    s = sub(s, "static void VKAPI_CALL mv_DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {\n",
+        "// " + marker + "\n"
+        "#define MV_RV_N 4096\n"
+        "static pthread_mutex_t mv_rv_lock = PTHREAD_MUTEX_INITIALIZER;\n"
+        "static struct { VkImageView v; VkImage img; int skip; } mv_rv[MV_RV_N];\n"
+        "static unsigned mv_rv_reaped;\n"
+        "static int mv_rt_has(VkImage img);   // step 39's census set\n"
+        "static void mv_rv_note(VkImageView v, VkImage img) {   // a new view\n"
+        "    if (!v || !mv_rt_has(img)) return;\n"
+        "    pthread_mutex_lock(&mv_rv_lock);\n"
+        "    int free_i = -1;\n"
+        "    for (int i = 0; i < MV_RV_N; i++) {\n"
+        "        if (mv_rv[i].v == v && mv_rv[i].skip) {   // a reaped handle reused: keep its skip\n"
+        "            free_i = -2; break;\n"
+        "        }\n"
+        "        if (!mv_rv[i].v && free_i == -1) free_i = i;\n"
+        "    }\n"
+        "    if (free_i >= 0) { mv_rv[free_i].v = v; mv_rv[free_i].img = img; mv_rv[free_i].skip = 0; }\n"
+        "    pthread_mutex_unlock(&mv_rv_lock);\n"
+        "}\n"
+        "static void mv_rv_reap(VkDevice dev, VkImage img) {        // its image is going\n"
+        "    static PFN_vkDestroyImageView real;\n"
+        "    if (!real && real_gdpa) real = (PFN_vkDestroyImageView)real_gdpa(dev, \"vkDestroyImageView\");\n"
+        "    if (!real || !img) return;\n"
+        "    pthread_mutex_lock(&mv_rv_lock);\n"
+        "    for (int i = 0; i < MV_RV_N; i++)\n"
+        "        if (mv_rv[i].v && mv_rv[i].img == img && !mv_rv[i].skip) {\n"
+        "            real(dev, mv_rv[i].v, NULL);\n"
+        "            mv_rv[i].skip = 1;\n"
+        "            mv_views_live--;\n"
+        "            if (mv_rv_reaped++ < 4)\n"
+        "                fprintf(stderr, \"  [vk] view %p destroyed with its render target %p \"\n"
+        "                        \"(the guest left it open)\\n\", (void *)mv_rv[i].v, (void *)img);\n"
+        "        }\n"
+        "    pthread_mutex_unlock(&mv_rv_lock);\n"
+        "}\n"
+        "static int mv_rv_forget(VkImageView v) {   // the guest destroys a view: 1 = already gone\n"
+        "    int gone = 0;\n"
+        "    pthread_mutex_lock(&mv_rv_lock);\n"
+        "    for (int i = 0; i < MV_RV_N; i++)\n"
+        "        if (mv_rv[i].v == v) { gone = mv_rv[i].skip; mv_rv[i].v = VK_NULL_HANDLE; mv_rv[i].skip = 0; break; }\n"
+        "    pthread_mutex_unlock(&mv_rv_lock);\n"
+        "    return gone;\n"
+        "}\n"
+        "static void VKAPI_CALL mv_DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {\n")
+    s = sub(s, "    if (v) mv_views_live--;\n",
+               "    if (v && mv_rv_forget(v)) return;   // metavision (step 51): went with its image\n"
+               "    if (v) mv_views_live--;\n")
+    s = sub(s, "static void mv_rt_del(VkImage img) {\n",
+               "static int mv_rt_has(VkImage img) {   // metavision (step 51)\n"
+               "    int has = 0;\n"
+               "    if (!img) return 0;\n"
+               "    pthread_mutex_lock(&mv_rt_lock);\n"
+               "    for (unsigned i = 0; i < 1024; i++) if (mv_rt[i] == img) { has = 1; break; }\n"
+               "    pthread_mutex_unlock(&mv_rt_lock);\n"
+               "    return has;\n"
+               "}\n"
+               "static void mv_rt_del(VkImage img) {\n")
+    s = sub(s, "    mv_rt_del(img);   // metavision (step 39)\n",
+               "    if (mv_rt_has(img)) mv_rv_reap(dev, img);   // metavision (step 51)\n"
+               "    mv_rt_del(img);   // metavision (step 39)\n")
+    s = sub(s, "    if (klvk_ivr == VK_SUCCESS) mv_views_live++;   // metavision (step 48)\n",
+               "    if (klvk_ivr == VK_SUCCESS) mv_views_live++;   // metavision (step 48)\n"
+               "    if (klvk_ivr == VK_SUCCESS && out && ci) mv_rv_note(*out, ci->image);   // metavision (step 51)\n")
+    open(p, "w").write(s)
+print("overlay: views left open on a destroyed render target are destroyed with it")
+PYEOF
