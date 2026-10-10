@@ -290,7 +290,8 @@ shader/compute failures, a library that would not load; the summary names the
 error that decided it), **black** (never drew, or every screenshot empty),
 **dark** (at most one screenshot with content: a sparse scene, or only the
 controllers; a serious error outranks it), **silent** (drew, no serious error, but never made a sound),
-**stopped** (an unimplemented entry point), **asleep** (sent to the
+**stopped** (an unimplemented entry point), **quit** (the title closed itself;
+the summary names the scripted input just before it), **asleep** (sent to the
 background mid-run — the headset taken off; re-run, not counted) or
 **crashed** (a fault, a crash report, or an exit on its own). Progress is saved after every run: a
 dropped connection reconnects and carries on, running `test` again resumes an

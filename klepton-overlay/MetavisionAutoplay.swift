@@ -276,7 +276,9 @@ enum MetavisionAutoplay {
         if step % 12 == 6 && phaseLate { lb |= OVRPRawButton.lHandTrigger; lGrip = 1; what += ", left grip" }
         if step % 7 == 4 { rStick = SIMD2(0, 1); lStick = SIMD2(0, 1); what += ", sticks forward" }
         if step % 9 == 2 { rStick = SIMD2(1, 0); what += ", right stick turn" }
-        if step % 29 == 17 && click { lb |= OVRPRawButton.start; what += ", MENU" }
+        // Menu from step 46 (about 30 s in): titles may answer it with a quit
+        // menu or a quit, and the rest of the run should be tested first.
+        if step % 29 == 17 && step > 29 && click { lb |= OVRPRawButton.start; what += ", MENU" }
 
         kl_ovrp_set_hand_motion(1, rp.x, rp.y, rp.z, rq.imag.x, rq.imag.y, rq.imag.z, rq.real, 0, 0, 0, 0, 0, 0)
         kl_ovrp_set_controller_input(1, rb, rb, rTrig, rGrip, rStick.x, rStick.y)
@@ -376,7 +378,7 @@ enum MetavisionAutoplay {
         if step % 8 == 5 { cmds.append(.confirm) }
         if step % 13 == 9 { cmds.append(.back) }
         if step % 11 == 7 { cmds.append(.grab) }
-        if step % 29 == 17 { cmds.append(.menu) }
+        if step % 29 == 17 && step > 29 { cmds.append(.menu) }   // late, as with the controller's Menu
         if step % 17 == 11 { cmds.append(.hold) }
         if step % 17 == 13 { cmds.append(.release) }
         let words = cmds.map { $0.rawValue }.joined(separator: ", ")

@@ -44,6 +44,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define OVRP_SUCCESS             0
@@ -349,7 +350,15 @@ void mv_hands_publish(int hand, int tracked, const float *model, const float *ro
         mv_vec3 m[MV_HAND_BONES];
         for (int i = 0; i < MV_HAND_BONES; i++)
             m[i] = (mv_vec3){ model[7*i + 4], model[7*i + 5], model[7*i + 6] };
-        mv_hands_solve(hand, m, pose_from(root), &r, rot, &scale);
+        // MV_HAND_SOLVE=0: no retargeting, the bones at rest on the visionOS
+        // wrist — to tell a solver problem from a title's own.
+        static int solve = -1;
+        if (solve < 0) { const char *e = getenv("MV_HAND_SOLVE"); solve = !(e && *e == '0'); }
+        if (solve) mv_hands_solve(hand, m, pose_from(root), &r, rot, &scale);
+        else {
+            r = pose_from(root);
+            for (int i = 0; i < MV_HAND_BONES; i++) rot[i] = (mv_quat){ 0, 0, 0, 1 };
+        }
     }
     pthread_mutex_lock(&g_lock);
     g_hand[hand].tracked = tracked;

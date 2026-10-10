@@ -3079,9 +3079,15 @@ static int mv_unsafe(const char *s) {   // labels that read like leaving the tit
     for (; s[i] && i < 127; i++) l[i] = (char)tolower((unsigned char)s[i]);
     l[i] = 0;
     if (i == 1) return 1;   // one character: an on-screen keyboard key
+    // A whole word: "Back" and "BackButton" (a capital starts the next word),
+    // "Links", but not "Background" or "Clearing".
     for (int b = 0; bad[b]; b++)
-        for (char *q = strstr(l, bad[b]); q; q = strstr(q + 1, bad[b]))
-            if (q == l || !isalpha((unsigned char)q[-1])) return 1;
+        for (char *q = strstr(l, bad[b]); q; q = strstr(q + 1, bad[b])) {
+            size_t at = (size_t)(q - l), e = at + strlen(bad[b]);
+            if (at && isalpha((unsigned char)l[at - 1])) continue;
+            if (e < i && l[e] == 's' && (e + 1 == i || !islower((unsigned char)s[e + 1]))) e++;
+            if (e == i || !islower((unsigned char)s[e])) return 1;
+        }
     return 0;
 }
 static struct { int32_t id; uint16_t n; } mv_seen[256];
@@ -4385,4 +4391,51 @@ if marker not in s:
         s = s.replace(inc, "#include <math.h>   // " + marker + ": sqrtf\n" + inc)
     open(p, "w").write(s)
 print("overlay: the input probe also reports what hand gates see (KL_PROBE_JOINTS)")
+PYEOF
+
+# 61 — a title that quits ends the app, as Android's finish() would. Unity's
+# Application.Quit sets a gate that makes nativeRender return false from then
+# on; on Android the UnityPlayer's frame callback reads that false and calls
+# finish(), and the activity (and its process) goes away. Here the false was
+# ignored: the guest drew nothing more, the compositor reprojected its last
+# frame forever, and a title with a watchdog that checks the quit really
+# happened (its own "kill self and dump" fallback) crashed itself on purpose
+# some seconds later — a crash report for what was a clean quit. After 30
+# false returns in a row (a run of them, not one, so a transient answer is not
+# read as a quit) the app logs why and exits with status 0, flushing first and
+# skipping atexit handlers and static destructors in a guest whose threads are
+# still live, as the background exit does. KL_EXIT_ON_QUIT=0 keeps the old
+# behaviour.
+python3 - "$K/visionos/Sources/kl_app.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a title's quit ends the app (step 61)"
+if marker not in s:
+    old = ("        if (kl_app_frame() < 0) {\n"
+           "            printf(\"[guest] nativeRender is gone — the frame loop ends here\\n\");\n"
+           "            fflush(NULL);\n"
+           "            break;\n"
+           "        }\n")
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old,
+        "        int rendered = kl_app_frame();   // " + marker + "\n"
+        "        if (rendered < 0) {\n"
+        "            printf(\"[guest] nativeRender is gone — the frame loop ends here\\n\");\n"
+        "            fflush(NULL);\n"
+        "            break;\n"
+        "        }\n"
+        "        static int exit_on_quit = -1;\n"
+        "        static unsigned quit_run;\n"
+        "        if (exit_on_quit < 0) exit_on_quit = kl_env_on(\"KL_EXIT_ON_QUIT\", 1);\n"
+        "        quit_run = rendered == 0 ? quit_run + 1 : 0;\n"
+        "        if (exit_on_quit && quit_run == 30) {\n"
+        "            printf(\"[guest] the title quit: nativeRender answered false for 30 frames \"\n"
+        "                   \"(Application.Quit) — ending the app as Android's finish() would\\n\");\n"
+        "            fflush(NULL);\n"
+        "            _exit(0);\n"
+        "        }\n")
+    open(p, "w").write(s)
+print("overlay: a title that quits ends the app (KL_EXIT_ON_QUIT)")
 PYEOF

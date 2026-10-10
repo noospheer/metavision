@@ -14,6 +14,8 @@ how far the scripted input got. verdict() is what `test` records per run:
     errors   ran, but logged exceptions, shader/compute failures or a failed load
     black    ran to the end without ever drawing a frame
     stopped  the runtime stopped it (an entry point it does not implement)
+    quit     the title closed itself (Application.Quit); the summary names the
+             scripted input just before, which is usually what asked for it
     crashed  a fault, a system crash report, or it exited on its own early
 """
 import json
@@ -30,6 +32,7 @@ START = re.compile(r"^\[hb\] (\S+)")
 SHIM = re.compile(r"\[mv-shim\] (.*)")
 PLAY = re.compile(r"\[mv-autoplay\] (t=\S+ step \d+: .*)")
 UNITY_E = re.compile(r"^E/Unity: (.*)", re.M)
+QUIT = re.compile(r"^\[guest\] the title quit:", re.M)
 HANDS = "[mv-hands] the title reads hand state"
 # Errors that mean something visibly does not work, not just noise.
 SERIOUS = re.compile(r"Exception|GLSL compilation failed|Kernel at index|Shader error|"
@@ -228,6 +231,11 @@ def verdict(d: Path, exited=None):
     iters = max((int(m.group(1)) for m in ITERS.finditer(log)), default=0)
     if ending.startswith(("crashed", "killed")):
         v = "crashed"
+    elif m := QUIT.search(log):
+        before = [l for l in log[:m.start()].splitlines()
+                  if "[mv-autoplay] t=" in l or "[mv-autoplay-ui] t=" in l][-1:]
+        v, ending = "quit", "the title quit itself" + (
+            " after: " + re.sub(r"^.*?\[mv-autoplay(-ui)?\] ", "", before[0])[:120] if before else "")
     elif "backgrounded — exiting" in log:
         # The app went behind something (the headset taken off, the Home view):
         # a clean exit that says nothing about the title.
