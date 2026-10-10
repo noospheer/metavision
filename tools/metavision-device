@@ -712,6 +712,9 @@ async def cmd_test(a):
             # heard; logs, screenshots and audio levels are taken as usual.
             env.setdefault("MV_HIDDEN", "1")
             env.setdefault("KL_FULL", "0")
+        # Vulkan titles: once a second, whether GPU work is seen to finish and
+        # what render targets and views are made, destroyed and left behind.
+        env.setdefault("KL_TRACE_VK_LIFE", "1")
         if hands_only(tree):
             # What the hand gate sees (camera, joint distances, each Hand's
             # flags): the input probe, off everywhere else for its side effects.
