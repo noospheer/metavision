@@ -3002,122 +3002,10 @@ if marker not in s:
 print("overlay: denormal float literals kept as bit casts in GLSL ES 3.00+ shaders")
 PYEOF
 
-# 51 — the views left on a destroyed render target go with it. A title made a
-# full-size depth target every frame and destroyed it, but never destroyed its
-# five image views. In MoltenVK an image view holds a reference on its image (and
-# its Metal view retains the parent texture), so each frame's ~75 MB depth image
-# was never freed and the process was killed for memory within two seconds
-# (step 48's census: device memory flat, image views +5 a frame). Views made on a
-# large attachment image (the step 39 census set) are tracked; when that image is
-# destroyed, the views still open on it are destroyed first and leave the table.
-# Their handles go into a short ring: a guest's own later destroy of one is
-# swallowed, unless a new view has since been created on that same handle (the
-# allocator reuses them), which takes it off the ring. Using a view after its
-# image is destroyed is invalid Vulkan, so a correct guest cannot notice. The
-# census line also counts the guest's own view destroys.
-python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-marker = "metavision: views go with their render target (step 51)"
-def sub(s, old, new):
-    if s.count(old) != 1:
-        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
-    return s.replace(old, new)
-if marker not in s:
-    if "metavision: memory and view census (step 48)" not in s:
-        sys.exit("overlay: step 51 needs step 48 (the view census)")
-    s = sub(s, "static void VKAPI_CALL mv_DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {\n",
-        "// " + marker + "\n"
-        "#define MV_RV_N 4096\n"
-        "#define MV_RV_RING 256\n"
-        "static pthread_mutex_t mv_rv_lock = PTHREAD_MUTEX_INITIALIZER;\n"
-        "static struct { VkImageView v; VkImage img; } mv_rv[MV_RV_N];     // live, tracked\n"
-        "static VkImageView mv_rv_ring[MV_RV_RING];                         // reaped, not yet destroyed by the guest\n"
-        "static unsigned mv_rv_ring_at, mv_rv_reaped, mv_rv_full_said;\n"
-        "static _Atomic unsigned long mv_guest_view_destroys;\n"
-        "static int mv_rt_has(VkImage img);   // step 39's census set\n"
-        "static void mv_view_map_del(VkImageView v) {   // the upstream view->image map, which never shrank\n"
-        "    pthread_mutex_lock(&g_view_map_lock);\n"
-        "    for (int i = g_view_map_n - 1; i >= 0; i--)\n"
-        "        if (g_view_map[i].view == v) { g_view_map[i] = g_view_map[--g_view_map_n]; break; }\n"
-        "    pthread_mutex_unlock(&g_view_map_lock);\n"
-        "}\n"
-        "static void mv_rv_ring_drop(VkImageView v) {   // caller holds mv_rv_lock\n"
-        "    for (int i = 0; i < MV_RV_RING; i++) if (mv_rv_ring[i] == v) mv_rv_ring[i] = VK_NULL_HANDLE;\n"
-        "}\n"
-        "static void mv_rv_note(VkImageView v, VkImage img) {   // a new view\n"
-        "    if (!v) return;\n"
-        "    int track = mv_rt_has(img);\n"
-        "    pthread_mutex_lock(&mv_rv_lock);\n"
-        "    mv_rv_ring_drop(v);                 // a reused handle is a new, live view\n"
-        "    if (track) {\n"
-        "        int i;\n"
-        "        for (i = 0; i < MV_RV_N; i++) if (!mv_rv[i].v) { mv_rv[i].v = v; mv_rv[i].img = img; break; }\n"
-        "        if (i == MV_RV_N && !mv_rv_full_said++)\n"
-        "            fprintf(stderr, \"  [vk] view tracking table full: further views are not reaped\\n\");\n"
-        "    }\n"
-        "    pthread_mutex_unlock(&mv_rv_lock);\n"
-        "}\n"
-        "static void mv_rv_reap(VkDevice dev, VkImage img) {        // its image is going\n"
-        "    static PFN_vkDestroyImageView real;\n"
-        "    if (!real && real_gdpa) real = (PFN_vkDestroyImageView)real_gdpa(dev, \"vkDestroyImageView\");\n"
-        "    if (!real || !img) return;\n"
-        "    pthread_mutex_lock(&mv_rv_lock);\n"
-        "    for (int i = 0; i < MV_RV_N; i++)\n"
-        "        if (mv_rv[i].v && mv_rv[i].img == img) {\n"
-        "            VkImageView v = mv_rv[i].v;\n"
-        "            mv_rv[i].v = VK_NULL_HANDLE;\n"
-        "            real(dev, v, NULL);\n"
-        "            mv_view_map_del(v);\n"
-        "            mv_views_live--;\n"
-        "            mv_rv_ring[mv_rv_ring_at++ % MV_RV_RING] = v;\n"
-        "            if (mv_rv_reaped++ < 4)\n"
-        "                fprintf(stderr, \"  [vk] view %p destroyed with its render target %p \"\n"
-        "                        \"(the guest left it open)\\n\", (void *)v, (void *)img);\n"
-        "        }\n"
-        "    pthread_mutex_unlock(&mv_rv_lock);\n"
-        "}\n"
-        "static int mv_rv_forget(VkImageView v) {   // the guest destroys a view: 1 = already gone\n"
-        "    int gone = 0;\n"
-        "    pthread_mutex_lock(&mv_rv_lock);\n"
-        "    for (int i = 0; i < MV_RV_RING; i++)\n"
-        "        if (mv_rv_ring[i] == v) { mv_rv_ring[i] = VK_NULL_HANDLE; gone = 1; break; }\n"
-        "    if (!gone)\n"
-        "        for (int i = 0; i < MV_RV_N; i++) if (mv_rv[i].v == v) { mv_rv[i].v = VK_NULL_HANDLE; break; }\n"
-        "    pthread_mutex_unlock(&mv_rv_lock);\n"
-        "    return gone;\n"
-        "}\n"
-        "static void VKAPI_CALL mv_DestroyImageView(VkDevice dev, VkImageView v, const VkAllocationCallbacks *a) {\n")
-    s = sub(s, "    if (v) mv_views_live--;\n",
-               "    if (v) mv_guest_view_destroys++;   // metavision (step 51)\n"
-               "    if (v) mv_view_map_del(v);\n"
-               "    if (v && mv_rv_forget(v)) return;   // went with its image\n"
-               "    if (v) mv_views_live--;\n")
-    s = sub(s, "                \"allocation(s); image views live %ld\\n\", mv_rt_who,\n"
-               "                mv_mem_bytes >> 20, mv_mem_count, (long)mv_views_live);\n",
-               "                \"allocation(s); image views live %ld (guest destroyed %lu)\\n\", mv_rt_who,\n"
-               "                mv_mem_bytes >> 20, mv_mem_count, (long)mv_views_live,\n"
-               "                (unsigned long)mv_guest_view_destroys);\n")
-    s = sub(s, "static void mv_rt_del(VkImage img) {\n",
-               "static int mv_rt_has(VkImage img) {   // metavision (step 51)\n"
-               "    int has = 0;\n"
-               "    if (!img) return 0;\n"
-               "    pthread_mutex_lock(&mv_rt_lock);\n"
-               "    for (unsigned i = 0; i < 1024; i++) if (mv_rt[i] == img) { has = 1; break; }\n"
-               "    pthread_mutex_unlock(&mv_rt_lock);\n"
-               "    return has;\n"
-               "}\n"
-               "static void mv_rt_del(VkImage img) {\n")
-    s = sub(s, "    mv_rt_del(img);   // metavision (step 39)\n",
-               "    if (mv_rt_has(img)) mv_rv_reap(dev, img);   // metavision (step 51)\n"
-               "    mv_rt_del(img);   // metavision (step 39)\n")
-    s = sub(s, "    if (klvk_ivr == VK_SUCCESS) mv_views_live++;   // metavision (step 48)\n",
-               "    if (klvk_ivr == VK_SUCCESS) mv_views_live++;   // metavision (step 48)\n"
-               "    if (klvk_ivr == VK_SUCCESS && out && ci) mv_rv_note(*out, ci->image);   // metavision (step 51)\n")
-    open(p, "w").write(s)
-print("overlay: views left open on a destroyed render target are destroyed with it")
-PYEOF
+# 51 — (withdrawn) destroying a render target's leftover image views ourselves
+# aliased handles: the allocator hands a freed view's address to the guest's
+# next view, and the guest's own later destroy then freed the live one twice.
+# The leak it aimed at is not in the views (see step 55's footprint trace).
 
 # 52 — autoplay presses Unity UI buttons for certain. The scripted input aims at
 # what the screen shows and clicks, so a menu button at the edge of view (a
@@ -3371,4 +3259,81 @@ if marker not in s:
                '    // metavision: path-mapped entries first (step 34)')
     open(p, "w").write(s)
 print("overlay: a wake written to a full emulated eventfd is taken as written")
+PYEOF
+
+# 55 — the footprint climb is traced. A title killed for memory went from 0.6 GB
+# to the 8 GB limit inside one two-second heartbeat, so no log line showed what
+# grew or when. The footprint sampler now runs from process start without
+# KL_MEM_LOG: it polls every 100 ms and prints only when the footprint has risen
+# 256 MiB above the last line (with the frame time), so a healthy title prints a
+# few lines and a runaway one prints its climb. KL_MEM_LOG=1 keeps the old
+# two-second heartbeat. The Vulkan census line carries the footprint too.
+python3 - "$K/runtime" <<'PYEOF'
+import sys
+rt = sys.argv[1]
+def patch(path, old, new, marker):
+    s = open(path).read()
+    if marker in s:
+        return
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {path}: {old[:60]!r}")
+    open(path, "w").write(s.replace(old, new))
+L = f"{rt}/libc/kl_libc.c"
+patch(L,
+      "static void kl_mem_log_maybe_start(void) {\n"
+      "    static _Atomic int started;\n"
+      "    if (atomic_exchange(&started, 1)) return;\n"
+      "    if (!kl_env_on(\"KL_MEM_LOG\", 0)) return;\n"
+      "    pthread_t t;\n"
+      "    pthread_create(&t, NULL, kl_mem_log_thread, NULL);\n"
+      "    pthread_detach(t);\n"
+      "}\n",
+      "// metavision: footprint climb traced (step 55)\n"
+      "static void *mv_mem_steps_thread(void *arg) {\n"
+      "    (void)arg;\n"
+      "    uint64_t said = 0;\n"
+      "    struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);\n"
+      "    for (;;) {\n"
+      "        task_vm_info_data_t    ti;\n"
+      "        mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;\n"
+      "        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &cnt) == KERN_SUCCESS) {\n"
+      "            uint64_t now = (uint64_t)ti.phys_footprint, peak = atomic_load(&g_mem_peak);\n"
+      "            while (now > peak && !atomic_compare_exchange_weak(&g_mem_peak, &peak, now)) { }\n"
+      "            if (now >= said + (256ull << 20)) {\n"
+      "                struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);\n"
+      "                double s = (double)(t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;\n"
+      "                fprintf(stderr, \"  [mem] footprint %llu MiB at %.1f s\\n\",\n"
+      "                        (unsigned long long)(now >> 20), s);\n"
+      "                said = now;\n"
+      "            }\n"
+      "        }\n"
+      "        struct timespec iv = { 0, 100000000 };\n"
+      "        nanosleep(&iv, NULL);\n"
+      "    }\n"
+      "    return NULL;\n"
+      "}\n"
+      "static void kl_mem_log_maybe_start(void) {\n"
+      "    static _Atomic int started;\n"
+      "    if (atomic_exchange(&started, 1)) return;\n"
+      "    pthread_t t;\n"
+      "    pthread_create(&t, NULL, kl_env_on(\"KL_MEM_LOG\", 0) ? kl_mem_log_thread : mv_mem_steps_thread, NULL);\n"
+      "    pthread_detach(t);\n"
+      "}\n"
+      "__attribute__((constructor)) static void mv_mem_steps_start(void) { kl_mem_log_maybe_start(); }\n",
+      "metavision: footprint climb traced (step 55)")
+V = f"{rt}/gfx/kl_vulkan.c"
+patch(V,
+      "        fprintf(stderr, \"  [vk-mem] depth target #%d: device memory live %llu MiB in %llu \"\n",
+      "        { task_vm_info_data_t ti; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;   // metavision (step 55)\n"
+      "          if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&ti, &cnt) == KERN_SUCCESS)\n"
+      "              fprintf(stderr, \"  [vk-mem] footprint %llu MiB\\n\", (unsigned long long)(ti.phys_footprint >> 20)); }\n"
+      "        fprintf(stderr, \"  [vk-mem] depth target #%d: device memory live %llu MiB in %llu \"\n",
+      "metavision (step 55)")
+s = open(V).read()
+if "#include <mach/mach.h>" not in s:
+    s = s.replace("#include <vulkan/vulkan.h>", "#include <vulkan/vulkan.h>\n#include <mach/mach.h>   // metavision (step 55)", 1)
+    if "#include <mach/mach.h>" not in s:
+        sys.exit("overlay: step 55 could not include mach/mach.h in kl_vulkan.c")
+    open(V, "w").write(s)
+print("overlay: footprint climb traced from process start; census line carries the footprint")
 PYEOF
