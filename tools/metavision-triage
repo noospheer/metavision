@@ -35,7 +35,11 @@ HANDS = "[mv-hands] the title reads hand state"
 SERIOUS = re.compile(r"Exception|GLSL compilation failed|Kernel at index|Shader error|"
                      r"Failed to (create|compile|load)|is not supported|shader compiler platform", re.I)
 AUDIO = re.compile(r"guest PCM so far: peak (\d+)/")
-SHOT = re.compile(r"\[mv-shot\] (shot_\d+\.png) mean (\d+) spread (\d+|nan) lit (\d+)%")
+SHOT = re.compile(r"\[mv-shot\] (shot_\d+\.png) mean (\d+) spread (\d+|nan) lit (\d+)%(?: detail ([\d.]+)%)?")
+# GLES compute and storage buffers (ES 3.1) are not available on the ES 3.0
+# context: Unity's compute shaders come back as shader 0 ("no infolog") and its
+# std430 blocks do not compile. A known limitation, reported, not an error.
+GLES_COMPUTE = re.compile(r"GLSL compilation failed, no infolog provided|'std430' : invalid layout qualifier")
 # The title asked for passthrough, which is not available: a black background is by design.
 PASSTHROUGH = re.compile(r"Failed to initialize Insight Passthrough|doesn't support XR_FB_passthrough")
 # The title records (the microphone is an input it reacts to).
@@ -58,6 +62,39 @@ def shipped_libs(d: Path):
     return None
 
 
+def load_failures(text: str, shipped):
+    """Libraries that failed to load and matter: the title ships them, or the
+    runtime provides them (libvulkan.so). Unity probes a plugin under several
+    names, and settings can name a plugin the APK does not carry — misses a
+    Quest makes too."""
+    return [n for n in sorted({m.group(1).rsplit("/", 1)[-1] for m in DLFAIL.finditer(text)})
+            if n in RUNTIME_LIBS or shipped is None or n in shipped]
+
+
+def unity_errors(text: str, shipped):
+    """Unity error lines that count, keyed with numbers folded: not benign, not
+    a plugin the APK does not carry (the same on a Quest), not the GLES-compute
+    limitation (reported on its own)."""
+    errs = {}
+    for m in UNITY_E.finditer(text):
+        if BENIGN.search(m.group(1)) or GLES_COMPUTE.search(m.group(1)):
+            continue
+        dll = re.search(r"DllNotFoundException: Unable to load DLL '([^']+)'", m.group(1))
+        if dll and shipped is not None and f"lib{dll.group(1)}.so" not in shipped and f"{dll.group(1)}.so" not in shipped:
+            continue
+        k = re.sub(r"\d+", "N", m.group(1))[:110]
+        errs[k] = errs.get(k, 0) + 1
+    return errs
+
+
+def shot_has_content(m) -> bool:
+    """A screenshot with a picture: lit and varied, or detailed — a starfield or
+    a thin grid is dim but drawn (1.5% of pixels on a sharp edge; controller
+    rays alone stay under 1%)."""
+    lit_ok = int(m.group(4)) >= 3 and (m.group(3) != "nan" and int(m.group(3)) >= 4)
+    return lit_ok or (m.group(5) is not None and float(m.group(5)) >= 1.5)
+
+
 def triage(d: Path):
     boot = d / "klepton-boot.log"
     if not boot.is_file():
@@ -71,29 +108,17 @@ def triage(d: Path):
     # names, and settings can name a plugin the APK does not carry — misses a
     # Quest makes too.
     shipped = shipped_libs(d)
-    notes = []
-    for n in sorted({m.group(1).rsplit("/", 1)[-1] for m in DLFAIL.finditer(text)}):
-        if n in RUNTIME_LIBS or shipped is None or n in shipped:
-            notes.append(f"could not load {n}")
+    notes = [f"could not load {n}" for n in load_failures(text, shipped)]
     ending = "running when closed"
     if m := FATAL.search(text):
         ending = "stopped: " + m.group(1).strip()
-    errs = {}
-    for m in UNITY_E.finditer(text):
-        if BENIGN.search(m.group(1)):
-            continue
-        dll = re.search(r"DllNotFoundException: Unable to load DLL '([^']+)'", m.group(1))
-        if dll and shipped is not None and f"lib{dll.group(1)}.so" not in shipped and f"{dll.group(1)}.so" not in shipped:
-            continue                  # a plugin the APK does not carry: the same on a Quest
-        k = re.sub(r"\d+", "N", m.group(1))[:110]
-        errs[k] = errs.get(k, 0) + 1
+    errs = unity_errors(text, shipped)
     for k, n in sorted(errs.items(), key=lambda kv: -kv[1])[:3]:
         notes.append(f"Unity error x{n}: {k}")
-    shots = [(m.group(1), int(m.group(2)), 0 if m.group(3) == "nan" else int(m.group(3)), int(m.group(4)))
-             for m in SHOT.finditer(text)]
+    shots = list(SHOT.finditer(text))
     if shots:
-        dark = [sh for sh in shots if sh[3] < 3 or sh[2] < 4]     # under 3% lit, or one flat colour
-        if max(sh[3] for sh in shots) == 0:
+        dark = [sh for sh in shots if not shot_has_content(sh)]
+        if all(int(sh.group(4)) == 0 and float(sh.group(5) or 0) == 0 for sh in shots):
             notes.append(f"BLACK CONTENT: all {len(shots)} screenshot(s) dark or flat")
         elif len(shots) - len(dark) < 2:
             # Something drawn, but at most one shot with real content: a sparse or
@@ -103,6 +128,8 @@ def triage(d: Path):
             notes.append(f"screenshots: {len(shots)} ({len(dark)} dark/flat) in this folder")
     if PASSTHROUGH.search(text):
         notes.append("needs passthrough (not available)")
+    if GLES_COMPUTE.search(text):
+        notes.append("needs GLES compute (not available): its compute effects are missing")
     peaks = [int(m.group(1)) for m in AUDIO.finditer(text)]
     if peaks and max(peaks) == 0:
         notes.append("SILENT: the title produced no sound (audio peak 0)"
@@ -149,18 +176,20 @@ def triage(d: Path):
     return started, pics, ending, notes, serious
 
 
-def healthy_so_far(text: str):
+def healthy_so_far(text: str, shipped=None):
     """Whether a run in progress has already shown everything a pass needs, so
     `test --adaptive` can end it early: at least two screenshots with a picture,
     sound, the input-mode cycle through hands and hands-free, and nothing
     serious — no fault, no fatal stop, no failed library load, no serious Unity
     error. Returns (ok, what is still missing)."""
-    if FAULT.search(text) or FATAL.search(text) or DLFAIL.search(text):
+    # The same tests triage() applies at the end, so a run ends early only when
+    # its final verdict would be a pass.
+    if FAULT.search(text) or FATAL.search(text) or load_failures(text, shipped):
         return False, "a fault, stop or failed load"
-    if any(SERIOUS.search(m.group(1)) and not BENIGN.search(m.group(1)) for m in UNITY_E.finditer(text)):
+    if any(SERIOUS.search(k) for k in unity_errors(text, shipped)):
         return False, "a serious error"
-    lit = [m for m in SHOT.finditer(text) if int(m.group(4)) >= 3 and int(m.group(3)) >= 4]
-    if len(lit) < 2:
+    lit = [m for m in SHOT.finditer(text) if shot_has_content(m)]
+    if len(lit) < 2 and not re.search(r"\[mv-shot\] eye format \d+ not captured", text):   # no shots to wait for
         return False, "two screenshots with a picture"
     if max((int(m.group(1)) for m in AUDIO.finditer(text)), default=0) == 0:
         return False, "sound"
@@ -209,10 +238,10 @@ def verdict(d: Path, exited=None):
         v, ending = "crashed", f"exited by itself after {exited} s"
     elif pics == 0 or any(n.startswith("BLACK CONTENT") for n in notes):
         v = "black"
+    elif serious or any(n.startswith("could not load") for n in notes):
+        v = "errors"    # ahead of dark: a serious error is not hidden behind a dim picture
     elif any(n.startswith("DARK CONTENT") for n in notes):
         v = "dark"
-    elif serious or any(n.startswith("could not load") for n in notes):
-        v = "errors"
     elif any(n.startswith("SILENT") for n in notes):
         v = "silent"   # drew, no serious error, but never made a sound
     else:

@@ -724,6 +724,7 @@ async def cmd_test(a):
         early = None
         cap = 25 if probe else state["seconds"] + (25 if hands_only(tree) else 0)   # + the start gesture
         seen, text = 0, ""                     # --adaptive: the boot log read so far
+        adaptive_said = False
         while time.time() - t0 < cap:
             await asyncio.sleep(5)
             if await pc.process_identifier_for_bundle_identifier(bundle) != pid:
@@ -742,12 +743,14 @@ async def cmd_test(a):
                         finally:
                             await afc.fclose(h)
                         seen = size
-                    ok, _missing = triage.healthy_so_far(text)
+                    ok, _missing = triage.healthy_so_far(text, triage.shipped_libs(out))
                     if ok:
                         early = round(time.time() - t0)
                         break
-                except Exception:
-                    pass
+                except Exception as e:
+                    if not adaptive_said:          # a silent failure here meant no run ever ended early
+                        adaptive_said = True
+                        print(f"  (adaptive read failed: {type(e).__name__}: {e})", end="", flush=True)
         if exited is None:
             try:
                 await pc.kill(pid)
@@ -761,6 +764,7 @@ async def cmd_test(a):
             # last run's logs under logs/<title>/ when the next title starts.
             why = None
             for attempt in range(3):
+                src = None
                 try:
                     src = afc if attempt == 0 else await HouseArrestService.create(rsd, bundle)
                     for path in (f"Documents/{f}", f"Documents/logs/{title}/{f}"):
@@ -770,10 +774,16 @@ async def cmd_test(a):
                             break
                         except Exception as e:
                             why = e
-                    if f in got:
-                        break
                 except Exception as e:
                     why = e
+                finally:
+                    if src is not None and src is not afc:   # a retry's own connection: closed, not left pending
+                        try:
+                            await src.close()
+                        except Exception:
+                            pass
+                if f in got:
+                    break
                 await asyncio.sleep(2)
             if f == "klepton-boot.log" and f not in got and not probe:
                 print(f"  (boot log not pulled: {type(why).__name__}: {why})", end="", flush=True)

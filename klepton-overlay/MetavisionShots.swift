@@ -1,5 +1,5 @@
 // Screenshots for test passes: with MV_AUTOPLAY=1 (or MV_SHOTS=1) the left-eye
-// image the title drew is saved every 15 s as Documents/shots/shot_NN.png,
+// image the title drew is saved every 10 s as Documents/shots/shot_NN.png,
 // about 768 px wide, and each one is logged with how bright and how varied it
 // is ([mv-shot]), so a pass can tell "drew frames" from "drew something":
 // metavision-device test pulls the PNGs beside the logs and metavision-triage
@@ -21,7 +21,7 @@ enum MetavisionShots {
     /// and no panels over passthrough, and the audio output is silenced — so
     /// the headset can be worn for other things while a pass runs.
     static let hidden: Bool = getenv("MV_HIDDEN").map { String(cString: $0) != "0" } ?? false
-    private static let every: Double = 15
+    private static let every: Double = 10
     private static let width = 768
     nonisolated(unsafe) private static var last: Double = 0
     nonisolated(unsafe) private static var count = 0
@@ -39,8 +39,9 @@ enum MetavisionShots {
         let now = ProcessInfo.processInfo.systemUptime
         lock.lock()
         if last == 0 {
-            // First picture: start the folder afresh; the first shot comes 5 s in.
-            last = now - every + 5
+            // First picture: start the folder afresh. The first shot comes one
+            // interval in: a shot at 5 s showed the loading screen in every title.
+            last = now
             try? FileManager.default.removeItem(at: dir)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
@@ -82,9 +83,10 @@ enum MetavisionShots {
         let ow = w / step, oh = h / step
         let src = buf.contents().assumingMemoryBound(to: UInt8.self)
         var out = [UInt8](repeating: 255, count: ow * oh * 4)
-        var sum = 0.0, sumSq = 0.0, lit = 0
+        var sum = 0.0, sumSq = 0.0, lit = 0, edges = 0
         for y in 0..<oh {
             let sy = flip ? (h - 1 - y * step) : y * step
+            var prev = -1.0
             for x in 0..<ow {
                 let p = src + sy * bpr + x * step * 4
                 let r = Int(bgra ? p[2] : p[0]), g = Int(p[1]), bl = Int(bgra ? p[0] : p[2])
@@ -93,6 +95,10 @@ enum MetavisionShots {
                 let luma = 0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(bl)
                 sum += luma; sumSq += luma * luma
                 if luma > 24 { lit += 1 }
+                // Detail: a sharp step from the pixel to its left. A starfield or a
+                // thin grid is dim but drawn; a flat or empty frame has none.
+                if prev >= 0 && abs(luma - prev) > 16 { edges += 1 }
+                prev = luma
             }
         }
         let n = Double(ow * oh)
@@ -108,7 +114,7 @@ enum MetavisionShots {
             CGImageDestinationAddImage(dest, img, nil)
             CGImageDestinationFinalize(dest)
         }
-        NSLog("[mv-shot] %@ mean %.0f spread %.0f lit %.0f%%", url.lastPathComponent as NSString,
-              mean, spread, 100 * Double(lit) / n)
+        NSLog("[mv-shot] %@ mean %.0f spread %.0f lit %.0f%% detail %.1f%%", url.lastPathComponent as NSString,
+              mean, spread, 100 * Double(lit) / n, 100 * Double(edges) / n)
     }
 }

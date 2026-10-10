@@ -3069,12 +3069,16 @@ static const char *mv_kind(Il2CppClass *k) {
     }
     return NULL;
 }
-static int mv_unsafe(const char *s) {   // labels that read like leaving the title
+static int mv_unsafe(const char *s) {   // labels that read like leaving the title, losing data or a dead end
     static const char *bad[] = { "quit", "exit", "leave", "logout", "log out", "sign out",
-                                 "main menu", "home", "back", "delete", "reset", "restart", 0 };
+                                 "main menu", "home", "back", "delete", "reset", "restart",
+                                 "clear", "erase", "wipe", "remove", "uninstall",          // saved data
+                                 "privacy", "policy", "terms", "url", "link", "website",   // external pages
+                                 "buy", "purchase", "debug", "crash", "developer", 0 };   // a store, a test crash
     char l[128]; size_t i = 0;
     for (; s[i] && i < 127; i++) l[i] = (char)tolower((unsigned char)s[i]);
     l[i] = 0;
+    if (i == 1) return 1;   // one character: an on-screen keyboard key
     for (int b = 0; bad[b]; b++)
         for (char *q = strstr(l, bad[b]); q; q = strstr(q + 1, bad[b]))
             if (q == l || !isalpha((unsigned char)q[-1])) return 1;
@@ -3336,4 +3340,89 @@ if "#include <mach/mach.h>" not in s:
         sys.exit("overlay: step 55 could not include mach/mach.h in kl_vulkan.c")
     open(V, "w").write(s)
 print("overlay: footprint climb traced from process start; census line carries the footprint")
+PYEOF
+
+# 56 — an unimplemented Java call shows its strings. A title's own logger (a Java
+# class in its APK, which the runtime does not run) received every line the title
+# wrote, so a run that quit through its own debug path left only "no host
+# implementation for ...log(ILjava/lang/String;Z)V" a thousand times. In
+# permissive mode the String arguments of such a call are now printed with it
+# (first 240 bytes each, at most 600 lines a run): the title's log becomes part
+# of ours.
+python3 - "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: an unimplemented call shows its strings (step 56)"
+if marker not in s:
+    old = ('    KLJ_LOG("no host implementation for %s.%s%s", w->cls, w->name, w->sig);\n'
+           '    if (!g_permissive) {\n')
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old,
+        '    KLJ_LOG("no host implementation for %s.%s%s", w->cls, w->name, w->sig);\n'
+        '    if (g_permissive && strstr(w->sig, "Ljava/lang/String;")) {   // ' + marker + '\n'
+        '        static _Atomic unsigned mv_lines;\n'
+        '        klj_val argv[KLJ_MAX_ARGS];\n'
+        '        int argc = va ? klj_decode_args(w->sig, va, argv) : klj_decode_args_a(w->sig, args, argv);\n'
+        '        const char *q = w->sig + 1;\n'
+        '        for (int i = 0; i < argc && *q && *q != \')\'; i++) {\n'
+        '            int arr = 0;\n'
+        '            while (*q == \'[\') { arr = 1; q++; }\n'
+        '            int str = !arr && strncmp(q, "Ljava/lang/String;", 18) == 0;\n'
+        '            if (*q == \'L\') { while (*q && *q != \';\') q++; if (*q) q++; } else q++;\n'
+        '            if (!str || !argv[i].l) continue;\n'
+        '            const char *t = klj_str(argv[i].l);\n'
+        '            if (t && *t && mv_lines++ < 600)\n'
+        '                fprintf(stderr, "[jni]   %s arg %d: \\"%.240s\\"\\n", w->name, i, t);\n'
+        '        }\n'
+        '    }\n'
+        '    if (!g_permissive) {\n', 1)
+    open(p, "w").write(s)
+print("overlay: unimplemented Java calls print their String arguments")
+PYEOF
+
+# 57 — file locks are translated, not refused. SQLite takes its database locks
+# with fcntl(F_SETLK); refused (EINVAL), every open reported "disk I/O error"
+# and a title waited forever on a database it could not check. Linux arm64's
+# struct flock is {short type, short whence, off_t start, off_t len, pid_t pid}
+# and Darwin's {off_t start, off_t len, pid_t pid, short type, short whence};
+# the lock types differ too (Linux RD/WR/UN 0/1/2, Darwin 1/3/2). The call is
+# made on a Darwin copy and F_GETLK's answer is written back. Linux's
+# open-file-description locks (36/37/38) are taken as the process locks they
+# coincide with for a single-process guest.
+python3 - "$K/runtime/libc/kl_libc.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: file locks translated (step 57)"
+if marker not in s:
+    old = ('    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:\n'
+           '        warn_once("fcntl file locking (struct flock layout differs) — refused");\n'
+           '        errno = EINVAL;\n'
+           '        return -1;\n')
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old,
+        '    case LX_F_GETLK: case LX_F_SETLK: case LX_F_SETLKW:   // ' + marker + '\n'
+        '    case 36: case 37: case 38: {                          // F_OFD_GETLK / SETLK / SETLKW\n'
+        '        struct lx_flock { short type, whence; int pad; int64_t start, len; int pid, pad2; };\n'
+        '        struct lx_flock *lf = (struct lx_flock *)arg;\n'
+        '        if (!lf) { errno = EFAULT; return -1; }\n'
+        '        static const short to_d[3] = { F_RDLCK, F_WRLCK, F_UNLCK };\n'
+        '        if (lf->type < 0 || lf->type > 2) { errno = EINVAL; return -1; }\n'
+        '        struct flock df = { .l_start = lf->start, .l_len = lf->len, .l_pid = lf->pid,\n'
+        '                            .l_type = to_d[lf->type], .l_whence = lf->whence };\n'
+        '        int dc = (cmd == LX_F_GETLK || cmd == 36) ? F_GETLK\n'
+        '               : (cmd == LX_F_SETLK || cmd == 37) ? F_SETLK : F_SETLKW;\n'
+        '        int r = fcntl(fd, dc, &df);\n'
+        '        if (r == 0 && dc == F_GETLK) {\n'
+        '            lf->type = df.l_type == F_RDLCK ? 0 : df.l_type == F_WRLCK ? 1 : 2;\n'
+        '            lf->whence = df.l_whence; lf->start = df.l_start; lf->len = df.l_len;\n'
+        '            lf->pid = (cmd == 36) ? -1 : df.l_pid;\n'
+        '        }\n'
+        '        return r;\n'
+        '    }\n', 1)
+    open(p, "w").write(s)
+print("overlay: fcntl file locks translated between the Linux and Darwin layouts")
 PYEOF
