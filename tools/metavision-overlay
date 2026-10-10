@@ -3426,3 +3426,834 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: fcntl file locks translated between the Linux and Darwin layouts")
 PYEOF
+
+# 58 — a video's soundtrack is demuxed and decoded. The NDK extractor exposed
+# only a file's video track (getTrackCount answered 1), so a title playing an
+# MP4 with a stereo AAC soundtrack through Unity's VideoPlayer showed the
+# picture and never made a sound. The file's first AAC track is now a second
+# track: its format carries mime audio/mp4a-latm, sample-rate, channel-count,
+# durationUs, max-input-size, language and csd-0 (the AudioSpecificConfig,
+# read from the track's esds cookie or built from the stream description).
+# Samples are compressed AAC access units, one per packet, read with a second
+# AVAssetReader (nil output settings), and the extractor interleaves the
+# selected tracks by timestamp as Android does: selectTrack builds the set
+# (nothing selected still means the video track alone, as before), the sample
+# calls answer for the earliest selected sample, advance moves only that
+# track, seekTo moves both. AMediaCodec "audio/mp4a-latm" is an AudioConverter
+# (AAC -> 16-bit interleaved PCM) configured from csd-0, on the same input and
+# output buffer model as the video codec; its output buffers are CPU-readable,
+# it reports OUTPUT_FORMAT_CHANGED (audio/raw, sample-rate, channel-count,
+# pcm-encoding 2) ahead of the first one, and end of stream comes back as an
+# empty buffer flagged EOS. The decoded PCM then goes wherever the title's
+# own audio mixer sends it. A file with no AAC track is unchanged (one track).
+# MV_VIDEO_AUDIO=0 turns all of it off.
+python3 - "$K/runtime/media" <<'PYEOF'
+import sys
+d = sys.argv[1]
+marker = "metavision: video soundtrack (step 58)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+
+# --- kl_avdec.h: the audio half of the demux interface -----------------------
+p = f"{d}/kl_avdec.h"
+s = open(p).read()
+if marker not in s:
+    old = "int  kl_avdemux_seek_us(kl_avdemux *m, long long us);\n"
+    s = sub(p, s, old, old +
+        "\n"
+        "// " + marker + ": the file's first AAC track, as a second stream.\n"
+        "// audio_info is 0 when there is none (or MV_VIDEO_AUDIO=0); any out-param may be\n"
+        "// NULL. `asc` is the AudioSpecificConfig (owned by the demuxer). The sample calls\n"
+        "// mirror the video ones: one AAC access unit per sample, -1 / 0 at end of stream.\n"
+        "int       kl_avdemux_audio_info(kl_avdemux *m, int *rate, int *channels,\n"
+        "                                long long *duration_us,\n"
+        "                                const unsigned char **asc, size_t *asc_len);\n"
+        "long long kl_avdemux_audio_sample_time_us(kl_avdemux *m);\n"
+        "long      kl_avdemux_audio_read(kl_avdemux *m, unsigned char *buf, unsigned long cap);\n"
+        "int       kl_avdemux_audio_advance(kl_avdemux *m);\n"
+        "int       kl_avdemux_audio_seek_us(kl_avdemux *m, long long us);\n")
+    open(p, "w").write(s)
+
+# --- kl_avdec.m: read the AAC track's packets ---------------------------------
+p = f"{d}/kl_avdec.m"
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s,
+        "    int            cur_key;\n"
+        "    int            eos;\n"
+        "};\n",
+        "    int            cur_key;\n"
+        "    int            eos;\n"
+        "\n"
+        "    // " + marker + "\n"
+        "    int            a_on;             // an AAC track is open\n"
+        "    void          *a_track, *a_reader, *a_out;   // CFBridgingRetain'd\n"
+        "    int            a_rate, a_ch, a_fpp;\n"
+        "    unsigned char  a_asc[64];\n"
+        "    size_t         a_asc_len;\n"
+        "    unsigned char *a_data;           // the current sample buffer's bytes\n"
+        "    struct mv_apk { size_t off, size; long long pts_us; } *a_pk;   // its packets\n"
+        "    long           a_npkt, a_pkt;    // packet count, current packet\n"
+        "    int            a_eos;\n"
+        "};\n")
+    code = r'''// metavision: video soundtrack (step 58)
+//
+// A compressed audio sample buffer usually holds several AAC packets; each one
+// is a sample of its own to the extractor, timed from the buffer's pts by the
+// frames each packet carries. csd-0 comes out of the track's magic cookie (an
+// esds ES_Descriptor, or a bare AudioSpecificConfig) and is built from the
+// stream description when neither parses.
+static int mv_a_is_aac(AVAssetTrack *t) {
+    CMFormatDescriptionRef fmt = (__bridge CMFormatDescriptionRef)t.formatDescriptions.firstObject;
+    if (!fmt) return 0;
+    FourCharCode sub = CMFormatDescriptionGetMediaSubType(fmt);
+    return sub == kAudioFormatMPEG4AAC || sub == kAudioFormatMPEG4AAC_HE ||
+           sub == kAudioFormatMPEG4AAC_HE_V2;
+}
+
+static AVAssetTrack *mv_first_aac_track(AVAsset *asset) {
+    __block NSArray<AVAssetTrack *> *all = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [asset loadTracksWithMediaType:AVMediaTypeAudio
+                 completionHandler:^(NSArray<AVAssetTrack *> *tracks, NSError *err) {
+        (void)err;
+        all = tracks;
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+    for (AVAssetTrack *t in all)
+        if (mv_a_is_aac(t)) return t;
+    return nil;
+}
+
+static int mv_desc_len(const uint8_t *p, size_t n, size_t *o, size_t *len) {
+    size_t l = 0;
+    for (int i = 0; i < 4; i++) {
+        if (*o >= n) return 0;
+        uint8_t b = p[(*o)++];
+        l = (l << 7) | (b & 0x7f);
+        if (!(b & 0x80)) break;
+    }
+    *len = l;
+    return 1;
+}
+
+static int mv_asc_from_cookie(const uint8_t *p, size_t n, uint8_t *asc, size_t cap,
+                              size_t *asc_len) {
+    if (!p || !n) return 0;
+    if (n <= 16 && p[0] != 0x03 && p[0] != 0x00) {     // a bare AudioSpecificConfig
+        if (n > cap) return 0;
+        memcpy(asc, p, n); *asc_len = n;
+        return 1;
+    }
+    size_t o = 0, len = 0;
+    if (n > 4 && p[0] != 0x03 && p[4] == 0x03) o = 4;  // full-box version/flags first
+    if (o >= n || p[o++] != 0x03 || !mv_desc_len(p, n, &o, &len)) return 0;
+    if (o + 3 > n) return 0;
+    o += 2;                                            // ES_ID
+    uint8_t fl = p[o++];
+    if (fl & 0x80) o += 2;                             // dependsOn_ES_ID
+    if (fl & 0x40) { if (o >= n) return 0; o += 1 + p[o]; }   // URL
+    if (fl & 0x20) o += 2;                             // OCR_ES_Id
+    if (o >= n || p[o++] != 0x04 || !mv_desc_len(p, n, &o, &len)) return 0;
+    o += 13;                                           // DecoderConfigDescriptor body
+    if (o >= n || p[o++] != 0x05 || !mv_desc_len(p, n, &o, &len)) return 0;
+    if (!len || len > cap || o + len > n) return 0;
+    memcpy(asc, p + o, len); *asc_len = len;
+    return 1;
+}
+
+static size_t mv_asc_synth(int rate, int ch, int obj, uint8_t *asc) {
+    static const int rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                                   22050, 16000, 12000, 11025, 8000, 7350 };
+    int idx = 4;
+    for (int i = 0; i < 13; i++) if (rates[i] == rate) idx = i;
+    asc[0] = (uint8_t)((obj << 3) | (idx >> 1));
+    asc[1] = (uint8_t)(((idx & 1) << 7) | ((ch & 0xf) << 3));
+    return 2;
+}
+
+static void mv_a_drop(kl_avdemux *m) {
+    free(m->a_data); m->a_data = NULL;
+    free(m->a_pk);   m->a_pk = NULL;
+    m->a_npkt = m->a_pkt = 0;
+}
+
+static int mv_a_fill(kl_avdemux *m, CMSampleBufferRef sb) {
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb);
+    if (!bb) return 0;
+    size_t len = CMBlockBufferGetDataLength(bb);
+    CMItemCount n = CMSampleBufferGetNumSamples(sb);
+    if (!len || n <= 0) return 0;
+    unsigned char *data = malloc(len);
+    struct mv_apk *pk = calloc((size_t)n, sizeof *pk);
+    if (!data || !pk || CMBlockBufferCopyDataBytes(bb, 0, len, data) != noErr) {
+        free(data); free(pk); return 0;
+    }
+    const AudioStreamPacketDescription *pd = NULL;
+    size_t pdsz = 0;
+    if (CMSampleBufferGetAudioStreamPacketDescriptionsPtr(sb, &pd, &pdsz) != noErr) pd = NULL;
+    size_t npd = pd ? pdsz / sizeof *pd : 0;
+    CMTime t0 = CMSampleBufferGetPresentationTimeStamp(sb);
+    long long us0 = CMTIME_IS_VALID(t0) ? (long long)(CMTimeGetSeconds(t0) * 1e6) : 0;
+    long long frames = 0;
+    size_t next = 0;
+    long k = 0;
+    for (CMItemCount i = 0; i < n; i++) {
+        size_t o, sz;
+        if (npd == (size_t)n)  { o = (size_t)pd[i].mStartOffset; sz = pd[i].mDataByteSize; }
+        else if (n == 1)       { o = 0; sz = len; }
+        else                   { o = next; sz = CMSampleBufferGetSampleSize(sb, i); }
+        if (!sz || o + sz > len) break;
+        next = o + sz;
+        long long us = us0 + frames * 1000000LL / m->a_rate;
+        pk[k].off = o; pk[k].size = sz;
+        pk[k].pts_us = us < 0 ? 0 : us;      // encoder priming: Unity refuses negative times
+        frames += (npd == (size_t)n && pd[i].mVariableFramesInPacket)
+                      ? pd[i].mVariableFramesInPacket : (UInt32)m->a_fpp;
+        k++;
+    }
+    if (!k) { free(data); free(pk); return 0; }
+    mv_a_drop(m);
+    m->a_data = data; m->a_pk = pk; m->a_npkt = k; m->a_pkt = 0;
+    return 1;
+}
+
+static void mv_a_pull(kl_avdemux *m) {
+    @autoreleasepool {
+        AVAssetReaderTrackOutput *out = (__bridge AVAssetReaderTrackOutput *)m->a_out;
+        for (;;) {
+            CMSampleBufferRef sb = out ? [out copyNextSampleBuffer] : NULL;
+            if (!sb) { m->a_eos = 1; mv_a_drop(m); return; }
+            int ok = mv_a_fill(m, sb);
+            CFRelease(sb);
+            if (ok) return;
+        }
+    }
+}
+
+static int mv_a_start(kl_avdemux *m, CMTime from) {
+    @autoreleasepool {
+        AVAsset *asset = (__bridge AVAsset *)m->asset;
+        AVAssetTrack *track = (__bridge AVAssetTrack *)m->a_track;
+        NSError *err = nil;
+        AVAssetReader *r = [AVAssetReader assetReaderWithAsset:asset error:&err];
+        if (!r) return 0;
+        AVAssetReaderTrackOutput *o =
+            [AVAssetReaderTrackOutput assetReaderTrackOutputWithTrack:track outputSettings:nil];
+        o.alwaysCopiesSampleData = NO;
+        if (![r canAddOutput:o]) return 0;
+        [r addOutput:o];
+        if (CMTIME_IS_VALID(from) && CMTimeGetSeconds(from) > 0)
+            r.timeRange = CMTimeRangeMake(from, kCMTimePositiveInfinity);
+        if (![r startReading]) return 0;
+        if (m->a_reader) CFBridgingRelease(m->a_reader);
+        if (m->a_out)    CFBridgingRelease(m->a_out);
+        m->a_reader = (void *)CFBridgingRetain(r);
+        m->a_out    = (void *)CFBridgingRetain(o);
+        m->a_eos = 0;
+        mv_a_drop(m);
+        return 1;
+    }
+}
+
+static void mv_a_close(kl_avdemux *m) {
+    if (m->a_out)    CFBridgingRelease(m->a_out);
+    if (m->a_reader) CFBridgingRelease(m->a_reader);
+    if (m->a_track)  CFBridgingRelease(m->a_track);
+    m->a_out = m->a_reader = m->a_track = NULL;
+    m->a_on = 0;
+    mv_a_drop(m);
+}
+
+static void mv_a_open(kl_avdemux *m) {
+    if (!kl_env_on("MV_VIDEO_AUDIO", 1) || !m->asset) return;
+    @autoreleasepool {
+        AVAssetTrack *t = mv_first_aac_track((__bridge AVAsset *)m->asset);
+        if (!t) return;
+        CMAudioFormatDescriptionRef fmt =
+            (__bridge CMAudioFormatDescriptionRef)t.formatDescriptions.firstObject;
+        const AudioStreamBasicDescription *sd =
+            fmt ? CMAudioFormatDescriptionGetStreamBasicDescription(fmt) : NULL;
+        if (!sd || sd->mSampleRate <= 0 || !sd->mChannelsPerFrame) return;
+        m->a_rate = (int)(sd->mSampleRate + 0.5);
+        m->a_ch   = (int)sd->mChannelsPerFrame;
+        m->a_fpp  = sd->mFramesPerPacket ? (int)sd->mFramesPerPacket : 1024;
+        size_t cl = 0;
+        const void *ck = CMAudioFormatDescriptionGetMagicCookie(fmt, &cl);
+        const char *how = "from the cookie";
+        if (!mv_asc_from_cookie(ck, cl, m->a_asc, sizeof m->a_asc, &m->a_asc_len)) {
+            int obj = (sd->mFormatFlags >= 1 && sd->mFormatFlags <= 4) ? (int)sd->mFormatFlags : 2;
+            m->a_asc_len = mv_asc_synth(m->a_rate, m->a_ch, obj, m->a_asc);
+            how = "built from the stream description";
+        }
+        m->a_track = (void *)CFBridgingRetain(t);
+        if (!mv_a_start(m, kCMTimeZero)) {
+            fprintf(stderr, "  [avdemux] %s: audio reader would not start — video only\n", m->path);
+            mv_a_close(m);
+            return;
+        }
+        mv_a_pull(m);
+        m->a_on = 1;
+        fprintf(stderr, "  [avdemux] %s: audio/mp4a-latm %d Hz, %d ch, csd-0 %zu bytes (%s)\n",
+                m->path, m->a_rate, m->a_ch, m->a_asc_len, how);
+    }
+}
+
+int kl_avdemux_audio_info(kl_avdemux *m, int *rate, int *channels, long long *dur,
+                          const unsigned char **asc, size_t *asc_len) {
+    if (!m || !m->a_on) return 0;
+    if (rate)     *rate = m->a_rate;
+    if (channels) *channels = m->a_ch;
+    if (dur)      *dur = m->duration_us;
+    if (asc)      *asc = m->a_asc;
+    if (asc_len)  *asc_len = m->a_asc_len;
+    return 1;
+}
+
+long long kl_avdemux_audio_sample_time_us(kl_avdemux *m) {
+    if (!m || !m->a_on || m->a_eos || m->a_pkt >= m->a_npkt) return -1;
+    return m->a_pk[m->a_pkt].pts_us;
+}
+
+long kl_avdemux_audio_read(kl_avdemux *m, unsigned char *buf, unsigned long cap) {
+    if (kl_avdemux_audio_sample_time_us(m) < 0) return -1;
+    const struct mv_apk *k = &m->a_pk[m->a_pkt];
+    if (buf && cap) memcpy(buf, m->a_data + k->off, k->size < cap ? k->size : cap);
+    return (long)k->size;               // full size, AMediaExtractor convention
+}
+
+int kl_avdemux_audio_advance(kl_avdemux *m) {
+    if (!m || !m->a_on || m->a_eos) return 0;
+    if (++m->a_pkt >= m->a_npkt) mv_a_pull(m);
+    return m->a_eos ? 0 : 1;
+}
+
+int kl_avdemux_audio_seek_us(kl_avdemux *m, long long us) {
+    if (!m || !m->a_on) return 0;
+    if (!mv_a_start(m, CMTimeMake(us, 1000000))) { m->a_eos = 1; return 0; }
+    mv_a_pull(m);
+    // The reader starts on the buffer holding `us`; begin at the packet that does.
+    while (!m->a_eos && m->a_pkt + 1 < m->a_npkt && m->a_pk[m->a_pkt + 1].pts_us <= us)
+        m->a_pkt++;
+    return m->a_eos ? 0 : 1;
+}
+
+'''
+    old = "kl_avdemux *kl_avdemux_open(const char *container, long long offset, long long size) {\n"
+    s = sub(p, s, old, code + old)
+    s = sub(p, s,
+        "            m->path, m->mime, m->width, m->height, m->duration_us);\n"
+        "    return m;\n",
+        "            m->path, m->mime, m->width, m->height, m->duration_us);\n"
+        "    mv_a_open(m);   // metavision (step 58)\n"
+        "    return m;\n")
+    s = sub(p, s,
+        "    free(m->psets);\n"
+        "    free(m->cur);\n"
+        "    free(m);\n",
+        "    mv_a_close(m);   // metavision (step 58)\n"
+        "    free(m->psets);\n"
+        "    free(m->cur);\n"
+        "    free(m);\n")
+    open(p, "w").write(s)
+
+# --- kl_mediandk.c: the second track, and the AAC decoder ---------------------
+p = f"{d}/kl_mediandk.c"
+s = open(p).read()
+if marker not in s:
+    # csd-0 is a byte buffer held in a format slot with is_str = 2; the string
+    # getter must not hand it out as a string.
+    s = sub(p, s,
+        "        if (!strcmp(f->kv[i].key, key) && f->kv[i].is_str) return f->kv[i].sval;\n",
+        "        if (!strcmp(f->kv[i].key, key) && f->kv[i].is_str == 1) return f->kv[i].sval;   // metavision (step 58)\n")
+    s = sub(p, s,
+        "    kl_avdemux *dm;         // the demuxer, when a container was opened (else NULL)\n"
+        "} klm_extractor;\n",
+        "    kl_avdemux *dm;         // the demuxer, when a container was opened (else NULL)\n"
+        "    int      mv_sel_explicit;   // metavision (step 58): selectTrack has been called\n"
+        "    unsigned mv_sel;            // ...and these tracks are selected (bit per track)\n"
+        "} klm_extractor;\n")
+    xcode = r'''// metavision: video soundtrack (step 58)
+static void mv_fmt_set_blob(klm_format *f, const char *key, const void *p, size_t n) {
+    if (!f || !key || !p || !n) return;
+    int i = klm_fmt_slot(f, key);
+    if (i < 0) return;
+    char *b = malloc(n);
+    if (!b) return;
+    memcpy(b, p, n);
+    free(f->kv[i].sval);
+    f->kv[i].sval = b;
+    f->kv[i].ival = (int32_t)n;
+    f->kv[i].is_str = 2;
+}
+static int mv_fmt_blob(klm_format *f, const char *key, const uint8_t **p, size_t *n) {
+    if (!f) return 0;
+    for (int i = 0; i < f->n; i++)
+        if (!strcmp(f->kv[i].key, key) && f->kv[i].is_str == 2) {
+            *p = (const uint8_t *)f->kv[i].sval;
+            *n = (size_t)f->kv[i].ival;
+            return 1;
+        }
+    return 0;
+}
+// Track 1 exists only when the demuxer opened an AAC track.
+static int mv_xa_on(klm_extractor *x) {
+    return x && x->dm && kl_avdemux_audio_info(x->dm, NULL, NULL, NULL, NULL, NULL);
+}
+// The track whose sample is current: the earliest of the selected tracks (video
+// on a tie), -1 when they are all spent. Nothing selected means the video track
+// alone, which is what this extractor always served.
+static int mv_xa_cur(klm_extractor *x) {
+    unsigned sel = x->mv_sel_explicit ? x->mv_sel : 1u;
+    long long tv = (sel & 1u) ? kl_avdemux_sample_time_us(x->dm) : -1;
+    long long ta = ((sel & 2u) && mv_xa_on(x)) ? kl_avdemux_audio_sample_time_us(x->dm) : -1;
+    if (tv < 0 && ta < 0) return -1;
+    if (ta < 0) return 0;
+    if (tv < 0) return 1;
+    return ta < tv ? 1 : 0;
+}
+static void *mv_xa_format(klm_extractor *x) {
+    int rate = 0, ch = 0;
+    long long dur = 0;
+    const unsigned char *asc = NULL;
+    size_t asc_len = 0;
+    if (!kl_avdemux_audio_info(x->dm, &rate, &ch, &dur, &asc, &asc_len)) return NULL;
+    klm_format *f = klm_AMediaFormat_new();
+    if (!f) return NULL;
+    klm_AMediaFormat_setString(f, g_key_mime, "audio/mp4a-latm");
+    klm_AMediaFormat_setInt32(f, g_key_sample_rate, rate);
+    klm_AMediaFormat_setInt32(f, g_key_channel_count, ch);
+    klm_AMediaFormat_setInt32(f, g_key_duration, (int32_t)dur);
+    klm_AMediaFormat_setInt32(f, "max-input-size", 8192);   // an AAC packet is <= 768 bytes a channel
+    klm_AMediaFormat_setString(f, g_key_language, "und");
+    mv_fmt_set_blob(f, "csd-0", asc, asc_len);
+    return f;
+}
+
+'''
+    old = "// Everything past the refusal describes an extractor with nothing in it."
+    s = sub(p, s, old, xcode + old)
+    s = sub(p, s,
+        "    return (x && x->dm) ? 1 : 0;\n",
+        "    return (x && x->dm) ? 1 + (size_t)(mv_xa_on(x) != 0) : 0;   // metavision (step 58)\n")
+    s = sub(p, s,
+        "static void *klm_AMediaExtractor_getTrackFormat(void *ex, size_t i) {\n"
+        "    klm_extractor *x = klm_ex(ex);\n",
+        "static void *klm_AMediaExtractor_getTrackFormat(void *ex, size_t i) {\n"
+        "    klm_extractor *x = klm_ex(ex);\n"
+        "    if (x && x->dm && i == 1 && mv_xa_on(x)) return mv_xa_format(x);   // metavision (step 58)\n")
+    s = sub(p, s,
+        "    if (!x || !x->dm || i != 0) return AMEDIA_ERROR_INVALID_PARAMETER;\n"
+        "    return AMEDIA_OK;               // the single video track is already reading\n",
+        "    if (!x || !x->dm || i >= klm_AMediaExtractor_getTrackCount(ex))   // metavision (step 58)\n"
+        "        return AMEDIA_ERROR_INVALID_PARAMETER;\n"
+        "    if (!x->mv_sel_explicit) { x->mv_sel_explicit = 1; x->mv_sel = 0; }\n"
+        "    x->mv_sel |= 1u << i;\n"
+        "    return AMEDIA_OK;\n")
+    s = sub(p, s,
+        "    if (!x || !x->dm) return -1;\n"
+        "    return (ssize_t)kl_avdemux_read(x->dm, buf, (unsigned long)cap);\n",
+        "    if (!x || !x->dm) return -1;\n"
+        "    int t = mv_xa_cur(x);   // metavision (step 58)\n"
+        "    if (t < 0) return -1;\n"
+        "    if (t == 1) return (ssize_t)kl_avdemux_audio_read(x->dm, buf, (unsigned long)cap);\n"
+        "    return (ssize_t)kl_avdemux_read(x->dm, buf, (unsigned long)cap);\n")
+    s = sub(p, s,
+        "    return kl_avdemux_sample_time_us(x->dm) < 0 ? -1 : 0;\n",
+        "    return mv_xa_cur(x);   // metavision (step 58)\n")
+    s = sub(p, s,
+        "    if (!x || !x->dm) return -1;\n"
+        "    return (int64_t)kl_avdemux_sample_time_us(x->dm);\n",
+        "    if (!x || !x->dm) return -1;\n"
+        "    int t = mv_xa_cur(x);   // metavision (step 58)\n"
+        "    if (t < 0) return -1;\n"
+        "    return (int64_t)(t == 1 ? kl_avdemux_audio_sample_time_us(x->dm)\n"
+        "                            : kl_avdemux_sample_time_us(x->dm));\n")
+    s = sub(p, s,
+        "    if (!x || !x->dm) return false;\n"
+        "    return kl_avdemux_advance(x->dm) != 0;\n",
+        "    if (!x || !x->dm) return false;\n"
+        "    int t = mv_xa_cur(x);   // metavision (step 58): only the current track moves\n"
+        "    if (t < 0) return false;\n"
+        "    if (t == 1) kl_avdemux_audio_advance(x->dm);\n"
+        "    else kl_avdemux_advance(x->dm);\n"
+        "    return mv_xa_cur(x) >= 0;\n")
+    s = sub(p, s,
+        "    return kl_avdemux_seek_us(x->dm, (long long)us) ? AMEDIA_OK : AMEDIA_ERROR_UNSUPPORTED;\n",
+        "    if (mv_xa_on(x)) kl_avdemux_audio_seek_us(x->dm, (long long)us);   // metavision (step 58)\n"
+        "    return kl_avdemux_seek_us(x->dm, (long long)us) ? AMEDIA_OK : AMEDIA_ERROR_UNSUPPORTED;\n")
+
+    # The codec: an AAC decoder beside the video one.
+    s = sub(p, s,
+        "    unsigned n_in, n_out, n_rendered;\n"
+        "} klm_codec;\n",
+        "    unsigned n_in, n_out, n_rendered;\n"
+        "    void    *mv_aac;            // metavision (step 58): the AAC decoder, audio codecs only\n"
+        "} klm_codec;\n")
+    ccode = r'''// metavision: video soundtrack (step 58)
+//
+// "audio/mp4a-latm": AudioConverter, AAC -> 16-bit interleaved PCM. Each queued
+// access unit is decoded on the spot into one output slot; dequeueOutputBuffer
+// hands slots out oldest first (after one OUTPUT_FORMAT_CHANGED), and their
+// bytes are CPU-visible through getOutputBuffer. Input is refused (TRY_AGAIN)
+// while fewer than two slots are free, which is the back-pressure a hardware
+// decoder applies too.
+#include <AudioToolbox/AudioToolbox.h>
+
+#define MV_PCM_FRAMES 4096                 // per slot; an AAC packet is 1024 (2048 with SBR)
+#define MV_PCM_CAP    (MV_PCM_FRAMES * 8 * 2)
+#define MV_AAC_DRY    ((OSStatus)0x6d76646eu)   /* 'mvdn': this call's packet is used up */
+
+static int mv_video_audio_on(void) {
+    static int on = -1;
+    if (on < 0) on = kl_env_on("MV_VIDEO_AUDIO", 1);
+    return on;
+}
+
+typedef struct {
+    AudioConverterRef conv;
+    int      rate, ch;
+    int      fmt_said;
+    const uint8_t *pkt;
+    uint32_t pkt_len;
+    int      pkt_given;
+    AudioStreamPacketDescription desc;
+    struct { uint8_t *pcm; size_t len; int64_t pts; uint32_t flags; int state; unsigned seq; }
+             o[KLM_OUT_SLOTS];         // state: 0 free, 1 decoded, 2 with the guest, 3 filling
+    unsigned seq;
+    unsigned n_err;
+} mv_aac;
+
+static void *mv_aac_codec_new(const char *mime) {
+    klm_codec *c = calloc(1, sizeof *c);
+    mv_aac *a = calloc(1, sizeof *a);
+    if (!c || !a) { free(c); free(a); return NULL; }
+    c->magic = KLM_CODEC_MAGIC;
+    snprintf(c->mime, sizeof c->mime, "%s", mime);
+    pthread_mutex_init(&c->lock, NULL);
+    c->mv_aac = a;
+    g_ever_created = 1;
+    fprintf(stderr, "  [media] AMediaCodec_createDecoderByType(\"%s\") — AAC to 16-bit PCM\n", mime);
+    return c;
+}
+
+static void mv_esds_descr(uint8_t *p, size_t *o, int tag, size_t size) {
+    p[(*o)++] = (uint8_t)tag;
+    for (int i = 3; i > 0; i--) p[(*o)++] = (uint8_t)((size >> (7 * i)) | 0x80);
+    p[(*o)++] = (uint8_t)(size & 0x7f);
+}
+
+static int mv_aac_configure(klm_codec *c, const void *format) {
+    mv_aac *a = c->mv_aac;
+    klm_format *f = (klm_format *)format;
+    int32_t rate = 0, ch = 0;
+    klm_AMediaFormat_getInt32(f, g_key_sample_rate, &rate);
+    klm_AMediaFormat_getInt32(f, g_key_channel_count, &ch);
+    const uint8_t *asc = NULL;
+    size_t asc_len = 0;
+    uint8_t synth[2];
+    if (!mv_fmt_blob(f, "csd-0", &asc, &asc_len) || !asc_len || asc_len > 64) {
+        // No csd-0: AAC-LC at the format's own rate and channel count.
+        static const int rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                                       22050, 16000, 12000, 11025, 8000, 7350 };
+        int idx = 4;
+        for (int i = 0; i < 13; i++) if (rates[i] == rate) idx = i;
+        synth[0] = (uint8_t)((2 << 3) | (idx >> 1));
+        synth[1] = (uint8_t)(((idx & 1) << 7) | ((ch & 0xf) << 3));
+        asc = synth; asc_len = 2;
+    }
+    // The decoder's magic cookie is an esds ES_Descriptor wrapped round csd-0.
+    uint8_t cookie[128];
+    size_t o = 0;
+    mv_esds_descr(cookie, &o, 0x03, 3 + 5 + 13 + 5 + asc_len);
+    cookie[o++] = 0; cookie[o++] = 0; cookie[o++] = 0;        // ES_ID, flags
+    mv_esds_descr(cookie, &o, 0x04, 13 + 5 + asc_len);
+    cookie[o++] = 0x40;                                       // MPEG-4 audio
+    cookie[o++] = 0x15;                                       // audio stream
+    memset(cookie + o, 0, 11); o += 11;                       // buffer size, bitrates
+    mv_esds_descr(cookie, &o, 0x05, asc_len);
+    memcpy(cookie + o, asc, asc_len); o += asc_len;
+
+    AudioStreamBasicDescription in = { 0 };
+    in.mFormatID = kAudioFormatMPEG4AAC;
+    UInt32 sz = sizeof in;
+    if (AudioFormatGetProperty(kAudioFormatProperty_FormatInfo, (UInt32)o, cookie, &sz, &in) != noErr
+        || in.mSampleRate <= 0 || !in.mChannelsPerFrame) {
+        memset(&in, 0, sizeof in);
+        in.mFormatID = kAudioFormatMPEG4AAC;
+        in.mSampleRate = rate > 0 ? rate : 44100;
+        in.mChannelsPerFrame = ch > 0 ? (UInt32)ch : 2;
+        in.mFramesPerPacket = 1024;
+    }
+    if (in.mChannelsPerFrame > 8) return AMEDIA_ERROR_UNSUPPORTED;
+    AudioStreamBasicDescription out = { 0 };
+    out.mFormatID = kAudioFormatLinearPCM;
+    out.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    out.mSampleRate = in.mSampleRate;
+    out.mChannelsPerFrame = in.mChannelsPerFrame;
+    out.mBitsPerChannel = 16;
+    out.mBytesPerFrame = 2 * in.mChannelsPerFrame;
+    out.mFramesPerPacket = 1;
+    out.mBytesPerPacket = out.mBytesPerFrame;
+    if (a->conv) { AudioConverterDispose(a->conv); a->conv = NULL; }
+    OSStatus st = AudioConverterNew(&in, &out, &a->conv);
+    if (st != noErr) {
+        a->conv = NULL;
+        fprintf(stderr, "  [media] AAC decoder: AudioConverterNew failed (%d)\n", (int)st);
+        return AMEDIA_ERROR_UNSUPPORTED;
+    }
+    st = AudioConverterSetProperty(a->conv, kAudioConverterDecompressionMagicCookie, (UInt32)o, cookie);
+    a->rate = (int)(in.mSampleRate + 0.5);
+    a->ch = (int)in.mChannelsPerFrame;
+    a->fmt_said = 0;
+    fprintf(stderr, "  [media] AMediaCodec_configure: mime=%s -> AAC decoder %d Hz, %d ch "
+                    "(csd-0 %zu bytes%s)\n", c->mime, a->rate, a->ch, asc_len,
+            st == noErr ? "" : ", cookie refused");
+    return AMEDIA_OK;
+}
+
+static OSStatus mv_aac_input(AudioConverterRef conv, UInt32 *n, AudioBufferList *bl,
+                             AudioStreamPacketDescription **desc, void *ud) {
+    (void)conv;
+    mv_aac *a = ud;
+    if (a->pkt_given || !a->pkt_len) { *n = 0; return MV_AAC_DRY; }
+    bl->mNumberBuffers = 1;
+    bl->mBuffers[0].mData = (void *)a->pkt;
+    bl->mBuffers[0].mDataByteSize = a->pkt_len;
+    bl->mBuffers[0].mNumberChannels = (UInt32)a->ch;
+    a->desc.mStartOffset = 0;
+    a->desc.mVariableFramesInPacket = 0;
+    a->desc.mDataByteSize = a->pkt_len;
+    if (desc) *desc = &a->desc;
+    *n = 1;
+    a->pkt_given = 1;
+    return noErr;
+}
+
+// Lock held. Two free slots: one for the decode, one for a following EOS.
+static int mv_aac_room_locked(klm_codec *c) {
+    mv_aac *a = c->mv_aac;
+    int free_slots = 0;
+    for (int i = 0; i < KLM_OUT_SLOTS; i++) free_slots += a->o[i].state == 0;
+    return free_slots >= 2;
+}
+
+static int mv_aac_take(klm_codec *c) {
+    mv_aac *a = c->mv_aac;
+    pthread_mutex_lock(&c->lock);
+    for (int i = 0; i < KLM_OUT_SLOTS; i++)
+        if (a->o[i].state == 0) {
+            if (!a->o[i].pcm) a->o[i].pcm = malloc(MV_PCM_CAP);
+            if (!a->o[i].pcm) break;
+            a->o[i].state = 3;
+            pthread_mutex_unlock(&c->lock);
+            return i;
+        }
+    pthread_mutex_unlock(&c->lock);
+    return -1;
+}
+
+static void mv_aac_post(klm_codec *c, int i, size_t len, int64_t pts, uint32_t flags) {
+    mv_aac *a = c->mv_aac;
+    pthread_mutex_lock(&c->lock);
+    a->o[i].len = len;
+    a->o[i].pts = pts;
+    a->o[i].flags = flags;
+    a->o[i].seq = a->seq++;
+    a->o[i].state = 1;
+    pthread_mutex_unlock(&c->lock);
+}
+
+static int mv_aac_queue(klm_codec *c, const uint8_t *p, size_t size, int64_t pts, uint32_t flags) {
+    mv_aac *a = c->mv_aac;
+    if (!a->conv) return AMEDIA_ERROR_INVALID_OBJECT;
+    if (flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) return AMEDIA_OK;   // csd-0 came with configure
+    if (size) {
+        int i = mv_aac_take(c);
+        if (i < 0) {
+            KLM_FIRST(said_aac_full, "AAC decoder: every output slot is held — an access "
+                                     "unit is dropped\n");
+        } else {
+            a->pkt = p; a->pkt_len = (uint32_t)size; a->pkt_given = 0;
+            UInt32 frames = MV_PCM_FRAMES;
+            AudioBufferList bl;
+            bl.mNumberBuffers = 1;
+            bl.mBuffers[0].mNumberChannels = (UInt32)a->ch;
+            bl.mBuffers[0].mDataByteSize = frames * 2u * (UInt32)a->ch;
+            bl.mBuffers[0].mData = a->o[i].pcm;
+            OSStatus st = AudioConverterFillComplexBuffer(a->conv, mv_aac_input, a, &frames, &bl, NULL);
+            if (st != noErr && st != MV_AAC_DRY) {
+                if (a->n_err++ < 3)
+                    fprintf(stderr, "  [media] AAC decoder: %zu-byte access unit at %lld us "
+                                    "not decoded (%d)\n", size, (long long)pts, (int)st);
+                frames = 0;
+            }
+            if (frames) {
+                mv_aac_post(c, i, (size_t)frames * 2u * (size_t)a->ch, pts, 0);
+            } else {
+                pthread_mutex_lock(&c->lock);
+                a->o[i].state = 0;
+                pthread_mutex_unlock(&c->lock);
+            }
+        }
+    }
+    if (flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) {
+        int i = mv_aac_take(c);
+        if (i >= 0) mv_aac_post(c, i, 0, pts, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+    }
+    return AMEDIA_OK;
+}
+
+static ssize_t mv_aac_dequeue(klm_codec *c, AMediaCodecBufferInfo *info, int64_t timeoutUs) {
+    mv_aac *a = c->mv_aac;
+    int64_t waited = 0;
+    for (;;) {
+        pthread_mutex_lock(&c->lock);
+        int best = -1;
+        for (int i = 0; i < KLM_OUT_SLOTS; i++)
+            if (a->o[i].state == 1 && (best < 0 || (int)(a->o[i].seq - a->o[best].seq) < 0))
+                best = i;
+        if (best >= 0 && !a->fmt_said) {
+            a->fmt_said = 1;
+            pthread_mutex_unlock(&c->lock);
+            return AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED;
+        }
+        if (best >= 0) {
+            a->o[best].state = 2;
+            if (info) {
+                info->offset = 0;
+                info->size = (int32_t)a->o[best].len;
+                info->presentationTimeUs = a->o[best].pts;
+                info->flags = a->o[best].flags;
+            }
+            c->n_out++;
+            int64_t pts = a->o[best].pts;
+            size_t len = a->o[best].len;
+            pthread_mutex_unlock(&c->lock);
+            KLM_FIRST(said_pcm, "first PCM buffer dequeued (slot %d, %zu bytes, pts %lld us)\n",
+                      best, len, (long long)pts);
+            return best;
+        }
+        pthread_mutex_unlock(&c->lock);
+        if (timeoutUs == 0 || (timeoutUs > 0 && waited >= timeoutUs))
+            return AMEDIACODEC_INFO_TRY_AGAIN_LATER;
+        usleep(1000);
+        waited += 1000;
+    }
+}
+
+static uint8_t *mv_aac_outbuf(klm_codec *c, size_t idx, size_t *out_size) {
+    mv_aac *a = c->mv_aac;
+    if (idx >= KLM_OUT_SLOTS) return NULL;
+    pthread_mutex_lock(&c->lock);
+    uint8_t *p = a->o[idx].state == 2 ? a->o[idx].pcm : NULL;
+    pthread_mutex_unlock(&c->lock);
+    if (out_size) *out_size = p ? MV_PCM_CAP : 0;
+    return p;
+}
+
+static int mv_aac_release(klm_codec *c, size_t idx) {
+    mv_aac *a = c->mv_aac;
+    pthread_mutex_lock(&c->lock);
+    int ok = a->o[idx].state == 2;
+    if (ok) { a->o[idx].state = 0; a->o[idx].len = 0; }
+    pthread_mutex_unlock(&c->lock);
+    return ok ? AMEDIA_OK : AMEDIA_ERROR_INVALID_PARAMETER;
+}
+
+static void mv_aac_fill_format(klm_codec *c, klm_format *f) {
+    mv_aac *a = c->mv_aac;
+    klm_AMediaFormat_setString(f, g_key_mime, "audio/raw");
+    if (a->rate > 0 && a->ch > 0) {
+        klm_AMediaFormat_setInt32(f, g_key_sample_rate, a->rate);
+        klm_AMediaFormat_setInt32(f, g_key_channel_count, a->ch);
+        klm_AMediaFormat_setInt32(f, "pcm-encoding", 2);      // ENCODING_PCM_16BIT
+    }
+}
+
+static void mv_aac_flush(klm_codec *c) {
+    mv_aac *a = c->mv_aac;
+    if (!a) return;
+    pthread_mutex_lock(&c->lock);
+    for (int i = 0; i < KLM_OUT_SLOTS; i++) { a->o[i].state = 0; a->o[i].len = 0; }
+    pthread_mutex_unlock(&c->lock);
+    if (a->conv) AudioConverterReset(a->conv);
+}
+
+static void mv_aac_destroy(klm_codec *c) {
+    mv_aac *a = c->mv_aac;
+    if (!a) return;
+    if (a->conv) AudioConverterDispose(a->conv);
+    for (int i = 0; i < KLM_OUT_SLOTS; i++) free(a->o[i].pcm);
+    free(a);
+    c->mv_aac = NULL;
+}
+
+'''
+    s = sub(p, s,
+        "static void *klm_AMediaCodec_createDecoderByType(const char *mime) {\n"
+        "    klm_codec *c = calloc(1, sizeof *c);\n",
+        ccode +
+        "static void *klm_AMediaCodec_createDecoderByType(const char *mime) {\n"
+        "    if (mime && !strcmp(mime, \"audio/mp4a-latm\") && mv_video_audio_on())   // metavision (step 58)\n"
+        "        return mv_aac_codec_new(mime);\n"
+        "    klm_codec *c = calloc(1, sizeof *c);\n")
+    s = sub(p, s,
+        "    const char *mime = klm_fmt_string((klm_format *)format, \"mime\");\n"
+        "    // The surface is the AImageReader's window;",
+        "    if (c->mv_aac) return mv_aac_configure(c, format);   // metavision (step 58)\n"
+        "    const char *mime = klm_fmt_string((klm_format *)format, \"mime\");\n"
+        "    // The surface is the AImageReader's window;")
+    s = sub(p, s,
+        "    kl_vtdec_flush(c->dec);\n",
+        "    mv_aac_flush(c);   // metavision (step 58)\n"
+        "    kl_vtdec_flush(c->dec);\n")
+    s = sub(p, s,
+        "    kl_vtdec_destroy(c->dec);\n",
+        "    mv_aac_destroy(c);   // metavision (step 58)\n"
+        "    kl_vtdec_destroy(c->dec);\n")
+    s = sub(p, s,
+        "        for (int i = 0; i < KLM_IN_BUFFERS; i++)\n"
+        "            if (!c->in[i].in_use) {\n",
+        "        for (int i = 0; i < KLM_IN_BUFFERS && (!c->mv_aac || mv_aac_room_locked(c)); i++)   // metavision (step 58)\n"
+        "            if (!c->in[i].in_use) {\n")
+    s = sub(p, s,
+        "    (void)idx;\n"
+        "    if (out_size) *out_size = 0;\n"
+        "    if (!c || c->magic != KLM_CODEC_MAGIC) return NULL;\n",
+        "    (void)idx;\n"
+        "    if (out_size) *out_size = 0;\n"
+        "    if (!c || c->magic != KLM_CODEC_MAGIC) return NULL;\n"
+        "    if (c->mv_aac) return mv_aac_outbuf(c, idx, out_size);   // metavision (step 58): PCM is CPU-visible\n")
+    s = sub(p, s,
+        "    klm_AMediaFormat_setString(f, g_key_mime, c->mime);\n",
+        "    klm_AMediaFormat_setString(f, g_key_mime, c->mime);\n"
+        "    if (c->mv_aac) { mv_aac_fill_format(c, f); return f; }   // metavision (step 58)\n")
+    s = sub(p, s,
+        "    if (offset < 0 || size > KLM_IN_CAP || (size_t)offset > KLM_IN_CAP - size)\n"
+        "        return AMEDIA_ERROR_INVALID_PARAMETER;\n",
+        "    if (offset < 0 || size > KLM_IN_CAP || (size_t)offset > KLM_IN_CAP - size)\n"
+        "        return AMEDIA_ERROR_INVALID_PARAMETER;\n"
+        "    if (c->mv_aac) return mv_aac_queue(c, p + offset, size, (int64_t)time_us, flags);   // metavision (step 58)\n")
+    s = sub(p, s,
+        "                                                   int64_t timeoutUs) {\n"
+        "    klm_codec *c = codec;\n"
+        "    if (!c || c->magic != KLM_CODEC_MAGIC) return AMEDIA_ERROR_INVALID_PARAMETER;\n",
+        "                                                   int64_t timeoutUs) {\n"
+        "    klm_codec *c = codec;\n"
+        "    if (!c || c->magic != KLM_CODEC_MAGIC) return AMEDIA_ERROR_INVALID_PARAMETER;\n"
+        "    if (c->mv_aac) return mv_aac_dequeue(c, info, timeoutUs);   // metavision (step 58)\n")
+    s = sub(p, s,
+        "        return AMEDIA_ERROR_INVALID_PARAMETER;\n"
+        "    pthread_mutex_lock(&c->lock);\n"
+        "    if (!c->out[idx].in_use) {",
+        "        return AMEDIA_ERROR_INVALID_PARAMETER;\n"
+        "    if (c->mv_aac) return mv_aac_release(c, idx);   // metavision (step 58)\n"
+        "    pthread_mutex_lock(&c->lock);\n"
+        "    if (!c->out[idx].in_use) {")
+    open(p, "w").write(s)
+print("overlay: a video's AAC soundtrack is a second extractor track, decoded to PCM (MV_VIDEO_AUDIO)")
+PYEOF
