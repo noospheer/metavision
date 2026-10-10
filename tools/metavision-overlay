@@ -4257,3 +4257,132 @@ static void mv_aac_destroy(klm_codec *c) {
     open(p, "w").write(s)
 print("overlay: a video's AAC soundtrack is a second extractor track, decoded to PCM (MV_VIDEO_AUDIO)")
 PYEOF
+
+# 59 — the real hands do not overwrite the scripted ones. Each frame the hand
+# skeleton from visionOS is published first (MetavisionHands) and auto-play's
+# scripted hands after it (MetavisionAutoplay.drive). With no real hands in
+# view the first publish says "not tracked", so a title reading hands between
+# the two calls saw them vanish for that instant — enough to reset a gesture a
+# title waits to see held. While auto-play drives the hands (its drivesHands,
+# set by the previous drive), the real publish is skipped; in its hands-free
+# phases the real hands are published as before.
+python3 - "$K/visionos/Sources/KleptonControllers.swift" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: scripted hands are not overwritten (step 59)"
+if marker not in s:
+    old = "        MetavisionHands.publish(left: leftHand, right: rightHand)   // metavision: hand tracking\n"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old,
+        "        if !MetavisionAutoplay.drivesHands {   // " + marker + "\n"
+        "            MetavisionHands.publish(left: leftHand, right: rightHand)   // metavision: hand tracking\n"
+        "        }\n")
+    open(p, "w").write(s)
+print("overlay: auto-play's scripted hands are not overwritten by the real (absent) ones")
+PYEOF
+
+# 60 — diagnostic: what a hand gate sees. Titles built on Meta's Interaction
+# SDK wait for a hand gesture before they draw — both hands near the head, or
+# a thumb tip on an index tip — measured on the hand rig's joint objects
+# against the main camera. With KL_PROBE_INPUT on, each probe line now also
+# gives the main camera's position, each named joint object's position and its
+# distance from the camera, and every Interaction SDK Hand's verdict
+# (IsTrackedDataValid, IsHighConfidence). KL_PROBE_JOINTS names the joint
+# objects (comma-separated GameObject names); the default is the Interaction
+# SDK hand rig's wrists, middle knuckles and thumb/index tips, and the
+# OVRSkeleton bones of the same joints. A name that finds nothing prints "-".
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: hand gate probe (step 60)"
+if marker not in s:
+    old = "    // 3. The verdict: is the pointer over UI, and what does the game consider\n"
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    if "static const MethodInfo *m_find, *m_findall" not in s:
+        sys.exit(f"overlay: step 60 needs the scene census's m_find in {p}")
+    new = (
+        "    {   // " + marker + "\n"
+        "        static const MethodInfo *m_cam, *m_gofind, *m_gotf, *m_ctf, *m_tpos, *m_hvalid, *m_hconf;\n"
+        "        static Il2CppObject *hand_type, *jobj[12];\n"
+        "        static char jname[12][48];\n"
+        "        static unsigned nj;\n"
+        "        static int res;\n"
+        "        if (!res) {\n"
+        "            res = 1;\n"
+        "            m_cam    = find_method(\"UnityEngine\", \"Camera\", \"get_main\", 0);\n"
+        "            m_gofind = find_method(\"UnityEngine\", \"GameObject\", \"Find\", 1);\n"
+        "            m_gotf   = find_method(\"UnityEngine\", \"GameObject\", \"get_transform\", 0);\n"
+        "            m_ctf    = find_method(\"UnityEngine\", \"Component\", \"get_transform\", 0);\n"
+        "            m_tpos   = find_method(\"UnityEngine\", \"Transform\", \"get_position\", 0);\n"
+        "            Il2CppClass *hk = find_class(\"Oculus.Interaction.Input\", \"Hand\");\n"
+        "            if (hk) {\n"
+        "                hand_type = il.type_get_object(il.class_get_type(hk));\n"
+        "                m_hvalid = il.class_get_method_from_name(hk, \"get_IsTrackedDataValid\", 0);\n"
+        "                m_hconf  = il.class_get_method_from_name(hk, \"get_IsHighConfidence\", 0);\n"
+        "            }\n"
+        "            const char *spec = kl_env_str(\"KL_PROBE_JOINTS\",\n"
+        "                \"b_l_wrist,b_r_wrist,b_l_middle1,b_r_middle1,b_l_thumb_null,b_l_index_null,\"\n"
+        "                \"b_r_thumb_null,b_r_index_null,Hand_WristRoot,Hand_Middle1,Hand_ThumbTip,Hand_IndexTip\");\n"
+        "            char buf[512];\n"
+        "            snprintf(buf, sizeof buf, \"%s\", spec);\n"
+        "            for (char *tok = strtok(buf, \",\"); tok && nj < 12; tok = strtok(NULL, \",\")) {\n"
+        "                snprintf(jname[nj], sizeof jname[0], \"%s\", tok);\n"
+        "                jobj[nj++] = il.string_new(tok);\n"
+        "            }\n"
+        "        }\n"
+        "        float cp[3] = { 0, 0, 0 };\n"
+        "        int have_cam = 0;\n"
+        "        Il2CppObject *cam = invoke(m_cam, NULL, \"Camera.main\");\n"
+        "        Il2CppObject *ctf = cam ? invoke_on(cam, m_ctf, NULL, \"Camera.transform\") : NULL;\n"
+        "        Il2CppObject *cpo = ctf ? invoke_on(ctf, m_tpos, NULL, \"Transform.position\") : NULL;\n"
+        "        if (cpo) { memcpy(cp, il.object_unbox(cpo), sizeof cp); have_cam = 1; }\n"
+        "        fprintf(stderr, \"  [mprobe f%u] hand gate: camera=\", frame);\n"
+        "        if (have_cam) fprintf(stderr, \"(%.2f,%.2f,%.2f)\", cp[0], cp[1], cp[2]);\n"
+        "        else          fprintf(stderr, \"?\");\n"
+        "        for (unsigned i = 0; i < nj; i++) {\n"
+        "            void *ga[1] = { jobj[i] };\n"
+        "            Il2CppObject *go = invoke(m_gofind, ga, \"GameObject.Find\");\n"
+        "            Il2CppObject *tf = go ? invoke_on(go, m_gotf, NULL, \"GameObject.transform\") : NULL;\n"
+        "            Il2CppObject *po = tf ? invoke_on(tf, m_tpos, NULL, \"Transform.position\") : NULL;\n"
+        "            if (!po) { fprintf(stderr, \" %s=-\", jname[i]); continue; }\n"
+        "            const float *v = (const float *)il.object_unbox(po);\n"
+        "            fprintf(stderr, \" %s=(%.3f,%.3f,%.3f)\", jname[i], v[0], v[1], v[2]);\n"
+        "            if (have_cam) {\n"
+        "                float dx = v[0] - cp[0], dy = v[1] - cp[1], dz = v[2] - cp[2];\n"
+        "                fprintf(stderr, \"d=%.3f\", sqrtf(dx*dx + dy*dy + dz*dz));\n"
+        "            }\n"
+        "        }\n"
+        "        if (hand_type) {\n"
+        "            void *ta[1] = { hand_type };\n"
+        "            Il2CppObject *hs = invoke(m_find, ta, \"FindObjectsOfType(Hand)\");\n"
+        "            uint32_t n = hs ? il.array_length(hs) : 0;\n"
+        "            fprintf(stderr, \" | Hand x%u\", n);\n"
+        "            for (uint32_t i = 0; i < n && i < 4; i++) {\n"
+        "                Il2CppObject *h = ((Il2CppObject **)((uint8_t *)hs + ARR_DATA))[i];\n"
+        "                if (!h) continue;\n"
+        "                Il2CppObject *nm = invoke_on(h, m_objname, NULL, \"Object.get_name\");\n"
+        "                Il2CppObject *va = invoke_on(h, m_hvalid, NULL, \"Hand.IsTrackedDataValid\");\n"
+        "                Il2CppObject *hc = invoke_on(h, m_hconf, NULL, \"Hand.IsHighConfidence\");\n"
+        "                char nb[64];\n"
+        "                str_ascii(nm, nb, sizeof nb);\n"
+        "                fprintf(stderr, \" %s[valid=%s,high=%s]\", nb,\n"
+        "                        va ? (*(uint8_t *)il.object_unbox(va) ? \"1\" : \"0\") : \"?\",\n"
+        "                        hc ? (*(uint8_t *)il.object_unbox(hc) ? \"1\" : \"0\") : \"?\");\n"
+        "            }\n"
+        "        }\n"
+        "        fprintf(stderr, \"\\n\");\n"
+        "    }\n"
+        "\n")
+    s = s.replace(old, new + old)
+    if "#include <math.h>" not in s:
+        inc = "#include <stdint.h>\n"
+        if s.count(inc) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {p}: {inc!r}")
+        s = s.replace(inc, "#include <math.h>   // " + marker + ": sqrtf\n" + inc)
+    open(p, "w").write(s)
+print("overlay: the input probe also reports what hand gates see (KL_PROBE_JOINTS)")
+PYEOF

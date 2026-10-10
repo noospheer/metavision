@@ -6,7 +6,9 @@
 
 // One hand, once per frame, from the app's hand-tracking loop.
 //   model   MV_HAND_BONES x {qx,qy,qz,qw, px,py,pz}: each OVR hand bone in the
-//           wrist's frame (index order is OVRPlugin's BoneId)
+//           wrist's frame (index order is OVRPlugin's BoneId). Only the
+//           positions are used: they are retargeted onto Meta's skeleton,
+//           whose bone frames are not ARKit's (see mv_hands.c)
 //   root    {qx,qy,qz,qw, px,py,pz}: the wrist in tracking space
 //   pointer {qx,qy,qz,qw, px,py,pz}: the pointing ray in tracking space, -Z forward
 //   pinch   5 strengths 0..1, thumb..pinky

@@ -37,8 +37,8 @@ static void *barrier_worker(void *b) {
     return (void *)(intptr_t)w(b);
 }
 
-// Hand tracking: enabled flag, skeleton only after the hand is seen, local
-// rotations and rest positions derived from wrist-frame bone poses.
+// Hand tracking: enabled flag, Meta's bind skeleton from the start, hand state
+// retargeted from wrist-frame joint positions.
 static void test_hands(void *(*dls)(void *, const char *)) {
     int32_t (*en)(int32_t *) = (int32_t (*)(int32_t *))dls(&g_fake_ovrp, "ovrp_GetHandTrackingEnabled");
     int32_t on = 0; assert(en(&on) == 0 && on == 1);
@@ -47,38 +47,43 @@ static void test_hands(void *(*dls)(void *, const char *)) {
     int32_t (*sk)(int32_t, void *) = (int32_t (*)(int32_t, void *))dls(&g_fake_ovrp, "ovrp_GetSkeleton2");
     int32_t (*hs)(int32_t, int32_t, void *) = (int32_t (*)(int32_t, int32_t, void *))dls(&g_fake_ovrp, "ovrp_GetHandState");
     static unsigned char skel[0xc44], st[0x200];
-    assert(sk(1, skel) == -1000);              // not seen yet: OVRSkeleton retries
+    // Meta's bind skeleton, before any hand is seen: Index2 under Index1, its
+    // offset Meta's (the right hand's is the left's negated).
+    assert(sk(1, skel) == 0);
+    int32_t *h = (int32_t *)skel; assert(h[0] == 1 && h[1] == MV_HAND_BONES && h[2] == 0);
+    unsigned char *b7 = skel + 0xc + 7 * 0x24;
+    assert(*(int16_t *)(b7 + 4) == 6);
+    float *p7 = (float *)(b7 + 8 + 16);
+    assert(fabsf(p7[0] + 0.0379273f) < 1e-6f);
+    assert(sk(0, skel) == 0 && fabsf(((float *)(skel + 0xc + 7 * 0x24 + 8 + 16))[0] - 0.0379273f) < 1e-6f);
 
-    // Right hand: every bone at identity, 1 cm further along +X than its parent,
-    // except Index1 turned 90 degrees about Z.
+    // Right hand, open, palm down, fingers along -Z, in its wrist frame.
+    static const float pts[MV_HAND_BONES][3] = {
+        {0,0,0}, {0,0,0.03f}, {-0.02f,0,-0.02f}, {-0.035f,0,-0.04f}, {-0.045f,0,-0.065f}, {-0.05f,0,-0.085f},
+        {-0.02f,0,-0.09f}, {-0.02f,0,-0.13f}, {-0.02f,0,-0.155f}, {0,0,-0.095f}, {0,0,-0.135f}, {0,0,-0.16f},
+        {0.02f,0,-0.09f}, {0.02f,0,-0.13f}, {0.02f,0,-0.155f}, {0.02f,0,-0.03f}, {0.035f,0,-0.08f},
+        {0.035f,0,-0.11f}, {0.035f,0,-0.13f}, {-0.052f,0,-0.105f}, {-0.02f,0,-0.18f}, {0,0,-0.19f},
+        {0.02f,0,-0.18f}, {0.035f,0,-0.15f} };
     float model[MV_HAND_BONES * 7] = {0};
-    static const int depth[MV_HAND_BONES] = {0,1,1,2,3,4,1,2,3,1,2,3,1,2,3,1,2,3,4,5,4,4,4,5};
-    for (int i = 0; i < MV_HAND_BONES; i++) { model[7*i+3] = 1; model[7*i+4] = 0.01f * depth[i]; }
-    float s45 = sqrtf(0.5f);
-    model[7*6+2] = s45; model[7*6+3] = s45;   // Index1
+    for (int i = 0; i < MV_HAND_BONES; i++) {
+        model[7*i+3] = 1;
+        for (int k = 0; k < 3; k++) model[7*i+4+k] = pts[i][k];
+    }
     float root[7] = {0,0,0,1, 0.1f,1.2f,-0.3f}, pinch[5] = {0.95f,0.95f,0.2f,0,0};
     mv_hands_publish(1, 1, model, root, NULL, pinch, 12.5);
 
-    assert(sk(1, skel) == 0);
-    int32_t *h = (int32_t *)skel; assert(h[0] == 1 && h[1] == MV_HAND_BONES && h[2] == 0);
-    unsigned char *b7 = skel + 0xc + 7 * 0x24;  // Index2: parent Index1
-    assert(*(int16_t *)(b7 + 4) == 6);
-    float *p7 = (float *)(b7 + 8 + 16);
-    // Index2 sits +X in world, which is -Y in Index1's turned frame.
-    assert(fabsf(p7[0]) < 1e-5f && fabsf(p7[1] + 0.01f) < 1e-5f);
-
     assert(hs(0, 1, st) == 0);
     assert(*(int32_t *)st == (1 | 2 | 128));
-    assert(((float *)(st + 4))[4] == 0.1f);               // root position x
-    float *r6 = (float *)(st + 0x20 + 6 * 16), *r7 = (float *)(st + 0x20 + 7 * 16);
-    assert(fabsf(r6[2] - s45) < 1e-5f);                   // Index1 relative to wrist: the turn
-    assert(fabsf(r7[2] + s45) < 1e-5f);                   // Index2 relative to Index1: undoes it
+    float *rp = (float *)(st + 4);
+    assert(fabsf(rp[4] - 0.1f) < 1e-6f && fabsf(rp[5] - 1.2f) < 1e-6f);   // root at the wrist
+    float rl = rp[0]*rp[0] + rp[1]*rp[1] + rp[2]*rp[2] + rp[3]*rp[3];
+    assert(fabsf(rl - 1) < 1e-4f);                                        // a unit rotation
+    float sc = *(float *)(st + 0x1d4); assert(sc > 0.9f && sc < 1.1f);    // about Meta's size
     assert(*(uint32_t *)(st + 0x1a0) == 3);               // thumb + index pinching
     assert(*(double *)(st + 0x1f8) == 12.5);
-    // Hand mesh: a tube per bone on the measured skeleton, refused until seen.
+    // Hand mesh: a tube per bone on the bind skeleton.
     int32_t (*gm)(int32_t, void *) = (int32_t (*)(int32_t, void *))dls(&g_fake_ovrp, "ovrp_GetMesh");
     static unsigned char mesh[0x31cec];
-    assert(gm(0, mesh) != 0);                             // left hand never seen
     assert(gm(2, mesh) != 0);                             // not a hand
     assert(gm(1, mesh) == 0);
     uint32_t *mh = (uint32_t *)mesh;
@@ -89,6 +94,7 @@ static void test_hands(void *(*dls)(void *, const char *)) {
     assert(hs(0, 0, st) == 0 && *(int32_t *)st == 0);     // left hand never seen
     mv_hands_set_enabled(0);
     assert(hs(0, 1, st) == 0 && *(int32_t *)st == 0);     // hands-free: hands ignored
+    assert(sk(1, skel) != 0 && gm(1, mesh) != 0);         // and no skeleton
     mv_hands_set_enabled(1);
 }
 

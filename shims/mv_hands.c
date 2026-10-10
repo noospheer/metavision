@@ -7,8 +7,7 @@
 //   ovrp_GetHandTrackingEnabled  yes, unless the input mode ignores hands
 //   ovrp_GetSkeleton2 / 3        the bind skeleton: 24 hand bones, their
 //                                parents, and each bone's rest pose in its
-//                                parent's frame — measured from the user's own
-//                                hand the first time it is seen
+//                                parent's frame — Meta's own (k_bind below)
 //   ovrp_GetHandState            per frame: wrist pose in tracking space, each
 //                                bone's rotation in its parent's frame, pinch
 //                                strengths, a pointing ray, confidences
@@ -16,16 +15,28 @@
 // The struct layouts are OVRPlugin's C# bindings (OVRPlugin.HandStateInternal,
 // Skeleton2Internal, Skeleton3Internal), identical across the titles checked;
 // the static asserts below pin every offset. ARKit and OVRPlugin share a
-// right-handed, Y-up, -Z-forward convention, so poses pass through unchanged
-// and Unity applies its own Z flip as it does on a Quest.
+// right-handed, Y-up, -Z-forward tracking space, so world poses pass through
+// unchanged and Unity applies its own Z flip as it does on a Quest.
 //
-// Bone frames are ARKit's joint frames, not Meta's. Anything built from bone
-// positions — the hand skeleton, colliders, particles, pinch tests — sees the
-// real hand. Meta's own hand MESH is skinned to Meta's frames and is not ours to
-// ship, so ovrp_GetMesh answers a mesh of our own instead: a tube along every
-// bone of the bind skeleton below, each vertex bound wholly to the bone it
-// rides. OVRMeshRenderer derives the bind poses from that same skeleton, so it
-// skins to the live hand. Titles that emit or place effects on the hand mesh
+// Bone frames are Meta's, not ARKit's. Meta's Interaction SDK does not ask
+// for the skeleton at all: it carries Meta's bind skeleton compiled in
+// (HandSkeletonOVR) and applies only the bone ROTATIONS it is given. So the
+// rotations have to be Meta's — rotations in ARKit's joint frames, applied to
+// Meta's bone offsets, bend every finger the wrong way, and a pinch the
+// user makes never brings the thumb tip to the index tip. Each frame is
+// therefore retargeted from joint POSITIONS (mv_hands_solve): the measured hand
+// is turned into Meta's wrist frame and scaled to Meta's hand size, every bone
+// is swung from its bind direction onto the measured direction to its child,
+// and the last two bones of each finger are solved so the tip lands on the
+// measured tip. ARKit's joint orientations are not used. GetSkeleton2/3 answer
+// the same bind skeleton, so OVRSkeleton, OVRMesh and the Interaction SDK all
+// place a joint in the same spot.
+//
+// Meta's own hand MESH is skinned to Meta's frames and is not ours to ship, so
+// ovrp_GetMesh answers a mesh of our own instead: a tube along every bone of
+// the bind skeleton, each vertex bound wholly to the bone it rides.
+// OVRMeshRenderer derives the bind poses from that same skeleton, so it skins
+// to the live hand. Titles that emit or place effects on the hand mesh
 // (SkinnedMeshRenderer.BakeMesh, particle shapes) need one to draw anything.
 #include "mv_hands.h"
 
@@ -90,13 +101,61 @@ static const int16_t k_parent[MV_HAND_BONES] = {
     5, 8, 11, 14, 18,   // tips
 };
 
+// Meta's bind skeleton for the LEFT hand, by BoneId: each bone's rest rotation
+// and offset in its parent's frame (OVRPlugin.Skeleton2 layout: orientation,
+// then position). The right hand is the same rotations with every offset
+// negated. These are the numbers Meta's runtime answers GetSkeleton2 with and
+// that its SDK bakes in (OVRSkeletonData.LeftSkeleton/RightSkeleton, read by
+// HandSkeletonOVR); copied bit-for-bit from that static constructor in three
+// titles' il2cpp code, built with different SDK releases, all identical.
+static const mv_pose k_bind[MV_HAND_BONES] = {
+    {{ 0, 0, 0, 1 }, { 0, 0, 0 }},   // WristRoot
+    {{ 0, 0, 0, 1 }, { 0, 0, 0 }},   // ForearmStub
+    {{ 0.375386894f, 0.424584091f, -0.00777885597f, 0.8238644f }, { 0.0200692993f, 0.0115540996f, -0.0104965204f }},   // Thumb0
+    {{ 0.260230303f, 0.0243308805f, 0.125678003f, 0.957023084f }, { 0.0248525608f, -9.30999999e-10f, -1.86299998e-09f }},   // Thumb1
+    {{ -0.0827037692f, -0.0769617036f, -0.0840622336f, 0.990035713f }, { 0.0325129107f, 5.82000004e-10f, 1.86299998e-09f }},   // Thumb2
+    {{ 0.0835059285f, 0.0650157332f, -0.0582740605f, 0.992675185f }, { 0.0337930992f, 3.26000005e-09f, 1.86299998e-09f }},   // Thumb3
+    {{ 0.0306830909f, -0.0188555904f, 0.0432814397f, 0.998413622f }, { 0.0959962383f, 0.00731645478f, -0.0235506799f }},   // Index1
+    {{ -0.0258524101f, -0.00711606117f, 0.00329294405f, 0.999634981f }, { 0.0379272997f, -5.82000004e-10f, -5.97000005e-10f }},   // Index2
+    {{ -0.0160559993f, -0.0271487199f, -0.0720340014f, 0.996903419f }, { 0.0243036505f, -6.72999989e-10f, -6.75e-10f }},   // Index3
+    {{ -0.00906632561f, -0.0514655896f, 0.0518357493f, 0.997287393f }, { 0.0956466123f, 0.0025431551f, -0.00172590604f }},   // Middle1
+    {{ -0.0112282299f, -0.00437887385f, -0.00197826698f, 0.999925375f }, { 0.0429270007f, -8.50999993e-10f, -1.19300003e-09f }},   // Middle2
+    {{ -0.0343195498f, -0.00461183907f, -0.0930070132f, 0.995063126f }, { 0.0275495797f, 3.08999992e-10f, 1.12800003e-09f }},   // Middle3
+    {{ -0.0531593598f, -0.123103403f, 0.0498134904f, 0.989716172f }, { 0.0886937976f, 0.00652930792f, 0.0174652394f }},   // Ring1
+    {{ -0.0336325206f, -0.0027898401f, 0.00567601994f, 0.999414325f }, { 0.0389961004f, 0, 5.2400001e-10f }},   // Ring2
+    {{ -0.0034774621f, 0.0291794501f, -0.0250285398f, 0.999254823f }, { 0.0265733898f, 1.28099997e-09f, 1.63000002e-09f }},   // Ring3
+    {{ -0.207036003f, -0.140342802f, 0.0183118004f, 0.968041718f }, { 0.0340735614f, 0.0094198361f, 0.0229985807f }},   // Pinky0
+    {{ 0.0911130384f, 0.00407136977f, 0.0281292293f, 0.99543488f }, { 0.0456505492f, 9.97678967e-07f, -2.19396293e-06f }},   // Pinky1
+    {{ -0.0376166515f, -0.0429377183f, -0.0132860504f, 0.998280883f }, { 0.0307204202f, 1.04800002e-09f, -1.75000001e-10f }},   // Pinky2
+    {{ 0.000644743384f, 0.0491706692f, -0.0240188297f, 0.99850142f }, { 0.0203113798f, -2.91000002e-10f, 9.30999999e-10f }},   // Pinky3
+    {{ 0, 0, 0, 1 }, { 0.0245907698f, -0.00102697394f, 0.000670370122f }},   // ThumbTip
+    {{ 0, 0, 0, 1 }, { 0.0223633796f, -0.00102506997f, 0.000295607606f }},   // IndexTip
+    {{ 0, 0, 0, 1 }, { 0.0249649193f, -0.001137299f, 0.000308652787f }},   // MiddleTip
+    {{ 0, 0, 0, 1 }, { 0.0243261307f, -0.00160817197f, 0.000257904991f }},   // RingTip
+    {{ 0, 0, 0, 1 }, { 0.0219223797f, -0.00121608598f, -0.000246479613f }},   // PinkyTip
+};
+
+// The child each bone is aimed at (its finger's next joint), or -1: the wrist
+// is placed by the root pose, the forearm stub and the tips have none.
+static const int8_t k_child[MV_HAND_BONES] = {
+    -1, -1,
+    3, 4, 5, 19,
+    7, 8, 20,
+    10, 11, 21,
+    13, 14, 22,
+    16, 17, 18, 23,
+    -1, -1, -1, -1, -1,
+};
+enum { B_WRIST = 0, B_INDEX1 = 6, B_MIDDLE1 = 9, B_RING1 = 12, B_TIP0 = 19 };
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_enabled = 1;
 static struct {
-    int tracked, have_bind;
+    int tracked, seen;
     double time;
-    mv_pose model[MV_HAND_BONES], root, pointer;
-    mv_vec3 bind[MV_HAND_BONES];   // rest position of each bone in its parent's frame
+    mv_pose root, pointer;          // root: Meta's wrist frame in tracking space
+    mv_quat rot[MV_HAND_BONES];     // each bone's rotation in its parent's frame
+    float scale;                    // measured hand size over Meta's
     float pinch[5];
 } g_hand[2];
 
@@ -111,18 +170,156 @@ static mv_vec3 q_rot(mv_quat q, mv_vec3 v) {
     mv_quat r = q_mul(q_mul(q, (mv_quat){ v.x, v.y, v.z, 0 }), q_conj(q));
     return (mv_vec3){ r.x, r.y, r.z };
 }
+static mv_quat q_norm(mv_quat q) {
+    float n = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    return n > 1e-12f ? (mv_quat){ q.x / n, q.y / n, q.z / n, q.w / n } : (mv_quat){ 0, 0, 0, 1 };
+}
 static mv_pose pose_from(const float *f) {
     return (mv_pose){ { f[0], f[1], f[2], f[3] }, { f[4], f[5], f[6] } };
 }
-static mv_quat local_rot(const mv_pose *m, int i) {
-    int p = k_parent[i];
-    return p < 0 ? (mv_quat){ 0, 0, 0, 1 } : q_mul(q_conj(m[p].o), m[i].o);
+
+static mv_vec3 v_add(mv_vec3 a, mv_vec3 b) { return (mv_vec3){ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static mv_vec3 v_sub(mv_vec3 a, mv_vec3 b) { return (mv_vec3){ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static mv_vec3 v_scale(mv_vec3 a, float k) { return (mv_vec3){ a.x * k, a.y * k, a.z * k }; }
+static float v_dot(mv_vec3 a, mv_vec3 b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+static mv_vec3 v_cross(mv_vec3 a, mv_vec3 b) {
+    return (mv_vec3){ a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
 }
-static mv_vec3 local_pos(const mv_pose *m, int i) {
-    int p = k_parent[i];
-    if (p < 0) return (mv_vec3){ 0, 0, 0 };
-    mv_vec3 d = { m[i].p.x - m[p].p.x, m[i].p.y - m[p].p.y, m[i].p.z - m[p].p.z };
-    return q_rot(q_conj(m[p].o), d);
+static float v_len(mv_vec3 a) { return sqrtf(v_dot(a, a)); }
+static mv_vec3 v_unit(mv_vec3 a) { float n = v_len(a); return n > 1e-9f ? v_scale(a, 1.0f / n) : a; }
+
+// The shortest rotation taking direction a onto direction b.
+static mv_quat q_from_to(mv_vec3 a, mv_vec3 b) {
+    a = v_unit(a); b = v_unit(b);
+    float d = v_dot(a, b);
+    if (d < -0.99999f) {                 // opposite: half a turn about any perpendicular
+        mv_vec3 ax = v_cross(a, (mv_vec3){ 1, 0, 0 });
+        if (v_len(ax) < 1e-3f) ax = v_cross(a, (mv_vec3){ 0, 1, 0 });
+        ax = v_unit(ax);
+        return (mv_quat){ ax.x, ax.y, ax.z, 0 };
+    }
+    mv_vec3 c = v_cross(a, b);
+    return q_norm((mv_quat){ c.x, c.y, c.z, 1 + d });
+}
+
+// The rotation whose matrix has these orthonormal columns.
+static mv_quat q_from_basis(mv_vec3 x, mv_vec3 y, mv_vec3 z) {
+    float t = x.x + y.y + z.z;
+    mv_quat q;
+    if (t > 0) {
+        float s = sqrtf(t + 1) * 2;
+        q = (mv_quat){ (y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, s / 4 };
+    } else if (x.x > y.y && x.x > z.z) {
+        float s = sqrtf(1 + x.x - y.y - z.z) * 2;
+        q = (mv_quat){ s / 4, (y.x + x.y) / s, (z.x + x.z) / s, (y.z - z.y) / s };
+    } else if (y.y > z.z) {
+        float s = sqrtf(1 + y.y - x.x - z.z) * 2;
+        q = (mv_quat){ (y.x + x.y) / s, s / 4, (z.y + y.z) / s, (z.x - x.z) / s };
+    } else {
+        float s = sqrtf(1 + z.z - x.x - y.y) * 2;
+        q = (mv_quat){ (z.x + x.z) / s, (z.y + y.z) / s, s / 4, (x.y - y.x) / s };
+    }
+    return q_norm(q);
+}
+
+// A hand's frame from its knuckles: x from the wrist towards the index, middle
+// and ring knuckles, z from the index knuckle across to the ring knuckle, y
+// their cross. Built the same way for Meta's bind hand and the measured one,
+// the two frames name the same physical directions whatever each source's axes.
+static mv_quat hand_frame(const mv_vec3 *p) {
+    mv_vec3 k = v_scale(v_add(v_add(p[B_INDEX1], p[B_MIDDLE1]), p[B_RING1]), 1.0f / 3);
+    mv_vec3 x = v_unit(v_sub(k, p[B_WRIST]));
+    mv_vec3 l = v_sub(p[B_RING1], p[B_INDEX1]);
+    mv_vec3 z = v_unit(v_sub(l, v_scale(x, v_dot(l, x))));
+    return q_from_basis(x, v_cross(z, x), z);
+}
+static float hand_size(const mv_vec3 *p) {
+    return v_len(v_sub(p[B_INDEX1], p[B_WRIST])) + v_len(v_sub(p[B_MIDDLE1], p[B_WRIST]))
+         + v_len(v_sub(p[B_RING1], p[B_WRIST]));
+}
+
+// Meta's bind offsets for one hand.
+static mv_vec3 bind_p(int hand, int i) { return hand ? v_scale(k_bind[i].p, -1) : k_bind[i].p; }
+
+// The bind skeleton laid out in the wrist's frame: each bone's rotation (g)
+// and position (at).
+static void bind_world(int hand, mv_quat *g, mv_vec3 *at) {
+    g[0] = k_bind[0].o; at[0] = (mv_vec3){ 0, 0, 0 };
+    for (int i = 1; i < MV_HAND_BONES; i++) {
+        int p = k_parent[i];
+        at[i] = v_add(at[p], q_rot(g[p], bind_p(hand, i)));
+        g[i] = q_norm(q_mul(g[p], k_bind[i].o));
+    }
+}
+
+// Bones b -> a -> t (the last two of a finger): bend b and aim a so the tip t
+// lands on target, keeping the bend in the plane the finger is already in.
+static void reach(int hand, int t, mv_vec3 target, mv_quat *g, mv_vec3 *at) {
+    int a = k_parent[t], b = k_parent[a];
+    float l1 = v_len(bind_p(hand, a)), l2 = v_len(bind_p(hand, t));
+    mv_vec3 d = v_sub(target, at[b]);
+    float dl = v_len(d);
+    if (dl < 1e-6f || l1 < 1e-6f || l2 < 1e-6f) return;
+    float lo = fabsf(l1 - l2) + 1e-5f, hi = l1 + l2 - 1e-5f;
+    float dc = dl < lo ? lo : dl > hi ? hi : dl;
+    float ca = (l1*l1 + dc*dc - l2*l2) / (2 * l1 * dc);
+    ca = ca > 1 ? 1 : ca < -1 ? -1 : ca;
+    mv_vec3 dh = v_scale(d, 1.0f / dl), cur = v_sub(at[a], at[b]);
+    mv_vec3 u = v_sub(cur, v_scale(dh, v_dot(cur, dh)));        // the side the knuckle bends to
+    if (v_len(u) < 1e-6f) u = v_cross(dh, q_rot(g[b], (mv_vec3){ 0, 0, 1 }));
+    u = v_unit(u);
+    mv_vec3 want = v_add(v_scale(dh, ca), v_scale(u, sqrtf(1 - ca*ca)));
+    mv_quat gb = q_norm(q_mul(q_from_to(q_rot(g[b], bind_p(hand, a)), want), g[b]));
+    mv_quat ga = q_norm(q_mul(gb, q_mul(q_conj(g[b]), g[a])));  // a keeps its turn on b
+    g[b] = gb;
+    at[a] = v_add(at[b], q_rot(gb, bind_p(hand, a)));
+    g[a] = q_norm(q_mul(q_from_to(q_rot(ga, bind_p(hand, t)), v_sub(target, at[a])), ga));
+    at[t] = v_add(at[a], q_rot(g[a], bind_p(hand, t)));
+    g[t] = q_norm(q_mul(g[a], k_bind[t].o));
+}
+
+// Retarget one measured hand onto Meta's skeleton (see the top of the file).
+// m: bone positions in the hand anchor's frame; anchor: that frame in tracking
+// space. Writes Meta's root pose, per-bone local rotations and the hand scale.
+static void mv_hands_solve(int hand, const mv_vec3 *m, mv_pose anchor,
+                           mv_pose *root, mv_quat *rot, float *scale) {
+    mv_quat bg[MV_HAND_BONES];
+    mv_vec3 bat[MV_HAND_BONES];
+    bind_world(hand, bg, bat);
+
+    // Measured frame -> Meta's wrist frame, and Meta's size over the user's.
+    mv_quat fm = hand_frame(m), fb = hand_frame(bat);
+    mv_quat turn = q_norm(q_mul(fb, q_conj(fm)));   // a measured direction, in Meta's frame
+    float sm = hand_size(m), sb = hand_size(bat);
+    float s = sb > 1e-6f && sm > 1e-6f ? sm / sb : 1;
+    if (s < 0.5f || s > 2.0f) s = 1;                // a nonsense measurement: keep Meta's size
+    mv_vec3 target[MV_HAND_BONES];
+    for (int i = 0; i < MV_HAND_BONES; i++)
+        target[i] = v_scale(q_rot(turn, v_sub(m[i], m[B_WRIST])), 1.0f / s);
+
+    // Root to tip: carry the parent's turn, then swing onto the measured child.
+    mv_quat g[MV_HAND_BONES];
+    mv_vec3 at[MV_HAND_BONES];
+    g[0] = k_bind[0].o; at[0] = (mv_vec3){ 0, 0, 0 };
+    for (int i = 1; i < MV_HAND_BONES; i++) {
+        int p = k_parent[i], c = k_child[i];
+        at[i] = v_add(at[p], q_rot(g[p], bind_p(hand, i)));
+        g[i] = q_norm(q_mul(g[p], k_bind[i].o));
+        if (c >= 0) {
+            mv_vec3 want = v_sub(target[c], at[i]);
+            if (v_len(want) > 1e-6f)
+                g[i] = q_norm(q_mul(q_from_to(q_rot(g[i], bind_p(hand, c)), want), g[i]));
+        }
+    }
+    // Bone lengths differ from the user's, so the swings alone leave each tip
+    // short of or past its mark: close the last two joints onto it.
+    for (int t = B_TIP0; t < MV_HAND_BONES; t++) reach(hand, t, target[t], g, at);
+
+    rot[0] = k_bind[0].o;
+    for (int i = 1; i < MV_HAND_BONES; i++) rot[i] = q_norm(q_mul(q_conj(g[k_parent[i]]), g[i]));
+    root->o = q_norm(q_mul(anchor.o, q_conj(turn)));
+    root->p = v_add(anchor.p, q_rot(anchor.o, m[B_WRIST]));
+    *scale = s;
 }
 
 void mv_hands_set_enabled(int on) {
@@ -144,21 +341,29 @@ int mv_hands_tracked(int hand) {
 void mv_hands_publish(int hand, int tracked, const float *model, const float *root,
                       const float *pointer, const float *pinch, double time_s) {
     if (hand < 0 || hand > 1) return;
+    mv_pose r = { { 0, 0, 0, 1 }, { 0, 0, 0 } };
+    mv_quat rot[MV_HAND_BONES];
+    float scale = 1;
+    tracked = tracked && model && root;
+    if (tracked) {           // solved outside the lock: the readers are other threads
+        mv_vec3 m[MV_HAND_BONES];
+        for (int i = 0; i < MV_HAND_BONES; i++)
+            m[i] = (mv_vec3){ model[7*i + 4], model[7*i + 5], model[7*i + 6] };
+        mv_hands_solve(hand, m, pose_from(root), &r, rot, &scale);
+    }
     pthread_mutex_lock(&g_lock);
-    g_hand[hand].tracked = tracked && model && root;
+    g_hand[hand].tracked = tracked;
     g_hand[hand].time = time_s;
-    if (g_hand[hand].tracked) {
-        for (int i = 0; i < MV_HAND_BONES; i++) g_hand[hand].model[i] = pose_from(model + 7 * i);
-        g_hand[hand].root = pose_from(root);
-        g_hand[hand].pointer = pointer ? pose_from(pointer) : g_hand[hand].root;
+    if (tracked) {
+        g_hand[hand].root = r;
+        memcpy(g_hand[hand].rot, rot, sizeof rot);
+        g_hand[hand].scale = scale;
+        g_hand[hand].pointer = pointer ? pose_from(pointer) : pose_from(root);
         for (int i = 0; i < 5; i++) g_hand[hand].pinch[i] = pinch ? pinch[i] : 0;
-        if (!g_hand[hand].have_bind) {
-            // The rest skeleton is the user's own hand, measured once: titles
-            // read it at startup and size colliders and visuals from it.
-            for (int i = 0; i < MV_HAND_BONES; i++) g_hand[hand].bind[i] = local_pos(g_hand[hand].model, i);
-            g_hand[hand].have_bind = 1;
-            fprintf(stderr, "  [mv-hands] %s hand seen: skeleton measured, hand tracking live\n",
-                    hand ? "right" : "left");
+        if (!g_hand[hand].seen) {
+            g_hand[hand].seen = 1;
+            fprintf(stderr, "  [mv-hands] %s hand seen: retargeted onto Meta's skeleton "
+                            "(scale %.2f), hand tracking live\n", hand ? "right" : "left", scale);
         }
     }
     pthread_mutex_unlock(&g_lock);
@@ -172,15 +377,14 @@ static int32_t mv_GetHandTrackingEnabled(int32_t *out) {
     return OVRP_SUCCESS;
 }
 
-// Fails until the hand has been seen once; OVRSkeleton retries every frame
-// until it gets a skeleton, so the bind pose is the user's real hand.
+// Meta's bind skeleton, whenever hand tracking is on: it is a constant, so
+// unlike the measured skeleton this used to answer there is nothing to wait for.
 static int32_t fill_skeleton(int type, int32_t *head, ovrp_bone *bones, int max_bones) {
     if (type < 0 || type > 1 || !head) return OVRP_FAIL_INVALID_PARAM;
     pthread_mutex_lock(&g_lock);
-    if (!g_enabled || !g_hand[type].have_bind) {
-        pthread_mutex_unlock(&g_lock);
-        return OVRP_FAILURE;
-    }
+    int on = g_enabled;
+    pthread_mutex_unlock(&g_lock);
+    if (!on) return OVRP_FAILURE;
     head[0] = type;
     head[1] = MV_HAND_BONES;
     head[2] = 0;                     // no capsules: physics hands are opt-in
@@ -189,10 +393,9 @@ static int32_t fill_skeleton(int type, int32_t *head, ovrp_bone *bones, int max_
                                 .pose = { { 0, 0, 0, 1 }, { 0, 0, 0 } } };
         if (i < MV_HAND_BONES) {
             bones[i].parent = k_parent[i];
-            bones[i].pose.p = g_hand[type].bind[i];
+            bones[i].pose = (mv_pose){ k_bind[i].o, bind_p(type, i) };
         }
     }
-    pthread_mutex_unlock(&g_lock);
     return OVRP_SUCCESS;
 }
 
@@ -217,14 +420,14 @@ static int32_t mv_GetHandState(int32_t step, int32_t hand, ovrp_hand_state *out)
     if (!said++) fprintf(stderr, "  [mv-hands] the title reads hand state: it uses hand tracking\n");
     memset(out, 0, sizeof *out);
     out->root.o.w = out->pointer.o.w = 1;
-    for (int i = 0; i < MV_HAND_BONES; i++) out->rot[i].w = 1;
+    for (int i = 0; i < MV_HAND_BONES; i++) out->rot[i] = k_bind[i].o;
     out->scale = 1;
     pthread_mutex_lock(&g_lock);
     if (g_enabled && g_hand[hand].tracked) {
-        const mv_pose *m = g_hand[hand].model;
         out->status = ST_TRACKED | ST_VALID | (hand == 1 ? ST_DOMINANT : 0);
         out->root = g_hand[hand].root;
-        for (int i = 0; i < MV_HAND_BONES; i++) out->rot[i] = local_rot(m, i);
+        memcpy(out->rot, g_hand[hand].rot, sizeof out->rot);
+        out->scale = g_hand[hand].scale;
         for (int i = 0; i < 5; i++) {
             out->pinch[i] = g_hand[hand].pinch[i];
             if (out->pinch[i] >= 0.9f) out->pinches |= 1u << i;
@@ -266,32 +469,21 @@ _Static_assert(offsetof(ovrp_mesh, bone) == 0x203ac, "Mesh.BlendIndices");
 _Static_assert(offsetof(ovrp_mesh, weight) == 0x2616c, "Mesh.BlendWeights");
 _Static_assert(sizeof(ovrp_mesh) == 0x31cec, "MeshInternal");
 
-static mv_vec3 v_add(mv_vec3 a, mv_vec3 b) { return (mv_vec3){ a.x + b.x, a.y + b.y, a.z + b.z }; }
-static mv_vec3 v_sub(mv_vec3 a, mv_vec3 b) { return (mv_vec3){ a.x - b.x, a.y - b.y, a.z - b.z }; }
-static mv_vec3 v_scale(mv_vec3 a, float k) { return (mv_vec3){ a.x * k, a.y * k, a.z * k }; }
-static mv_vec3 v_cross(mv_vec3 a, mv_vec3 b) {
-    return (mv_vec3){ a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
-}
-static float v_len(mv_vec3 a) { return sqrtf(a.x*a.x + a.y*a.y + a.z*a.z); }
-
 #define TUBE_SIDES 8
 
-// Fails, like the skeleton, until the hand has been seen once: the mesh is
-// built on the measured bind skeleton and must match it bone for bone.
+// Built on the bind skeleton GetSkeleton2/3 answer, bone for bone, in its
+// wrist frame (Meta's mesh space). Refused, like the skeleton, while hand
+// tracking is off.
 static int32_t mv_GetMesh(int32_t type, ovrp_mesh *out) {
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     if (type != 0 && type != 1) return OVRP_FAILURE;   // HandLeft / HandRight only, as the skeleton
-    mv_vec3 at[MV_HAND_BONES];                         // each bone's bind origin, wrist frame
     pthread_mutex_lock(&g_lock);
-    if (!g_enabled || !g_hand[type].have_bind) {
-        pthread_mutex_unlock(&g_lock);
-        return OVRP_FAILURE;
-    }
-    for (int i = 0; i < MV_HAND_BONES; i++) {          // parents precede children
-        int p = k_parent[i];
-        at[i] = p < 0 ? (mv_vec3){ 0, 0, 0 } : v_add(at[p], g_hand[type].bind[i]);
-    }
+    int on = g_enabled;
     pthread_mutex_unlock(&g_lock);
+    if (!on) return OVRP_FAILURE;
+    mv_quat g[MV_HAND_BONES];
+    mv_vec3 at[MV_HAND_BONES];                         // each bone's bind origin, wrist frame
+    bind_world(type, g, at);
 
     memset(out, 0, sizeof *out);
     out->type = type;
@@ -330,8 +522,8 @@ static int32_t mv_GetMesh(int32_t type, ovrp_mesh *out) {
     out->num_indices = ni;
     static int said[2];
     if (!said[type]++)
-        fprintf(stderr, "  [mv-hands] %s hand mesh: %u vertices, %u indices, skinned to the "
-                        "measured skeleton\n", type ? "right" : "left", nv, ni);
+        fprintf(stderr, "  [mv-hands] %s hand mesh: %u vertices, %u indices, skinned to Meta's "
+                        "bind skeleton\n", type ? "right" : "left", nv, ni);
     return OVRP_SUCCESS;
 }
 

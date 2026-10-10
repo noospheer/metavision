@@ -66,11 +66,17 @@ enum MetavisionAutoplay {
     private static let cycleModes: [MetavisionHandsFree.Mode] = [.hands, .handsfree, .auto]
     /// A hands-only title (MV_HANDS_ONLY, set by the launcher from its manifest)
     /// is opened with a two-hand start gesture first: such titles commonly wait
-    /// for both hands near the face, or for both hands' thumb and index tips
-    /// touching, held for seconds, before they start what they draw.
+    /// for both hands near the face, or for a thumb and index tip touching,
+    /// held for seconds, before they start what they draw. The gesture holds
+    /// both hands open at the face, then pinches both and holds the pinch.
     private static var handsOnly: Bool { getenv("MV_HANDS_ONLY").map { String(cString: $0) == "1" } ?? false }
-    private static let gestureFrom = 1.0, gestureLen = 22.0
+    private static let gestureFrom = 1.0, gestureLen = 22.0, gesturePinchAt = 10.0
     private static var gestureSaid = false
+    /// Whether the last drive() published the hands itself. The frame's real
+    /// hand publish (MetavisionHands, called just before drive) is skipped
+    /// while this holds (tools/metavision-overlay), or a title reading hands
+    /// between the two calls would see them untracked for that instant.
+    nonisolated(unsafe) static var drivesHands = false
     private static var headNow_ = ""
     private static let headLock = NSLock()
     /// Written on the render thread, read on the controller thread.
@@ -193,8 +199,9 @@ enum MetavisionAutoplay {
         let path = viaHandsFree ? "hands-free" : "controllers+hands"
         if path != lastPath { lastPath = path; NSLog("[mv-autoplay] input path: %@", path as NSString) }
 
+        drivesHands = gesture || !viaHandsFree
         let what = gesture
-            ? twoHandGesture(head: hp, heading: facing, now: now)
+            ? twoHandGesture(head: hp, heading: facing, pinch: t >= gestureFrom + gesturePinchAt, now: now)
             : viaHandsFree
             ? handsFree(step: step, head: base, aim: aim)
             : controllersAndHands(step: step, phase: phase, now: now, head: base, heading: heading, aim: aim,
@@ -248,9 +255,11 @@ enum MetavisionAutoplay {
     private static func controllersAndHands(step: Int, phase: Double, now: Double, head hp: SIMD3<Float>,
                                             heading: simd_quatf, aim rq: simd_quatf,
                                             rightAt: SIMD3<Float>? = nil) -> String {
-        let rp = rightAt ?? hp + heading.act(SIMD3<Float>(0.18, -0.30, -0.25))
+        // Hands low in front, middle knuckles about 0.36 m from the eye: inside
+        // the "hands near the head" gates hands-only titles use (0.4 m).
+        let rp = rightAt ?? hp + heading.act(SIMD3<Float>(0.13, -0.20, -0.18))
         let lq = heading * simd_quatf(angle: -10 * .pi / 180, axis: SIMD3<Float>(1, 0, 0))
-        let lp = hp + heading.act(SIMD3<Float>(-0.18, -0.30, -0.25))
+        let lp = hp + heading.act(SIMD3<Float>(-0.13, -0.20, -0.18))
 
         var rb: UInt32 = 0, lb: UInt32 = 0
         var rTrig: Float = 0, rGrip: Float = 0, lTrig: Float = 0, lGrip: Float = 0
@@ -281,41 +290,58 @@ enum MetavisionAutoplay {
         return what
     }
 
-    /// A plausible open hand in its wrist frame (metres; palm down, fingers
-    /// along -Z), in OVR bone order; the thumb tip closes on the index tip as
-    /// `pinch` goes to 1.
-    /// Both hands up in front of the face, palms down, no pinch, held still:
-    /// middle knuckles about 0.33 m from the eye, thumb tips 3.4 cm and index
-    /// tips 3.0 cm apart (publishHand's hand model) — inside the common gates of
-    /// "hands within 0.4 m of the head" and "fingertips within 5 cm".
-    private static func twoHandGesture(head hp: SIMD3<Float>, heading q: simd_quatf, now: Double) -> String {
+    /// Both hands up in front of the face, palms down, held still: middle
+    /// knuckles about 0.33 m from the eye — inside the common "hands within
+    /// 0.4 m of the head" gate. Open at first (thumb tips 3.4 cm and index tips
+    /// 3.0 cm apart, for "fingertips close" gates), then each hand pinching,
+    /// thumb tip on index tip, held (for "pinch to start" gates).
+    private static func twoHandGesture(head hp: SIMD3<Float>, heading q: simd_quatf, pinch: Bool,
+                                       now: Double) -> String {
         let d: Float = 0.035
         let rp = hp + q.act(SIMD3<Float>( d, -0.15, -0.20))
         let lp = hp + q.act(SIMD3<Float>(-d, -0.15, -0.20))
         kl_ovrp_set_hand_motion(1, rp.x, rp.y, rp.z, q.imag.x, q.imag.y, q.imag.z, q.real, 0, 0, 0, 0, 0, 0)
         kl_ovrp_set_hand_motion(0, lp.x, lp.y, lp.z, q.imag.x, q.imag.y, q.imag.z, q.real, 0, 0, 0, 0, 0, 0)
-        kl_ovrp_set_controller_input(1, 0, 0, 0, 0, 0, 0)
-        kl_ovrp_set_controller_input(0, 0, 0, 0, 0, 0, 0)
-        publishHand(1, at: rp, q, pinch: 0, grip: false, now: now)
-        publishHand(0, at: lp, q, pinch: 0, grip: false, now: now)
-        if !gestureSaid { gestureSaid = true; NSLog("[mv-autoplay] two-hand start gesture for a hands-only title (%.0f s)", gestureLen) }
-        return " + two-hand gesture (hands at face, thumb and index tips touching)"
+        // A pinch also arrives as the index trigger, as in controllersAndHands.
+        let p: Float = pinch ? 1 : 0
+        let rb: UInt32 = pinch ? OVRPRawButton.rIndexTrigger : 0
+        let lb: UInt32 = pinch ? OVRPRawButton.lIndexTrigger : 0
+        kl_ovrp_set_controller_input(1, rb, rb, p, 0, 0, 0)
+        kl_ovrp_set_controller_input(0, lb, lb, p, 0, 0, 0)
+        publishHand(1, at: rp, q, pinch: p, grip: false, now: now)
+        publishHand(0, at: lp, q, pinch: p, grip: false, now: now)
+        if !gestureSaid {
+            gestureSaid = true
+            NSLog("[mv-autoplay] two-hand start gesture for a hands-only title (%.0f s: open, then pinch held from %.0f s)",
+                  gestureLen, gesturePinchAt)
+        }
+        return pinch ? " + two-hand gesture (hands at face, both pinching, held)"
+                     : " + two-hand gesture (hands at face, open)"
     }
 
+    /// A plausible open hand in its wrist frame (metres; palm down, fingers
+    /// along -Z), in OVR bone order. As `pinch` goes to 1 the index finger
+    /// curls under and the thumb tip comes onto its tip, 6 mm off — the way a
+    /// hand pinches, with every bone keeping roughly its length, so a skeleton
+    /// of real proportions can make the same pose (mv_hands.c retargets from
+    /// these positions alone; the joint orientations sent are identity).
     private static func publishHand(_ hand: Int, at p: SIMD3<Float>, _ q: simd_quatf,
                                     pinch: Float, grip: Bool, now: Double) {
         let s: Float = hand == 1 ? 1 : -1          // left hand: mirrored across X
-        let indexTip = SIMD3<Float>(-0.02, 0, -0.18)
-        let pinched = indexTip + SIMD3<Float>(0, -0.005, 0.005)
-        let thumbTip = simd_mix(SIMD3<Float>(-0.052, 0, -0.105), pinched, SIMD3<Float>(repeating: pinch))
         func v(_ x: Float, _ y: Float, _ z: Float) -> SIMD3<Float> { SIMD3<Float>(x, y, z) }
         let pin = SIMD3<Float>(repeating: pinch)
+        func curl(_ open: SIMD3<Float>, _ closed: SIMD3<Float>) -> SIMD3<Float> { simd_mix(open, closed, pin) }
+        let indexTip = curl(v(-0.02, 0, -0.18), v(-0.03, -0.052, -0.10))
+        let thumbTip = curl(v(-0.052, 0, -0.105), v(-0.034, -0.056, -0.10))
         var pts = [SIMD3<Float>]()
         pts.append(v(0, 0, 0)); pts.append(v(0, 0, 0.03))                              // wrist, forearm
         pts.append(v(-0.02, 0, -0.02)); pts.append(v(-0.035, 0, -0.04))                 // thumb 0, 1
-        pts.append(simd_mix(v(-0.045, 0, -0.065), thumbTip, pin * 0.3))                 // thumb 2
-        pts.append(simd_mix(v(-0.05, 0, -0.085), thumbTip, pin * 0.6))                  // thumb 3
-        for x: Float in [-0.02, 0, 0.02] {                                              // index, middle, ring 1-3
+        pts.append(curl(v(-0.045, 0, -0.065), v(-0.04, -0.025, -0.065)))                // thumb 2
+        pts.append(curl(v(-0.05, 0, -0.085), v(-0.038, -0.045, -0.08)))                 // thumb 3
+        pts.append(v(-0.02, 0, -0.09))                                                  // index 1-3
+        pts.append(curl(v(-0.02, 0, -0.13), v(-0.022, -0.02, -0.12)))
+        pts.append(curl(v(-0.02, 0, -0.155), v(-0.026, -0.042, -0.115)))
+        for x: Float in [0, 0.02] {                                                     // middle, ring 1-3
             let l: Float = x == 0 ? 0.005 : 0
             pts.append(v(x, 0, -0.09 - l)); pts.append(v(x, 0, -0.13 - l)); pts.append(v(x, 0, -0.155 - l))
         }
