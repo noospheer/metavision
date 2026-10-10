@@ -423,6 +423,38 @@ static const struct { const char *name; void *fn; } k_ovrp_answers[] = {
     { "ovrp_GetActionStatePose2",   (void *)mv_ovrp_action_pose2 },
 };
 
+// Which managed method threw. Unity finds il2cpp_runtime_invoke by name (dlsym)
+// and calls every script method it dispatches through it; an exception comes
+// back in *exc. Release builds carry no stack trace, so a NullReferenceException
+// logged every frame names nothing — this names the class and method it came
+// out of, once per distinct (method, exception) pair. MV_LOG_THROWS=0 turns it off.
+typedef void *(*mv_invoke_fn)(const void *, void *, void **, void **);
+static mv_invoke_fn mv_real_invoke;
+static void *(*mv_object_get_class)(void *);
+static const char *(*mv_class_get_name)(void *);
+static const char *(*mv_class_get_namespace)(void *);
+static const char *(*mv_method_get_name)(const void *);
+static void *(*mv_method_get_class)(const void *);
+static void *mv_logged_invoke(const void *m, void *obj, void **args, void **exc) {
+    void *r = mv_real_invoke(m, obj, args, exc);
+    if (exc && *exc && mv_object_get_class && mv_class_get_name) {
+        static struct { const void *m; void *k; } seen[64];
+        static _Atomic unsigned nseen;
+        void *ek = mv_object_get_class(*exc);
+        unsigned n = nseen < 64 ? nseen : 64;
+        for (unsigned i = 0; i < n; i++) if (seen[i].m == m && seen[i].k == ek) return r;
+        unsigned slot = nseen++;
+        if (slot >= 64) return r;
+        seen[slot].m = m; seen[slot].k = ek;
+        void *mk = mv_method_get_class ? mv_method_get_class(m) : NULL;
+        const char *ns = mk && mv_class_get_namespace ? mv_class_get_namespace(mk) : "";
+        fprintf(stderr, "  [mv-throw] %s%s%s.%s threw %s\n", ns && *ns ? ns : "", ns && *ns ? "." : "",
+                mk ? mv_class_get_name(mk) : "?", mv_method_get_name ? mv_method_get_name(m) : "?",
+                ek ? mv_class_get_name(ek) : "?");
+    }
+    return r;
+}
+
 static void *mv_dlsym(void *handle, const char *name) {
     if (handle == &g_ossdk_handle)
         return (void *)mv_dummy_method;   // createTelemetryHandler, destroy*, anything
@@ -437,6 +469,21 @@ static void *mv_dlsym(void *handle, const char *name) {
             if (strcmp(name, k_ovrp_no[i]) == 0) return (void *)mv_ovrp_answer_no;
         for (size_t i = 0; i < sizeof k_ovrp_answers / sizeof k_ovrp_answers[0]; i++)
             if (strcmp(name, k_ovrp_answers[i].name) == 0) return k_ovrp_answers[i].fn;
+    }
+    if (name && strcmp(name, "il2cpp_runtime_invoke") == 0) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("MV_LOG_THROWS"); on = !(e && *e == '0'); }
+        void *real = klb_dlsym(handle, name);
+        if (on && real) {
+            mv_real_invoke = (mv_invoke_fn)real;
+            *(void **)&mv_object_get_class    = klb_dlsym(handle, "il2cpp_object_get_class");
+            *(void **)&mv_class_get_name      = klb_dlsym(handle, "il2cpp_class_get_name");
+            *(void **)&mv_class_get_namespace = klb_dlsym(handle, "il2cpp_class_get_namespace");
+            *(void **)&mv_method_get_name     = klb_dlsym(handle, "il2cpp_method_get_name");
+            *(void **)&mv_method_get_class    = klb_dlsym(handle, "il2cpp_method_get_class");
+            return (void *)mv_logged_invoke;
+        }
+        return real;
     }
     return klb_dlsym(handle, name);
 }

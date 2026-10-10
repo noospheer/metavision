@@ -63,6 +63,7 @@ that will not start, and what is still open.
 | (test) scripted input aims at what the screen shows, so menu buttons at the edge of view were pressed only by luck | menus (a language choice, a start button) never left | the managed probe presses the active, interactable Unity UI Buttons, Toggles and Dropdowns directly, least-pressed first, skipping quit/exit/back (`MV_AUTOPLAY_UI`) | overlay step 52 |
 | `getSystemService("midi")` answered null | a title polling it threw a NullReferenceException every frame | a MidiManager with no devices | overlay step 53 |
 | a wake written to the emulated eventfd (a datagram socket) failed with ENOBUFS once its queue filled | a Rust I/O reactor panicked: "failed to wake I/O driver" | an 8-byte write that fails on one of these sockets is taken as written | overlay step 54 |
+| (diagnostic) release builds carry no managed stack traces, so an exception logged every frame named nothing | a title threw a NullReferenceException every frame with no trace | Unity's dlsym of `il2cpp_runtime_invoke` gets a wrapper that logs `[mv-throw] Class.Method threw Type` once per distinct pair (`MV_LOG_THROWS=0` off) | shims/mv_shims.c |
 | the launcher did not carry **MoltenVK** | every Vulkan title black: `MoltenVK is not vendored` | the launcher build wraps it like ANGLE | `tools/metavision-launcher` |
 | a hand-launched app has no environment, and every Klepton diagnostic is an environment switch | — | `Documents/klepton.env`, read before configure | `tools/metavision-overlay`, `metavision-device env` |
 
