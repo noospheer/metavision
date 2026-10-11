@@ -5694,3 +5694,75 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: OVRPlugin hand state, eye size and passthrough answered")
 PYEOF
+
+# 69 — both eyes of a frame share one compositor slot when each eye has its own
+# swapchain. The GL eye copy keys its destination by (swapchain, image), so a
+# title with one swapchain per eye put its left eye in slots 0/2/4 and its
+# right eye in 1/3/5, and every frame the compositor read held only one eye: a
+# picture missing half its content. The right eye's copy is now keyed by the
+# left eye's swapchain and image in the same layer, so a frame's two eyes land
+# together.
+python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: one slot for both eyes of a frame (step 69)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static int klxr_mirror_eye_image(klxr_swapchain *sc, int eye, int layer) {\n",
+        "// " + marker + ": `key` names the destination — the left eye's swapchain\n"
+        "// when the two eyes come from two, so both land in one slot.\n"
+        "static int klxr_mirror_eye_image(klxr_swapchain *sc, klxr_swapchain *key, int eye, int layer) {\n")
+    s = sub(s, "    return kl_glfb_mirror_eye_layer(eye, sc->last_released,\n"
+               "                                    (uint32_t)(klxr_layer_id(sc) + 1),\n",
+        "    if (!key || key->last_released < 0) key = sc;\n"
+        "    return kl_glfb_mirror_eye_layer(eye, key->last_released,\n"
+        "                                    (uint32_t)(klxr_layer_id(key) + 1),\n")
+    s = sub(s, "                    slot = klxr_mirror_eye_image(sc, (int)v,\n",
+        "                    klxr_swapchain *key = v ? klxr_swapchain_of(proj->views[0].subImage.swapchain) : sc;   // " + marker + "\n"
+        "                    slot = klxr_mirror_eye_image(sc, key, (int)v,\n")
+    open(p, "w").write(s)
+print("overlay: both eyes of a frame share one compositor slot (one swapchain per eye)")
+PYEOF
+
+# 70 — Activity.finish() ends the app, as on Android. A title's own quit button
+# often calls finish() on its activity (through Unity's reflection); it had no
+# host implementation, so the title went on running after it asked to close.
+# finish, finishAndRemoveTask and finishAffinity now log "[guest] the title
+# quit" (triage's quit verdict) and exit with status 0, as step 61 does for
+# Application.Quit. KL_EXIT_ON_QUIT=0 ignores them instead.
+python3 - "$K/runtime/jni/kl_jni_android.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Activity.finish ends the app (step 70)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, int n) {\n",
+        "// " + marker + "\n"
+        "int kl_env_on(const char *name, int dflt);\n"
+        "static klj_val mv_Activity_finish(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)self; (void)a; (void)n;\n"
+        "    if (!kl_env_on(\"KL_EXIT_ON_QUIT\", 1)) {\n"
+        "        KLJ_LOG(\"Activity.finish(): ignored (KL_EXIT_ON_QUIT=0)\");\n"
+        "        return (klj_val){0};\n"
+        "    }\n"
+        "    printf(\"[guest] the title quit: Activity.finish() — ending the app as Android would\\n\");\n"
+        "    fflush(NULL); _exit(0);\n"
+        "}\n"
+        "\n"
+        "static klj_val klj_Activity_getIntent(void *env, void *self, const klj_val *a, int n) {\n")
+    s = sub(s, "    {\"android/app/Activity\",   \"getIntent\",  \"()Landroid/content/Intent;\", klj_Activity_getIntent},\n",
+        "    {\"android/app/Activity\",   \"getIntent\",  \"()Landroid/content/Intent;\", klj_Activity_getIntent},\n"
+        "    {\"android/app/Activity\",   \"finish\", \"()V\", mv_Activity_finish},   // " + marker + "\n"
+        "    {\"android/app/Activity\",   \"finishAndRemoveTask\", \"()V\", mv_Activity_finish},\n"
+        "    {\"android/app/Activity\",   \"finishAffinity\", \"()V\", mv_Activity_finish},\n")
+    open(p, "w").write(s)
+print("overlay: Activity.finish() ends the app")
+PYEOF
