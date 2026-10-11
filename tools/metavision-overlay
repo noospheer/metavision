@@ -4713,7 +4713,8 @@ PYEOF
 # runtime drew every eye opaque, so such a title showed black (or nothing at
 # all). Now the compositor has a see-through mode: while the title has a
 # passthrough layer running, the eye picture keeps the title's own alpha
-# (premultiplied) and the clear is transparent, so the Vision Pro's real
+# (as premultiplied colour, so additive light still shows) and the clear is
+# transparent, so the Vision Pro's real
 # passthrough (the immersive space is .mixed) shows wherever the title left it.
 # Style effects on the camera image (colour maps, edges) cannot be done: the
 # camera image is not available to apps. KL_PASSTHROUGH=0 keeps every frame
@@ -4757,11 +4758,13 @@ if marker not in s:
         "    if (!u.chroma_on && kl_reproject_passthrough()) u.chroma_on = 2;   // " + marker + "\n")
     s = sub(p, s, "\"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\\n\"\n",
         "\"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\\n\"\n"
-        "// " + marker + ": see-through keeps the title's own alpha, premultiplied.\n"
+        "// " + marker + ": see-through keeps the title's own alpha. The eye picture\n"
+        "// is premultiplied, as a Quest composites it: additive light (particles, glows)\n"
+        "// written with alpha 0 still shows over the room, so the colour is not scaled.\n"
         "\"    if (in.chromaOn == 2u) {\\n\"\n"
         "\"        float a = saturate(in.src == 0u ? tex.sample(samp, in.uv, in.slice).a\\n\"\n"
         "\"                                        : tex1.sample(samp, in.uv, in.slice).a);\\n\"\n"
-        "\"        return float4(c.rgb * a, a);\\n\"\n"
+        "\"        return float4(c.rgb, a);\\n\"\n"
         "\"    }\\n\"\n")
     open(p, "w").write(s)
 p = os.path.join(K, "runtime/gfx/kl_reproject.h")

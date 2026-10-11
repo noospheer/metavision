@@ -100,8 +100,10 @@ def shot_has_content(m) -> bool:
     a thin grid is dim but drawn (1.5% of pixels on a sharp edge; controller
     rays alone stay under 1%). With passthrough on, a shot where the title left
     part of the view see-through shows the room there: that is a picture too —
-    but not a shot that is all room, where the title drew nothing over it."""
-    if m.group(6) is not None and 1 <= int(m.group(6)) < 99:
+    but not a shot that is all room, where the title drew nothing over it.
+    Additive light (particles) is drawn with alpha 0, so a shot that reads 99%
+    see-through still counts when it carries detail."""
+    if m.group(6) is not None and (1 <= int(m.group(6)) < 99 or float(m.group(5) or 0) >= 0.1):
         return True
     lit_ok = int(m.group(4)) >= 3 and (m.group(3) != "nan" and int(m.group(3)) >= 4)
     return lit_ok or (m.group(5) is not None and float(m.group(5)) >= 1.5)
@@ -132,7 +134,7 @@ def triage(d: Path):
         dark = [sh for sh in shots if not shot_has_content(sh)]
         if all(int(sh.group(4)) == 0 and float(sh.group(5) or 0) == 0 and int(sh.group(6) or 0) == 0 for sh in shots):
             notes.append(f"BLACK CONTENT: all {len(shots)} screenshot(s) dark or flat")
-        elif all(int(sh.group(6) or 0) >= 99 for sh in shots):
+        elif all(int(sh.group(6) or 0) >= 99 and float(sh.group(5) or 0) < 0.1 for sh in shots):
             notes.append(f"DARK CONTENT: room only — all {len(shots)} screenshot(s) see-through, nothing drawn over passthrough")
         elif len(shots) - len(dark) < 2:
             # Something drawn, but at most one shot with real content: a sparse or
