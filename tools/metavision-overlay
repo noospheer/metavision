@@ -6437,3 +6437,43 @@ if marker not in s:
     open(pn, "w").write(s)
 print("overlay: Unity assets missing from the APK are served from the expansion file")
 PYEOF
+
+# 76 — Google Play services are absent, and say so. Nothing answered
+# GoogleApiAvailability, so isGooglePlayServicesAvailable read as 0 —
+# ConnectionResult.SUCCESS — and SDKs that gate on it (Firebase's Auth,
+# Database and Firestore modules among them) would go on to drive Java services
+# that do not exist here. It now answers SERVICE_MISSING (1), as a device
+# without Play services does, so those modules report a missing dependency and
+# stay off.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Google Play services report missing (step 76)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_net[] = {\n",
+        "// " + marker + "\n"
+        "#define MV_GMS_AVAIL \"com/google/android/gms/common/GoogleApiAvailability\"\n"
+        "static klj_val mv_GoogleApiAvailability_getInstance(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)self; (void)a; (void)n;\n"
+        "    static void *inst;\n"
+        "    return klj_singleton(MV_GMS_AVAIL, &inst);\n"
+        "}\n"
+        "static klj_val mv_GoogleApiAvailability_available(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)self; (void)a; (void)n;\n"
+        "    static int said;\n"
+        "    if (!said++) KLJ_LOG(\"GoogleApiAvailability.isGooglePlayServicesAvailable -> SERVICE_MISSING (no Play services here)\");\n"
+        "    return (klj_val){.j = 1};   // ConnectionResult.SERVICE_MISSING\n"
+        "}\n"
+        "\n"
+        "const klj_binding klj_bind_net[] = {\n"
+        "    {MV_GMS_AVAIL, \"getInstance\", \"()Lcom/google/android/gms/common/GoogleApiAvailability;\", mv_GoogleApiAvailability_getInstance},   // " + marker + "\n"
+        "    {MV_GMS_AVAIL, \"isGooglePlayServicesAvailable\", \"(Landroid/content/Context;)I\", mv_GoogleApiAvailability_available},\n"
+        "    {MV_GMS_AVAIL, \"isGooglePlayServicesAvailable\", \"(Landroid/content/Context;I)I\", mv_GoogleApiAvailability_available},\n")
+    open(p, "w").write(s)
+print("overlay: Google Play services report missing")
+PYEOF
