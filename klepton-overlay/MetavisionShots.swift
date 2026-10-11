@@ -50,15 +50,16 @@ enum MetavisionShots {
         let index = count
         lock.unlock()
 
-        let bgra: Bool
+        let bgra: Bool, half: Bool
         switch tex.pixelFormat {
-        case .bgra8Unorm, .bgra8Unorm_srgb: bgra = true
-        case .rgba8Unorm, .rgba8Unorm_srgb: bgra = false
+        case .bgra8Unorm, .bgra8Unorm_srgb: bgra = true; half = false
+        case .rgba8Unorm, .rgba8Unorm_srgb: bgra = false; half = false
+        case .rgba16Float: bgra = false; half = true        // linear HDR eye buffers
         default:
             if !saidFormat { saidFormat = true; NSLog("[mv-shot] eye format %lu not captured", tex.pixelFormat.rawValue) }
             done(); return
         }
-        let w = tex.width, h = tex.height, bpr = w * 4
+        let w = tex.width, h = tex.height, bpr = w * (half ? 8 : 4)
         guard let buf = queue.device.makeBuffer(length: bpr * h, options: .storageModeShared),
               let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { done(); return }
         blit.copy(from: tex, sourceSlice: slice, sourceLevel: 0,
@@ -72,7 +73,7 @@ enum MetavisionShots {
         nonisolated(unsafe) let b = buf
         cb.addCompletedHandler { _ in
             DispatchQueue.global(qos: .utility).async {
-                write(b, w: w, h: h, bpr: bpr, bgra: bgra, flip: flip, seeThrough: seeThrough, index: index)
+                write(b, w: w, h: h, bpr: bpr, bgra: bgra, half: half, flip: flip, seeThrough: seeThrough, index: index)
                 done()
             }
         }
@@ -81,7 +82,7 @@ enum MetavisionShots {
 
     private static func done() { lock.lock(); busy = false; lock.unlock() }
 
-    private static func write(_ buf: MTLBuffer, w: Int, h: Int, bpr: Int, bgra: Bool, flip: Bool,
+    private static func write(_ buf: MTLBuffer, w: Int, h: Int, bpr: Int, bgra: Bool, half: Bool, flip: Bool,
                               seeThrough: Bool, index: Int) {
         let step = max(1, w / width)
         let ow = w / step, oh = h / step
@@ -92,13 +93,25 @@ enum MetavisionShots {
             let sy = flip ? (h - 1 - y * step) : y * step
             var prev = -1.0
             for x in 0..<ow {
-                let p = src + sy * bpr + x * step * 4
-                let r = Int(bgra ? p[2] : p[0]), g = Int(p[1]), bl = Int(bgra ? p[0] : p[2])
+                let p = src + sy * bpr + x * step * (half ? 8 : 4)
+                let r: Int, g: Int, bl: Int, al: Int
+                if half {
+                    // Linear half floats, encoded to sRGB as a display would show them.
+                    let f = UnsafeRawPointer(p).loadUnaligned(as: (Float16, Float16, Float16, Float16).self)
+                    func enc(_ v: Float16, srgb: Bool = true) -> Int {
+                        let c = min(max(Float(v), 0), 1)
+                        let e = !srgb ? c : c <= 0.0031308 ? c * 12.92 : 1.055 * powf(c, 1 / 2.4) - 0.055
+                        return Int(e * 255 + 0.5)
+                    }
+                    r = enc(f.0); g = enc(f.1); bl = enc(f.2); al = enc(f.3, srgb: false)
+                } else {
+                    r = Int(bgra ? p[2] : p[0]); g = Int(p[1]); bl = Int(bgra ? p[0] : p[2]); al = Int(p[3])
+                }
                 let o = (y * ow + x) * 4
                 out[o] = UInt8(r); out[o + 1] = UInt8(g); out[o + 2] = UInt8(bl)
                 if seeThrough {
                     // Premultiplied colour over a checker that stands in for the room.
-                    let a = Int(p[3])
+                    let a = al
                     if a < 128 { clear += 1 }
                     let bg = ((x / 16 + y / 16) % 2 == 0) ? 96 : 160
                     out[o] = UInt8(min(255, r + bg * (255 - a) / 255))
