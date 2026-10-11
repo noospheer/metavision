@@ -59,6 +59,8 @@ enum MetavisionAutoplay {
     private static var start: Double = 0
     private static var lastStep = -1
     private static var lastPath = ""
+    static let levelHead: Bool = enabled && MetavisionShots.hidden &&
+        (getenv("MV_AUTOPLAY_LEVEL").map { String(cString: $0) != "0" } ?? true)
     static let movesHead: Bool = enabled && (getenv("MV_AUTOPLAY_HEAD").map { String(cString: $0) != "0" } ?? true)
     static let speaks: Bool = enabled && (getenv("MV_AUTOPLAY_SPEECH").map { String(cString: $0) != "0" } ?? true)
     private static var headStart: Double = 0
@@ -220,6 +222,11 @@ enum MetavisionAutoplay {
     /// Called by KleptonCompositor where it publishes the head (patched in by
     /// tools/metavision-overlay); returns the pose unchanged when not moving.
     static func moveHead(_ pose: (SIMD3<Float>, simd_quatf)) -> (SIMD3<Float>, simd_quatf) {
+        // Hidden test runs: nobody wears the headset, so its real pose is
+        // wherever it rests (a title's scenery can sit below a level gaze, or
+        // behind). Start from a level gaze along the title's forward instead,
+        // so every run sees the same view (MV_AUTOPLAY_LEVEL=0 keeps the real one).
+        let pose = levelHead ? (pose.0, simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)) : pose
         guard movesHead else { return pose }
         let now = ProcessInfo.processInfo.systemUptime
         if headStart == 0 { headStart = now }
