@@ -5949,3 +5949,381 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: the LOCAL_FLOOR reference space is accepted")
 PYEOF
+
+# 74 — Firebase's Java side, enough for its C++ SDK to create an app. A Unity
+# title using Firebase starts by asking GlobalLibraryVersionRegistrar for its
+# instance (to record library versions) and FirebaseOptions.fromResource for the
+# options its build baked into res/values/strings.xml. Neither had a host
+# implementation: the null registrar failed the SDK's "registrar != nullptr"
+# assertion and the null options "Failed to read Firebase options", so
+# FirebaseApp creation threw. The registrar is now a singleton whose
+# registerVersion does nothing and whose getRegisteredVersions is an empty Set;
+# fromResource answers from KL_RES_STRINGS (name=value lines, a fixed list of
+# resource names the launcher catalogue carries for the title; null without
+# google_app_id, as on Android); FirebaseOptions.Builder and FirebaseApp
+# (initializeApp, getInstance, getName, getOptions, data collection, delete)
+# keep what the SDK hands them. Resources.getIdentifier/getString answer the
+# same names. Values are never logged.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Firebase's Java side (step 74)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_net[] = {\n", "// " + marker + "\n" + r'''
+// The title's resource strings: KL_RES_STRINGS, "name=value" lines, read once.
+#define MV_RES_MAX 32
+static struct { const char *name, *val; } mv_res[MV_RES_MAX];
+static int mv_res_n;
+static pthread_once_t mv_res_once = PTHREAD_ONCE_INIT;
+static void mv_res_load(void) {
+    const char *e = kl_env_str("KL_RES_STRINGS", NULL);
+    if (!e || !*e) return;
+    char *copy = strdup(e), *save = NULL;
+    for (char *l = strtok_r(copy, "\n", &save); l && mv_res_n < MV_RES_MAX; l = strtok_r(NULL, "\n", &save)) {
+        char *eq = strchr(l, '=');
+        if (!eq || eq == l) continue;
+        *eq = 0;
+        mv_res[mv_res_n].name = l;
+        mv_res[mv_res_n].val = eq + 1;
+        mv_res_n++;
+    }
+    KLJ_LOG("resource strings: %d from KL_RES_STRINGS (values not logged)", mv_res_n);
+}
+static int mv_res_index(const char *name) {
+    pthread_once(&mv_res_once, mv_res_load);
+    for (int i = 0; name && i < mv_res_n; i++)
+        if (strcmp(mv_res[i].name, name) == 0) return i;
+    return -1;
+}
+static const char *mv_res_string(const char *name) {
+    int i = mv_res_index(name);
+    return i < 0 ? NULL : mv_res[i].val;
+}
+#define MV_RES_ID_BASE 0x7f0f7000   // a string-type id in the app's package range
+// Resources.getIdentifier for one of these names (also "[pkg:]string/<name>").
+int mv_res_string_id(const char *name, const char *type) {
+    if (!name) return 0;
+    const char *slash = strstr(name, "string/");
+    if (slash && (!type || !*type)) { name = slash + 7; type = "string"; }
+    if (!type || strcmp(type, "string") != 0) return 0;
+    int i = mv_res_index(name);
+    return i < 0 ? 0 : MV_RES_ID_BASE + i;
+}
+static klj_val mv_Resources_getString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int id = n > 0 ? (int)(int32_t)a[0].j : 0;
+    pthread_once(&mv_res_once, mv_res_load);
+    if (id >= MV_RES_ID_BASE && id < MV_RES_ID_BASE + mv_res_n)
+        return (klj_val){.l = kl_jni_new_string(mv_res[id - MV_RES_ID_BASE].val)};
+    KLJ_LOG("Resources.getString(0x%x) -> null (not a resource string we carry)", id);
+    return (klj_val){0};
+}
+
+// GlobalLibraryVersionRegistrar: a singleton; versions are not kept, and the
+// registered set is an empty java/util/Set (its iterator/size answer empty).
+static klj_val mv_FbRegistrar_getInstance(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *inst;
+    return klj_singleton("com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", &inst);
+}
+static klj_val mv_FbRegistrar_registerVersion(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+static klj_val mv_FbRegistrar_getRegisteredVersions(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_object("java/util/Set")};   // no payload: empty
+}
+
+// FirebaseOptions and its Builder: the same seven strings.
+enum { MV_FBO_APP_ID, MV_FBO_API_KEY, MV_FBO_DB_URL, MV_FBO_SENDER, MV_FBO_BUCKET,
+       MV_FBO_PROJECT, MV_FBO_GA, MV_FBO_N };
+static const char *const mv_fbo_res[MV_FBO_N] = {
+    "google_app_id", "google_api_key", "firebase_database_url", "gcm_defaultSenderId",
+    "google_storage_bucket", "project_id", "ga_trackingId",
+};
+typedef struct { char *v[MV_FBO_N]; } mv_fbo;
+#define MV_FBO_CLASS "com/google/firebase/FirebaseOptions"
+#define MV_FBB_CLASS "com/google/firebase/FirebaseOptions$Builder"
+static void mv_fbo_free(void *p) {
+    mv_fbo *o = p;
+    if (!o) return;
+    for (int i = 0; i < MV_FBO_N; i++) free(o->v[i]);
+    free(o);
+}
+static void *mv_fbo_new(const char *cls, const mv_fbo *from) {
+    mv_fbo *o = calloc(1, sizeof *o);
+    for (int i = 0; from && i < MV_FBO_N; i++)
+        if (from->v[i]) o->v[i] = strdup(from->v[i]);
+    void *obj = kl_jni_new_object(cls);
+    klj_as_object(obj)->data = o;
+    return klj_own(obj, mv_fbo_free);
+}
+static mv_fbo *mv_fbo_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o && (strcmp(o->cls, MV_FBO_CLASS) == 0 || strcmp(o->cls, MV_FBB_CLASS) == 0) ? o->data : NULL;
+}
+static klj_val mv_FbOptions_fromResource(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    if (!mv_res_string("google_app_id") || !*mv_res_string("google_app_id")) {
+        KLJ_LOG("FirebaseOptions.fromResource -> null (no google_app_id among the title's resource strings)");
+        return (klj_val){0};
+    }
+    mv_fbo from = {{0}};
+    for (int i = 0; i < MV_FBO_N; i++) from.v[i] = (char *)mv_res_string(mv_fbo_res[i]);
+    void *obj = mv_fbo_new(MV_FBO_CLASS, &from);
+    KLJ_LOG("FirebaseOptions.fromResource -> options from the title's resource strings");
+    return (klj_val){.l = obj};
+}
+static klj_val mv_fbo_get(void *self, int i) {
+    mv_fbo *o = mv_fbo_of(self);
+    return (klj_val){.l = o && o->v[i] ? kl_jni_new_string(o->v[i]) : NULL};
+}
+static klj_val mv_fbb_set(void *self, int i, const klj_val *a, int n) {
+    mv_fbo *o = mv_fbo_of(self);
+    const char *v = n > 0 ? klj_str(a[0].l) : NULL;
+    if (o) { free(o->v[i]); o->v[i] = v ? strdup(v) : NULL; }
+    return (klj_val){.l = self};
+}
+#define MV_FBO_FIELD(Name, I) \
+    static klj_val mv_FbOptions_get##Name(void *env, void *self, const klj_val *a, int n) { \
+        (void)env; (void)a; (void)n; return mv_fbo_get(self, I); } \
+    static klj_val mv_FbBuilder_set##Name(void *env, void *self, const klj_val *a, int n) { \
+        (void)env; return mv_fbb_set(self, I, a, n); }
+MV_FBO_FIELD(ApplicationId, MV_FBO_APP_ID)
+MV_FBO_FIELD(ApiKey,        MV_FBO_API_KEY)
+MV_FBO_FIELD(DatabaseUrl,   MV_FBO_DB_URL)
+MV_FBO_FIELD(GcmSenderId,   MV_FBO_SENDER)
+MV_FBO_FIELD(StorageBucket, MV_FBO_BUCKET)
+MV_FBO_FIELD(ProjectId,     MV_FBO_PROJECT)
+MV_FBO_FIELD(GaTrackingId,  MV_FBO_GA)
+static klj_val mv_FbBuilder_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = mv_fbo_new(MV_FBB_CLASS, NULL)};
+}
+static klj_val mv_FbBuilder_build(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    return (klj_val){.l = mv_fbo_new(MV_FBO_CLASS, mv_fbo_of(self))};
+}
+
+// FirebaseApp: the apps initializeApp made, by name. Host-held, so pinned.
+#define MV_FBAPP_CLASS "com/google/firebase/FirebaseApp"
+#define MV_FBAPP_MAX 8
+typedef struct { char *name; void *options; int collect; } mv_fbapp;
+static void *mv_fbapps[MV_FBAPP_MAX];
+static pthread_mutex_t mv_fbapps_lock = PTHREAD_MUTEX_INITIALIZER;
+static mv_fbapp *mv_fbapp_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o && strcmp(o->cls, MV_FBAPP_CLASS) == 0 ? o->data : NULL;
+}
+static void *mv_fbapp_find(const char *name) {
+    for (int i = 0; i < MV_FBAPP_MAX; i++)
+        if (mv_fbapps[i] && strcmp(mv_fbapp_of(mv_fbapps[i])->name, name) == 0) return mv_fbapps[i];
+    return NULL;
+}
+static klj_val mv_FbApp_initialize(const char *name, void *options) {
+    pthread_mutex_lock(&mv_fbapps_lock);
+    void *app = mv_fbapp_find(name);
+    if (!app && mv_fbo_of(options)) {
+        for (int i = 0; i < MV_FBAPP_MAX; i++) {
+            if (mv_fbapps[i]) continue;
+            mv_fbapp *d = calloc(1, sizeof *d);
+            d->name = strdup(name);
+            d->options = mv_fbo_new(MV_FBO_CLASS, mv_fbo_of(options));
+            kl_jni_pin_object(d->options);
+            d->collect = 1;
+            app = kl_jni_new_object(MV_FBAPP_CLASS);
+            klj_as_object(app)->data = d;
+            kl_jni_pin_object(app);
+            mv_fbapps[i] = app;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&mv_fbapps_lock);
+    KLJ_LOG("FirebaseApp.initializeApp(\"%s\") -> %s", name, app ? "app" : "null");
+    return (klj_val){.l = app};
+}
+static klj_val mv_FbApp_initializeApp3(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *name = n > 2 ? klj_str(a[2].l) : NULL;
+    return mv_FbApp_initialize(name ? name : "[DEFAULT]", n > 1 ? a[1].l : NULL);
+}
+static klj_val mv_FbApp_initializeApp2(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return mv_FbApp_initialize("[DEFAULT]", n > 1 ? a[1].l : NULL);
+}
+static klj_val mv_FbApp_getInstance(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *name = n > 0 ? klj_str(a[0].l) : NULL;
+    pthread_mutex_lock(&mv_fbapps_lock);
+    void *app = mv_fbapp_find(name ? name : "[DEFAULT]");
+    pthread_mutex_unlock(&mv_fbapps_lock);
+    return (klj_val){.l = app};
+}
+static klj_val mv_FbApp_getName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_fbapp *d = mv_fbapp_of(self);
+    return (klj_val){.l = d ? kl_jni_new_string(d->name) : NULL};
+}
+static klj_val mv_FbApp_getOptions(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_fbapp *d = mv_fbapp_of(self);
+    return (klj_val){.l = d ? d->options : NULL};
+}
+static klj_val mv_FbApp_isDataCollectionDefaultEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_fbapp *d = mv_fbapp_of(self);
+    return (klj_val){.j = d ? (uint64_t)d->collect : 0};
+}
+static klj_val mv_FbApp_setDataCollectionDefaultEnabled(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    mv_fbapp *d = mv_fbapp_of(self);
+    if (d && n > 0) d->collect = (uint8_t)a[0].j != 0;
+    return (klj_val){0};
+}
+static klj_val mv_FbApp_delete(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    pthread_mutex_lock(&mv_fbapps_lock);
+    for (int i = 0; i < MV_FBAPP_MAX; i++)
+        if (mv_fbapps[i] == self) mv_fbapps[i] = NULL;   // the object itself stays valid
+    pthread_mutex_unlock(&mv_fbapps_lock);
+    return (klj_val){0};
+}
+
+''' + "const klj_binding klj_bind_net[] = {\n" + r'''    // metavision: Firebase's Java side (step 74)
+    {"android/content/res/Resources", "getString", "(I)Ljava/lang/String;", mv_Resources_getString},
+    {"com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "getInstance",
+     "()Lcom/google/firebase/platforminfo/GlobalLibraryVersionRegistrar;", mv_FbRegistrar_getInstance},
+    {"com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "registerVersion",
+     "(Ljava/lang/String;Ljava/lang/String;)V", mv_FbRegistrar_registerVersion},
+    {"com/google/firebase/platforminfo/GlobalLibraryVersionRegistrar", "getRegisteredVersions",
+     "()Ljava/util/Set;", mv_FbRegistrar_getRegisteredVersions},
+    {MV_FBO_CLASS, "fromResource", "(Landroid/content/Context;)L" MV_FBO_CLASS ";", mv_FbOptions_fromResource},
+    {MV_FBO_CLASS, "getApplicationId", "()Ljava/lang/String;", mv_FbOptions_getApplicationId},
+    {MV_FBO_CLASS, "getApiKey",        "()Ljava/lang/String;", mv_FbOptions_getApiKey},
+    {MV_FBO_CLASS, "getDatabaseUrl",   "()Ljava/lang/String;", mv_FbOptions_getDatabaseUrl},
+    {MV_FBO_CLASS, "getGcmSenderId",   "()Ljava/lang/String;", mv_FbOptions_getGcmSenderId},
+    {MV_FBO_CLASS, "getStorageBucket", "()Ljava/lang/String;", mv_FbOptions_getStorageBucket},
+    {MV_FBO_CLASS, "getProjectId",     "()Ljava/lang/String;", mv_FbOptions_getProjectId},
+    {MV_FBO_CLASS, "getGaTrackingId",  "()Ljava/lang/String;", mv_FbOptions_getGaTrackingId},
+    {MV_FBB_CLASS, "<init>", "()V", mv_FbBuilder_init},
+    {MV_FBB_CLASS, "setApplicationId", "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setApplicationId},
+    {MV_FBB_CLASS, "setApiKey",        "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setApiKey},
+    {MV_FBB_CLASS, "setDatabaseUrl",   "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setDatabaseUrl},
+    {MV_FBB_CLASS, "setGcmSenderId",   "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setGcmSenderId},
+    {MV_FBB_CLASS, "setStorageBucket", "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setStorageBucket},
+    {MV_FBB_CLASS, "setProjectId",     "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setProjectId},
+    {MV_FBB_CLASS, "setGaTrackingId",  "(Ljava/lang/String;)L" MV_FBB_CLASS ";", mv_FbBuilder_setGaTrackingId},
+    {MV_FBB_CLASS, "build", "()L" MV_FBO_CLASS ";", mv_FbBuilder_build},
+    {MV_FBAPP_CLASS, "initializeApp",
+     "(Landroid/content/Context;L" MV_FBO_CLASS ";Ljava/lang/String;)L" MV_FBAPP_CLASS ";", mv_FbApp_initializeApp3},
+    {MV_FBAPP_CLASS, "initializeApp",
+     "(Landroid/content/Context;L" MV_FBO_CLASS ";)L" MV_FBAPP_CLASS ";", mv_FbApp_initializeApp2},
+    {MV_FBAPP_CLASS, "getInstance", "()L" MV_FBAPP_CLASS ";", mv_FbApp_getInstance},
+    {MV_FBAPP_CLASS, "getInstance", "(Ljava/lang/String;)L" MV_FBAPP_CLASS ";", mv_FbApp_getInstance},
+    {MV_FBAPP_CLASS, "getName", "()Ljava/lang/String;", mv_FbApp_getName},
+    {MV_FBAPP_CLASS, "getOptions", "()L" MV_FBO_CLASS ";", mv_FbApp_getOptions},
+    {MV_FBAPP_CLASS, "isDataCollectionDefaultEnabled", "()Z", mv_FbApp_isDataCollectionDefaultEnabled},
+    {MV_FBAPP_CLASS, "setDataCollectionDefaultEnabled", "(Z)V", mv_FbApp_setDataCollectionDefaultEnabled},
+    {MV_FBAPP_CLASS, "delete", "()V", mv_FbApp_delete},
+''')
+    open(p, "w").write(s)
+print("overlay: Firebase's registrar, options (from the title's resource strings) and apps")
+PYEOF
+
+# ...and Resources.getIdentifier answers the same names, so a lookup by name
+# then getString(id) reads them too.
+python3 - "$K/runtime/jni/kl_jni_display.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: resource strings by name (step 74)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "static klj_val klj_Resources_getIdentifier(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)self;\n",
+        "int mv_res_string_id(const char *name, const char *type);   // " + marker + "\n"
+        "static klj_val klj_Resources_getIdentifier(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)self;\n"
+        "    {   int id = mv_res_string_id(n > 0 ? klj_str(a[0].l) : NULL, n > 1 ? klj_str(a[1].l) : NULL);\n"
+        "        if (id) {\n"
+        "            KLJ_LOG(\"Resources.getIdentifier(\\\"%s\\\", \\\"%s\\\") -> 0x%x (a resource string the title carries)\",\n"
+        "                    klj_str(a[0].l), n > 1 && klj_str(a[1].l) ? klj_str(a[1].l) : \"\", id);\n"
+        "            return (klj_val){.j = (uint64_t)id};\n"
+        "        }\n"
+        "    }\n")
+    open(p, "w").write(s)
+print("overlay: Resources.getIdentifier answers the title's resource strings")
+PYEOF
+
+# ...and the catalogue carries each title's strings: read from its tree's
+# res/values/strings.xml at overlay time (this fixed list of names only), and
+# set as KL_RES_STRINGS when the title is picked. Only the generated catalogue
+# holds them; nothing here prints them.
+S="$K/visionos/Sources/MetavisionLibrary.swift"
+if [ -f "$S" ] && [ -f "$ROOT/build/guests/targets.json" ]; then
+python3 - "$S" "$ROOT/build/guests/targets.json" <<'PYEOF'
+import json, os, re, sys
+import xml.etree.ElementTree as ET
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the title's resource strings (step 74)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+NAMES = ["google_app_id", "google_api_key", "firebase_database_url", "gcm_defaultSenderId",
+         "google_storage_bucket", "project_id", "ga_trackingId"]
+rows = json.load(open(sys.argv[2]))
+def res_strings(k):
+    v = rows.get(k, {})
+    f = os.path.join(os.path.dirname(sys.argv[2]), v.get("tree", k), "res", "values", "strings.xml")
+    if not os.path.isfile(f):
+        return ""
+    try:
+        root = ET.parse(f).getroot()
+    except ET.ParseError:
+        return ""
+    found = {}
+    for el in root.iter("string"):
+        name = el.get("name")
+        if name not in NAMES:
+            continue
+        val = "".join(el.itertext()).strip()
+        if len(val) >= 2 and val[0] == val[-1] == '"':
+            val = val[1:-1]
+        val = val.replace("\\'", "'").replace('\\"', '"')
+        if val and not any(ord(c) < 32 for c in val):
+            found[name] = val
+    return "\n".join(f"{n}={found[n]}" for n in NAMES if n in found)
+carried = 0
+if marker not in s:
+    s = sub(s, "    let ovrp: String       // the OVRPlugin version it shipped with (\"\" if none)\n",
+        "    let ovrp: String       // the OVRPlugin version it shipped with (\"\" if none)\n"
+        "    let res: String        // " + marker + ": name=value lines (\"\" if none)\n")
+    def entry(m):
+        global carried
+        r = res_strings(json.loads(m.group(1)))
+        carried += bool(r)
+        return m.group(0)[:-1] + ", res: " + json.dumps(r, ensure_ascii=False) + ")"
+    s, n = re.subn(r'MetavisionTitle\(id: ("(?:[^"\\]|\\.)*"), .*, ovrp: "(?:[^"\\]|\\.)*"\)(?=,?\n)', entry, s)
+    if n != len(rows):
+        sys.exit(f"overlay: anchor moved upstream in {p}: {n} catalogue entries for {len(rows)} titles")
+    s = sub(s, "        if let v = all.first(where: { $0.id == id })?.ovrp, !v.isEmpty { setenv(\"KL_OVRP_VERSION\", v, 0) }\n",
+        "        if let v = all.first(where: { $0.id == id })?.ovrp, !v.isEmpty { setenv(\"KL_OVRP_VERSION\", v, 0) }\n"
+        "        // " + marker + ": what Resources and FirebaseOptions.fromResource read.\n"
+        "        if let r = all.first(where: { $0.id == id })?.res, !r.isEmpty { setenv(\"KL_RES_STRINGS\", r, 1) }\n"
+        "        else { unsetenv(\"KL_RES_STRINGS\") }\n")
+    open(p, "w").write(s)
+print(f"overlay: the catalogue carries resource strings ({carried} titles have some)")
+PYEOF
+fi
