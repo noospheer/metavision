@@ -5528,3 +5528,46 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: autoplay presses every framework's selectables (MV_AUTOPLAY_UI_FAMILIES), with coverage")
 PYEOF
+
+# 67 — the Unity OpenXR hooks. A title built on Unity's OpenXR with Meta's
+# feature hands the plugin its OpenXR instance and session through
+# ovrp_UnityOpenXR_* once the plugin version is 1.71 or later (step 37's
+# KL_OVRP_VERSION); below that the feature switches itself off ("[MetaXRFeature]
+# OnInstanceCreate returned an error"). They are answered: the
+# GetInstanceProcAddr hook hands the function back unchanged, the instance
+# callback succeeds, and the session/space notices are accepted.
+python3 - "$K/runtime/xr/kl_ovrp.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Unity OpenXR hooks (step 67)"
+def sub(s, old, new, n=1):
+    if s.count(old) != n:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static const char *klovrp_GetVersion(void) {\n",
+        "// " + marker + "\n"
+        "static void *klovrp_uoxr_hook(void *fn)  { ovrp_hit(\"ovrp_UnityOpenXR_HookGetInstanceProcAddr\"); return fn; }\n"
+        "static uint64_t klovrp_uoxr_ok(void)     { ovrp_hit(\"ovrp_UnityOpenXR_OnInstanceCreate\"); return OVRP_SUCCESS; }\n"
+        "static uint64_t klovrp_uoxr_notice(void) { return OVRP_SUCCESS; }\n"
+        "\n"
+        "static const char *klovrp_GetVersion(void) {\n")
+    s = sub(s, "    {\"ovrp_GetVersion2\",   (void *)klovrp_GetVersion2},\n",
+        "    {\"ovrp_GetVersion2\",   (void *)klovrp_GetVersion2},\n"
+        "    // " + marker + "\n"
+        "    {\"ovrp_UnityOpenXR_HookGetInstanceProcAddr\", (void *)klovrp_uoxr_hook},\n"
+        "    {\"ovrp_UnityOpenXR_OnInstanceCreate\",  (void *)klovrp_uoxr_ok},\n"
+        "    {\"ovrp_UnityOpenXR_OnInstanceDestroy\", (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_SetClientVersion\",  (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnSessionCreate\",   (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnSessionBegin\",    (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnSessionEnd\",      (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnSessionExiting\",  (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnSessionDestroy\",  (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnSessionStateChange\", (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnAppSpaceChange\",  (void *)klovrp_uoxr_notice},\n"
+        "    {\"ovrp_UnityOpenXR_OnAppSpaceChange2\", (void *)klovrp_uoxr_notice},\n")
+    open(p, "w").write(s)
+print("overlay: Unity OpenXR hooks answered")
+PYEOF
