@@ -3084,7 +3084,9 @@ static int mv_unsafe(const char *s) {   // labels that read like leaving the tit
     for (int b = 0; bad[b]; b++)
         for (char *q = strstr(l, bad[b]); q; q = strstr(q + 1, bad[b])) {
             size_t at = (size_t)(q - l), e = at + strlen(bad[b]);
-            if (at && isalpha((unsigned char)l[at - 1])) continue;
+            // camelCase starts a word too: "onQuitClicked", not "Background"
+            if (at && isalpha((unsigned char)l[at - 1]) &&
+                !(isupper((unsigned char)s[at]) && islower((unsigned char)s[at - 1]))) continue;
             if (e < i && l[e] == 's' && (e + 1 == i || !islower((unsigned char)s[e + 1]))) e++;
             if (e == i || !islower((unsigned char)s[e])) return 1;
         }
@@ -4806,4 +4808,723 @@ if marker not in s:
         "static XrResult klxr_PassthroughLayerResumeFB(void *l)       { (void)l; g_pt_layer_running = 1; klxr_pt_update(); return KLXR_SUCCESS; }\n")
     open(p, "w").write(s)
 print("overlay: passthrough — see-through eye pass while a title's passthrough layer runs (XR_FB_passthrough)")
+PYEOF
+
+# 65 — a destroyed image's storage is freed even while views of it live. A
+# Metal texture view keeps its parent texture, and so its memory, alive.
+# One engine build deletes a render target's image every frame but keeps the
+# views behind its own reference count, so each frame left a full-size depth
+# target behind and the app reached the memory limit in two seconds. When the
+# guest destroys an image that still has views, its MTLTexture is kept for a
+# moment (work already queued may still read it) and then emptied with
+# setPurgeableState(Empty): the storage goes, no view handle is touched (an
+# early view destroy let handles be reused under the guest — step 51). A view
+# of a destroyed image is already invalid in Vulkan, so nothing valid reads the
+# emptied storage. KL_VK_PURGE_ORPHANS=0 turns it off.
+python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: orphaned image storage purge (step 65)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "metavision: Vulkan lifecycle trace (step 63)" not in s:
+        sys.exit("overlay: step 65 needs step 63")
+    # The view table is kept whenever the purge is on, not only under the trace.
+    s = sub(s, "static void mv_lv_add(VkImageView v, VkImage img) {\n    if (!mv_life_on() || !v) return;\n",
+        "static int mv_purge_on(void);   // " + marker + "\n"
+        "static void mv_lv_add(VkImageView v, VkImage img) {\n    if ((!mv_life_on() && !mv_purge_on()) || !v) return;\n"
+        "    // Full (orphans the guest never destroys pile up): the oldest orphan makes room.\n"
+        "    pthread_mutex_lock(&mv_lv_lock);\n"
+        "    if (mv_lv_n == MV_LV_N) {\n"
+        "        unsigned o = MV_LV_N;\n"
+        "        for (unsigned i = 0; i < mv_lv_n; i++)\n"
+        "            if (mv_lv[i].gone && (o == MV_LV_N || mv_lv[i].gone < mv_lv[o].gone)) o = i;\n"
+        "        if (o < MV_LV_N) mv_lv[o] = mv_lv[--mv_lv_n];\n"
+        "    }\n"
+        "    pthread_mutex_unlock(&mv_lv_lock);\n")
+    s = sub(s, "static void mv_lv_del(VkImageView v, const void *caller) {\n    if (!mv_life_on() || !v) return;\n",
+        "static void mv_lv_del(VkImageView v, const void *caller) {\n    if ((!mv_life_on() && !mv_purge_on()) || !v) return;\n")
+    s = sub(s, "static void mv_lv_image_gone(VkImage img, const void *caller) {\n    if (!mv_life_on() || !img) return;\n",
+        "static void mv_lv_image_gone(VkImage img, const void *caller) {\n    if ((!mv_life_on() && !mv_purge_on()) || !img) return;\n")
+    s = sub(s, "static void mv_lv_stats(unsigned long *live, double *oldest) {\n",
+        "// " + marker + "\n"
+        "#include <objc/message.h>\n"
+        "#include <objc/runtime.h>\n"
+        "#include <CoreFoundation/CoreFoundation.h>\n"
+        "static int mv_purge_on(void) {\n"
+        "    static int on = -1;\n"
+        "    if (on < 0) on = kl_env_on(\"KL_VK_PURGE_ORPHANS\", 1);\n"
+        "    return on;\n"
+        "}\n"
+        "// How many live views an image has (the views table, step 63).\n"
+        "static unsigned mv_lv_count(VkImage img) {\n"
+        "    unsigned n = 0;\n"
+        "    pthread_mutex_lock(&mv_lv_lock);\n"
+        "    for (unsigned i = 0; i < mv_lv_n; i++) if (mv_lv[i].img == img && !mv_lv[i].gone) n++;\n"
+        "    pthread_mutex_unlock(&mv_lv_lock);\n"
+        "    return n;\n"
+        "}\n"
+        "#define MV_PURGE_N 256\n"
+        "static pthread_mutex_t mv_purge_lock = PTHREAD_MUTEX_INITIALIZER;\n"
+        "static struct { void *tex; double at; } mv_purge_q[MV_PURGE_N];\n"
+        "static unsigned mv_purge_n;\n"
+        "static _Atomic unsigned long mv_purged, mv_purged_mib;\n"
+        "static void mv_purge_one(void *tex) {\n"
+        "    unsigned long bytes = ((unsigned long (*)(void *, SEL))objc_msgSend)(tex, sel_registerName(\"allocatedSize\"));\n"
+        "    ((unsigned long (*)(void *, SEL, unsigned long))objc_msgSend)(tex, sel_registerName(\"setPurgeableState:\"), 4);   // MTLPurgeableStateEmpty\n"
+        "    CFRelease(tex);\n"
+        "    mv_purged++; mv_purged_mib += bytes >> 20;\n"
+        "    static int said;\n"
+        "    if (said < 3) { said++; fprintf(stderr, \"  [vk-purge] emptied the storage of a destroyed image its views kept alive (%lu MiB)\\n\", bytes >> 20); }\n"
+        "}\n"
+        "// Called as the guest destroys an image, before the real destroy.\n"
+        "static void mv_purge_hold(klvk_device *d, VkImage img) {\n"
+        "    if (!mv_purge_on() || !img || !mv_lv_count(img)) return;\n"
+        "    void *tex = eye_mtl_texture(d, img);\n"
+        "    if (!tex) return;\n"
+        "    CFRetain(tex);\n"
+        "    void *spill = NULL;\n"
+        "    pthread_mutex_lock(&mv_purge_lock);\n"
+        "    if (mv_purge_n == MV_PURGE_N) { spill = mv_purge_q[0].tex; memmove(mv_purge_q, mv_purge_q + 1, sizeof mv_purge_q[0] * (MV_PURGE_N - 1)); mv_purge_n--; }\n"
+        "    mv_purge_q[mv_purge_n].tex = tex; mv_purge_q[mv_purge_n].at = mv_life_now(); mv_purge_n++;\n"
+        "    pthread_mutex_unlock(&mv_purge_lock);\n"
+        "    if (spill) mv_purge_one(spill);\n"
+        "}\n"
+        "// Each submit: empty what was destroyed more than a quarter second ago.\n"
+        "static void mv_purge_due(void) {\n"
+        "    if (!mv_purge_on() || !mv_purge_n) return;\n"
+        "    void *due[MV_PURGE_N]; unsigned k = 0;\n"
+        "    double now = mv_life_now();\n"
+        "    pthread_mutex_lock(&mv_purge_lock);\n"
+        "    unsigned j = 0;\n"
+        "    for (unsigned i = 0; i < mv_purge_n; i++)\n"
+        "        if (now - mv_purge_q[i].at > 0.25) due[k++] = mv_purge_q[i].tex; else mv_purge_q[j++] = mv_purge_q[i];\n"
+        "    mv_purge_n = j;\n"
+        "    pthread_mutex_unlock(&mv_purge_lock);\n"
+        "    for (unsigned i = 0; i < k; i++) mv_purge_one(due[i]);\n"
+        "}\n"
+        "static void mv_lv_stats(unsigned long *live, double *oldest) {\n")
+    s = sub(s, "    mv_lv_image_gone(img, __builtin_return_address(0));   // metavision: Vulkan lifecycle trace (step 63)\n",
+        "    mv_purge_hold(dev_find(dev), img);   // " + marker + "\n"
+        "    mv_lv_image_gone(img, __builtin_return_address(0));   // metavision: Vulkan lifecycle trace (step 63)\n")
+    s = sub(s, "    mv_life_submit(n, si, fence);   // metavision: Vulkan lifecycle trace (step 63)\n",
+        "    mv_life_submit(n, si, fence);   // metavision: Vulkan lifecycle trace (step 63)\n"
+        "    mv_purge_due();   // " + marker + "\n")
+    s = sub(s, "\"later destroyed %lu (max %.2f s after), still live %lu (oldest %.1f s) | footprint %llu MiB\\n\",\n",
+        "\"later destroyed %lu (max %.2f s after), still live %lu (oldest %.1f s) | storage emptied %lu (%lu MiB) | footprint %llu MiB\\n\",\n")
+    s = sub(s, "            mv_orph_max_age, orph_live, orph_old, fp);\n",
+        "            mv_orph_max_age, orph_live, orph_old, (unsigned long)mv_purged, (unsigned long)mv_purged_mib, fp);\n")
+    open(p, "w").write(s)
+print("overlay: a destroyed image's storage is emptied while views of it live (KL_VK_PURGE_ORPHANS)")
+PYEOF
+
+# 66 — autoplay presses what every interaction framework calls selectable, not
+# only Unity UI. Step 52 found nothing to press in 39 of 45 titles: their menus
+# and objects are Interaction SDK, XR Interaction Toolkit or plain scripts. Each
+# tick (every _EVERY s) the presser now gathers, generically:
+#   ui     Unity UI Buttons/Toggles/Dropdowns (as step 52) and a title's own
+#          Selectable subclasses
+#   isdk   Oculus.Interaction InteractableUnityEventWrapper / PointableUnityEventWrapper:
+#          their own When* events (Hover, Select; after _HOLD_MS Release/Unselect, Unhover)
+#   xri    XRBaseInteractable (both namespaces): XRInteractionManager.SelectEnter
+#          with an interactor the scene already has (ray first, never a socket);
+#          SelectExit after _HOLD_MS
+#   click  a title's own IPointerClick/Down/UpHandler MonoBehaviours, and
+#          EventTrigger: Enter, Down; after _HOLD_MS Up, Click, Exit — the
+#          interface methods, dispatched on the object, with a new PointerEventData
+#   event  a title's own MonoBehaviours with a parameterless UnityEvent field
+#          named like a press (onClick, onSelect, onActivate, whenPressed...):
+#          Invoke
+# A class missing from the title's metadata is skipped silently. One element is
+# pressed per tick: the least-pressed (then oldest-pressed, then by family, game
+# object name, label, instance ID — the same order every run), at most _MAX
+# times (3) and not again within _GAP s (12). Labels, object names and event
+# names that read like leaving (step 52's mv_unsafe) are skipped. Every element
+# ever found is counted, so the log carries "[mv-autoplay-ui] coverage N/M (...)"
+# whenever N or M changes, which triage reports. MV_AUTOPLAY_UI_FAMILIES
+# (default "ui,isdk,xri,click,event") picks the families. Runs where step 52's
+# did: between frames, on the Unity main thread. Supersedes step 52's tick
+# (whose helpers it reuses).
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: every selectable, every framework (step 66)"
+if "metavision: deterministic UI presses (step 52)" not in s:
+    sys.exit("overlay: step 66 needs step 52 (mv_unsafe, mv_utf8, mv_kind, mv_m, mvx)")
+code = r'''// metavision: every selectable, every framework (step 66)
+enum { MVF_UI, MVF_ISDK, MVF_XRI, MVF_CLICK, MVF_EVENT, MVF_N };
+static const char *const mvf_name[MVF_N] = { "ui", "isdk", "xri", "click", "event" };
+static struct {
+    Il2CppObject *(*object_new)(Il2CppClass *);
+    _Bool (*assignable)(Il2CppClass *, Il2CppClass *);    // (base, derived)
+    void *(*fields)(Il2CppClass *, void **);
+    const char *(*fname)(void *);
+    const void *(*ftype)(void *);
+    size_t (*foff)(void *);
+    int (*fflags)(void *);
+    void (*fstatic)(void *, void *);
+    Il2CppClass *(*from_type)(const void *);
+    void *(*field)(Il2CppClass *, const char *);
+    const MethodInfo *(*methods)(Il2CppClass *, void **);
+    const char *(*mname)(const MethodInfo *);
+    uint32_t (*mparams)(const MethodInfo *);
+    const MethodInfo *(*virt)(Il2CppObject *, const MethodInfo *);
+    uint32_t (*gc_new)(Il2CppObject *, _Bool);
+    Il2CppObject *(*gc_get)(uint32_t);
+    void (*gc_free)(uint32_t);
+} mvy;
+// Types and methods, resolved once. Type objects are kept by the runtime (as
+// step 52's t_tmp); no string or other managed object is kept across calls.
+static Il2CppClass *k_sel, *k_mb, *k_ue, *k_iw, *k_pw, *k_pe, *k_xint, *k_xior,
+                   *k_ped, *k_enter, *k_down, *k_up, *k_click, *k_exit, *k_trig;
+static Il2CppObject *t_mb, *t_xior, *t_tmp2, *t_txt2;
+static const MethodInfo *m_find, *m_by, *m_act, *m_int, *m_go, *m_name, *m_id, *m_child,
+                        *m_tmp2, *m_txt2, *m_alive, *m_tf, *m_pos, *m_rot, *m_ue_inv,
+                        *m_es_cur, *m_ped_new, *m_ped_press, *m_ped_raw, *m_ped_clicks,
+                        *m_ped_elig, *mi_enter, *mi_down, *mi_up, *mi_click, *mi_exit,
+                        *m_xmgr, *m_xisel, *m_xr_mgr;
+static int32_t pe_off_id = -1, pe_off_type = -1, pe_off_pose = -1, pe_size;
+static int32_t pet_hover = 0, pet_unhover = 1, pet_select = 2, pet_unselect = 3;
+static unsigned mv_fams = (1u << MVF_N) - 1;
+
+static const MethodInfo *mv_m1(Il2CppClass *k, const char *n, uint32_t argc) {   // exact, non-generic, this class only
+    void *it = NULL; const MethodInfo *m;
+    if (!k || !mvy.methods) return NULL;
+    while ((m = mvy.methods(k, &it)))
+        if (!strcmp(mvy.mname(m), n) && mvy.mparams(m) == argc && !(mvx.generic && mvx.generic(m))) return m;
+    return NULL;
+}
+static Il2CppObject *mv_tobj(Il2CppClass *k) { return k ? il.type_get_object(il.class_get_type(k)) : NULL; }
+static Il2CppClass *mv_cls2(const char *ns1, const char *ns2, const char *n) {
+    Il2CppClass *k = find_class(ns1, n);
+    return k ? k : ns2 ? find_class(ns2, n) : NULL;
+}
+static int mv_is(Il2CppClass *base, Il2CppClass *k) { return base && k && mvy.assignable(base, k); }
+static Il2CppObject *mv_find(Il2CppObject *type) {   // active objects of a type; by instance ID where Unity can
+    if (!type) return NULL;
+    int32_t by_id = 1;   // FindObjectsSortMode.InstanceID
+    void *a2[2] = { type, &by_id }, *a1[1] = { type };
+    return m_by ? invoke(m_by, a2, "FindObjectsByType") : invoke(m_find, a1, "FindObjectsOfType");
+}
+static int32_t mv_id(Il2CppObject *o) {
+    Il2CppObject *r = invoke_on(o, m_id, NULL, "id");
+    return r ? *(int32_t *)il.object_unbox(r) : (int32_t)(intptr_t)o;
+}
+static int mv_alive(Il2CppObject *o) {   // Unity's own null test: a destroyed object is "null"
+    void *a[1] = { o };
+    Il2CppObject *r = o ? invoke(m_alive, a, "Object.op_Implicit") : NULL;
+    return r && *(uint8_t *)il.object_unbox(r);
+}
+static void mv_names(Il2CppObject *o, char *lab, size_t nl, char *go, size_t ng) {   // child text, game object name
+    uint8_t f = 0;
+    lab[0] = go[0] = 0;
+    Il2CppObject *g = invoke_on(o, m_go, NULL, "go");
+    if (g) mv_utf8(invoke_on(g, m_name, NULL, "name"), go, ng);
+    Il2CppObject *types[2] = { t_tmp2, t_txt2 };
+    const MethodInfo *gets[2] = { m_tmp2, m_txt2 };
+    for (int t = 0; t < 2 && !lab[0]; t++)
+        if (types[t] && gets[t] && m_child) {
+            void *ar[2] = { types[t], &f };
+            Il2CppObject *tc = invoke_on(o, m_child, ar, "label");
+            if (tc) mv_utf8(invoke_on(tc, gets[t], NULL, "text"), lab, nl);
+        }
+}
+
+// ---- what a class is, cached per class ----
+enum { KF_IW = 1, KF_PW = 2, KF_XRI = 4, KF_CLICK = 8, KF_EVENT = 16, KF_TRIG = 32, KF_SEL = 64 };
+typedef struct { Il2CppClass *k; uint8_t f, nev; uint16_t off[4]; char ev[4][32]; } mv_kinfo;
+static mv_kinfo mvk[1024];
+static int mv_evname(const char *raw, char *out, size_t cap) {   // a UnityEvent field named like a press
+    static const char *good[] = { "click", "press", "select", "activat", "submit", "interact", "trigger",
+                                  "tap", "poke", "push", "toggle", "pick", "grab", "onuse", "confirm", "choose", 0 };
+    static const char *no[] = { "deselect", "unselect", "deactivat", "exit", "destroy", "disable", "hover", 0 };
+    const char *a = raw, *b;
+    if (*a == '<' && (b = strchr(a, '>'))) { a++; snprintf(out, cap, "%.*s", (int)(b - a), a); }   // <X>k__BackingField
+    else snprintf(out, cap, "%s", a[0] == 'm' && a[1] == '_' ? a + 2 : a[0] == '_' ? a + 1 : a);
+    char l[64]; size_t i = 0;
+    for (; out[i] && i < 63; i++) l[i] = (char)tolower((unsigned char)out[i]);
+    l[i] = 0;
+    for (int j = 0; no[j]; j++) if (strstr(l, no[j])) return 0;
+    for (int j = 0; good[j]; j++) if (strstr(l, good[j])) return !mv_unsafe(out);
+    return 0;
+}
+static const mv_kinfo *mv_class(Il2CppClass *k) {
+    static mv_kinfo tmp;   // when the cache is full: classified each time
+    unsigned h = (unsigned)(((uintptr_t)k >> 4) * 2654435761u) & 1023u, i = h;
+    mv_kinfo *e = NULL;
+    do {
+        if (mvk[i].k == k) return &mvk[i];
+        if (!mvk[i].k) { e = &mvk[i]; break; }
+        i = (i + 1) & 1023u;
+    } while (i != h);
+    if (!e) e = &tmp;
+    memset(e, 0, sizeof *e);
+    e->k = k;
+    const char *ns = mvx.ns(k), *nm = il.class_get_name(k);
+    if (!ns) ns = "";
+    if (mv_is(k_sel, k)) e->f = KF_SEL;                                  // the ui family lists these
+    else if (mv_is(k_iw, k)) e->f = KF_IW;
+    else if (mv_is(k_pw, k)) e->f = KF_PW;
+    else if (mv_is(k_xint, k)) e->f = KF_XRI;
+    else if (!strncmp(ns, "UnityEngine", 11) && !(nm && !strcmp(nm, "EventTrigger"))) ;   // engine parts: input modules, raycasters
+    else if (!strcmp(ns, "TMPro") || !strncmp(ns, "Oculus", 6) || !strncmp(ns, "Meta.", 5) || !strncmp(ns, "Unity.", 6)) ;
+    else {
+        if (mv_is(k_click, k) || mv_is(k_down, k) || mv_is(k_up, k)) e->f |= KF_CLICK;
+        for (Il2CppClass *c = k; c && c != k_mb && e->nev < 4; c = mvx.parent(c)) {
+            void *it = NULL, *fld;
+            while ((fld = mvy.fields(c, &it)) && e->nev < 4) {
+                if (mvy.fflags(fld) & 0x10) continue;                        // static
+                Il2CppClass *fk = mvy.from_type(mvy.ftype(fld));
+                if (!mv_is(k_ue, fk)) continue;                              // parameterless UnityEvent (or a subclass)
+                if (!mv_evname(mvy.fname(fld), e->ev[e->nev], sizeof e->ev[0])) continue;
+                e->off[e->nev++] = (uint16_t)mvy.foff(fld);
+            }
+        }
+        if (e->nev) e->f |= KF_EVENT;
+        if (!e->f && k_trig && il.class_get_method_from_name(k, "OnTriggerEnter", 1)) e->f = KF_TRIG;   // counted, not pressed
+    }
+    return e;
+}
+
+// ---- everything ever found: coverage ----
+#define MV_DISC 4096
+static struct { int32_t id; uint8_t fam, unsafe_, tries; double last; } mvd[MV_DISC];
+static unsigned mvd_n, mv_trig_seen;
+static int mvd_get(int32_t id, int fam) {
+    for (unsigned i = 0; i < mvd_n; i++) if (mvd[i].id == id && mvd[i].fam == fam) return (int)i;
+    if (mvd_n == MV_DISC) return -1;
+    memset(&mvd[mvd_n], 0, sizeof mvd[0]);
+    mvd[mvd_n].id = id; mvd[mvd_n].fam = (uint8_t)fam;
+    return (int)mvd_n++;
+}
+static void mv_coverage(double t) {
+    unsigned tot[MVF_N] = { 0 }, hit[MVF_N] = { 0 }, uns = 0, T = 0, H = 0;
+    for (unsigned i = 0; i < mvd_n; i++) {
+        if (mvd[i].unsafe_) { uns++; continue; }
+        tot[mvd[i].fam]++; T++;
+        if (mvd[i].tries) { hit[mvd[i].fam]++; H++; }
+    }
+    static unsigned lt = ~0u, lh = ~0u, lu = ~0u;
+    if (T == lt && H == lh && uns == lu) return;
+    lt = T; lh = H; lu = uns;
+    char d[200]; size_t o = 0;
+    for (int f = 0; f < MVF_N; f++)
+        if (tot[f]) o += (size_t)snprintf(d + o, sizeof d - o, "%s%s %u/%u", o ? ", " : "", mvf_name[f], hit[f], tot[f]);
+    // No "t=" ahead of the numbers: triage reads the last "[mv-autoplay-ui] t=" line as the press before a quit.
+    fprintf(stderr, "[mv-autoplay-ui] coverage %u/%u (%s%s%u unsafe skipped, %u trigger-only) at %.1fs\n",
+            H, T, d, o ? "; " : "", uns, mv_trig_seen, t);
+}
+
+// ---- a press in two halves: now, and _HOLD_MS later ----
+static struct { uint32_t h, hi; uint8_t fam, live; double at; const char *kind; char what[64]; } mvp;
+static Il2CppObject *mv_ped(Il2CppObject *o) {   // a new PointerEventData aimed at o's game object
+    if (!k_ped || !m_ped_new) return NULL;
+    Il2CppObject *es = invoke(m_es_cur, NULL, "EventSystem.current");
+    Il2CppObject *pd = mvy.object_new(k_ped);
+    if (!pd) return NULL;
+    void *a[1] = { es };
+    invoke_on(pd, m_ped_new, a, "PointerEventData..ctor");
+    Il2CppObject *g = invoke_on(o, m_go, NULL, "go");
+    int32_t one = 1; uint8_t yes = 1;
+    void *ag[1] = { g }, *a1[1] = { &one }, *ay[1] = { &yes };
+    if (g) { invoke_on(pd, m_ped_press, ag, "pointerPress"); invoke_on(pd, m_ped_raw, ag, "rawPointerPress"); }
+    invoke_on(pd, m_ped_clicks, a1, "clickCount");
+    invoke_on(pd, m_ped_elig, ay, "eligibleForClick");
+    return pd;
+}
+static const char *mv_iface(Il2CppObject *o, Il2CppClass *ik, const MethodInfo *im, Il2CppObject *pd, int *threw) {
+    // An interface method has no body of its own: dispatch it on the object first.
+    if (!ik || !im || !pd || !mv_is(ik, il.object_get_class(o))) return NULL;
+    const MethodInfo *m = mvy.virt(o, im);
+    if (!m) return NULL;
+    Il2CppObject *exc = NULL; void *a[1] = { pd };
+    il.runtime_invoke(m, o, a, &exc);
+    if (exc) (*threw)++;
+    return il.class_get_name(ik) + 1;   // "PointerClickHandler" etc., minus the I
+}
+static int mv_uevent(Il2CppObject *o, const char *getter, int pet) {   // o.<getter>().Invoke() / .Invoke(PointerEvent)
+    const MethodInfo *g = mv_m(il.object_get_class(o), getter, 0);
+    Il2CppObject *ev = g ? invoke_on(o, g, NULL, getter) : NULL;
+    if (!ev) return 0;
+    Il2CppObject *exc = NULL;
+    if (pet < 0) {
+        if (!m_ue_inv) return 0;
+        il.runtime_invoke(m_ue_inv, ev, NULL, &exc);
+    } else {   // UnityEvent<PointerEvent>: a PointerEvent at o's own pose
+        const MethodInfo *inv = mv_m(il.object_get_class(ev), "Invoke", 1);
+        if (!inv || pe_off_type < 0 || pe_size <= 0 || pe_size > 128) return 0;
+        uint8_t pe[128] = { 0 };
+        int32_t id = 0x6d76;   // 'mv': no real pointer has it
+        if (pe_off_id >= 0) memcpy(pe + pe_off_id, &id, 4);
+        memcpy(pe + pe_off_type, &pet, 4);
+        Il2CppObject *tf = invoke_on(o, m_tf, NULL, "transform");
+        Il2CppObject *ps = tf ? invoke_on(tf, m_pos, NULL, "position") : NULL;
+        Il2CppObject *rt = tf ? invoke_on(tf, m_rot, NULL, "rotation") : NULL;
+        if (pe_off_pose >= 0 && ps && rt) {
+            memcpy(pe + pe_off_pose, il.object_unbox(ps), 12);
+            memcpy(pe + pe_off_pose + 12, il.object_unbox(rt), 16);
+        }
+        void *a[1] = { pe };
+        il.runtime_invoke(inv, ev, a, &exc);
+    }
+    if (exc) fprintf(stderr, "[mv-autoplay-ui]   %s threw %s\n", getter, il.class_get_name(il.object_get_class(exc)));
+    return exc ? -1 : 1;
+}
+static Il2CppObject *mv_xri_mgr(Il2CppObject *able, Il2CppObject *ior) {
+    Il2CppObject *mgr = invoke_on(able, m_xmgr, NULL, "interactionManager");
+    return mgr ? mgr : ior ? invoke_on(ior, m_xr_mgr, NULL, "interactor.interactionManager") : NULL;
+}
+static void mv_release(double now, double t0, int force) {
+    if (!mvp.live || (!force && now < mvp.at)) return;
+    mvp.live = 0;
+    Il2CppObject *o = mvy.gc_get(mvp.h), *ior = mvp.hi ? mvy.gc_get(mvp.hi) : NULL;
+    const char *how = "gone";
+    int threw = 0;
+    if (mv_alive(o)) switch (mvp.fam) {
+    case MVF_ISDK:
+        if (!strcmp(mvp.kind, "PointableUnityEventWrapper")) {
+            threw += mv_uevent(o, "get_WhenRelease", pet_unselect) < 0;
+            threw += mv_uevent(o, "get_WhenUnselect", pet_unselect) < 0;
+            threw += mv_uevent(o, "get_WhenUnhover", pet_unhover) < 0;
+        } else {
+            threw += mv_uevent(o, "get_WhenUnselect", -1) < 0;
+            threw += mv_uevent(o, "get_WhenUnhover", -1) < 0;
+        }
+        how = "When{Release,Unselect,Unhover}";
+        break;
+    case MVF_XRI: {
+        Il2CppObject *sel = invoke_on(o, m_xisel, NULL, "isSelected");
+        Il2CppObject *mgr = mv_xri_mgr(o, ior);
+        const MethodInfo *x = mgr ? mv_m(il.object_get_class(mgr), "SelectExit", 2) : NULL;
+        how = "already released";
+        if (x && ior && (!sel || *(uint8_t *)il.object_unbox(sel))) {
+            Il2CppObject *exc = NULL; void *a[2] = { ior, o };
+            il.runtime_invoke(x, mgr, a, &exc);
+            threw += exc != NULL;
+            how = "SelectExit";
+        }
+        break;
+    }
+    case MVF_UI: case MVF_CLICK: {
+        Il2CppObject *pd = mv_ped(o);   // a new one: the press's was not kept
+        const char *a = mv_iface(o, k_up, mi_up, pd, &threw), *b = mv_iface(o, k_click, mi_click, pd, &threw);
+        mv_iface(o, k_exit, mi_exit, pd, &threw);
+        how = b ? "Up+Click" : a ? "Up" : "nothing";
+        break;
+    }
+    }
+    mvy.gc_free(mvp.h);
+    if (mvp.hi) mvy.gc_free(mvp.hi);
+    fprintf(stderr, "[mv-autoplay-ui] t=%.1fs released '%s' (%s via %s%s)\n",
+            now - t0, mvp.what, mvf_name[mvp.fam], how, threw ? " THREW" : "");
+}
+static void mv_hold(Il2CppObject *o, Il2CppObject *ior, int fam, const char *kind, const char *what, double at) {
+    mvp.h = mvy.gc_new(o, 0);                  // a GC root until the release: host statics are not
+    mvp.hi = ior ? mvy.gc_new(ior, 0) : 0;
+    mvp.fam = (uint8_t)fam; mvp.kind = kind; mvp.at = at; mvp.live = 1;
+    snprintf(mvp.what, sizeof mvp.what, "%s", what);
+}
+
+typedef struct { Il2CppObject *o; const char *kind; int32_t id; int16_t di; uint8_t fam; char lab[56], go[40]; } mv_cand;
+static int mv_before(const mv_cand *a, const mv_cand *b) {   // the press order: deterministic
+    if (mvd[a->di].tries != mvd[b->di].tries) return mvd[a->di].tries < mvd[b->di].tries;
+    if (mvd[a->di].last != mvd[b->di].last) return mvd[a->di].last < mvd[b->di].last;
+    if (a->fam != b->fam) return a->fam < b->fam;
+    int c = strcmp(a->go, b->go); if (c) return c < 0;
+    c = strcmp(a->lab, b->lab);   if (c) return c < 0;
+    return a->id < b->id;
+}
+
+static int mv_press_bind(void) {
+    kl_image *im = kl_find_image("libil2cpp.so");
+#define Y(f, sym) (*(void **)&mvy.f = kl_sym(im, sym))
+    Y(object_new, "il2cpp_object_new"); Y(assignable, "il2cpp_class_is_assignable_from");
+    Y(fields, "il2cpp_class_get_fields"); Y(fname, "il2cpp_field_get_name"); Y(ftype, "il2cpp_field_get_type");
+    Y(foff, "il2cpp_field_get_offset"); Y(fflags, "il2cpp_field_get_flags"); Y(fstatic, "il2cpp_field_static_get_value");
+    Y(from_type, "il2cpp_class_from_type"); Y(field, "il2cpp_class_get_field_from_name");
+    Y(methods, "il2cpp_class_get_methods"); Y(mname, "il2cpp_method_get_name"); Y(mparams, "il2cpp_method_get_param_count");
+    Y(virt, "il2cpp_object_get_virtual_method");
+    Y(gc_new, "il2cpp_gchandle_new"); Y(gc_get, "il2cpp_gchandle_get_target"); Y(gc_free, "il2cpp_gchandle_free");
+#undef Y
+    *(void **)&mvx.parent  = kl_sym(im, "il2cpp_class_get_parent");
+    *(void **)&mvx.ns      = kl_sym(im, "il2cpp_class_get_namespace");
+    *(void **)&mvx.generic = kl_sym(im, "il2cpp_method_is_generic");
+    void **need = (void **)&mvy;
+    for (size_t i = 0; i < sizeof mvy / sizeof(void *); i++)
+        if (!need[i]) { fprintf(stderr, "[mv-autoplay-ui] off: libil2cpp lacks an export (#%zu)\n", i); return 0; }
+    if (!mvx.parent || !mvx.ns) return 0;
+    Il2CppClass *obj = find_class("UnityEngine", "Object"), *cmp = find_class("UnityEngine", "Component"), *k;
+    m_find  = mv_m1(obj, "FindObjectsOfType", 1);
+    m_by    = mv_m1(obj, "FindObjectsByType", 2);
+    m_alive = mv_m1(obj, "op_Implicit", 1);
+    m_name  = mv_m1(obj, "get_name", 0);
+    m_id    = mv_m1(obj, "GetInstanceID", 0);
+    m_go    = mv_m1(cmp, "get_gameObject", 0);
+    m_tf    = mv_m1(cmp, "get_transform", 0);
+    m_child = mv_m1(cmp, "GetComponentInChildren", 2);
+    m_act   = mv_m1(find_class("UnityEngine", "Behaviour"), "get_isActiveAndEnabled", 0);
+    k = find_class("UnityEngine", "Transform");
+    m_pos = mv_m1(k, "get_position", 0); m_rot = mv_m1(k, "get_rotation", 0);
+    if (!m_find && !m_by) { fprintf(stderr, "[mv-autoplay-ui] off: no FindObjectsOfType\n"); return 0; }
+    k_mb = find_class("UnityEngine", "MonoBehaviour"); t_mb = mv_tobj(k_mb);
+    k_ue = find_class("UnityEngine.Events", "UnityEvent"); m_ue_inv = mv_m1(k_ue, "Invoke", 0);
+    if ((k = find_class("TMPro", "TMP_Text")))      { t_tmp2 = mv_tobj(k); m_tmp2 = mv_m(k, "get_text", 0); }
+    if ((k = find_class("UnityEngine.UI", "Text"))) { t_txt2 = mv_tobj(k); m_txt2 = mv_m(k, "get_text", 0); }
+    if ((k_sel = find_class("UnityEngine.UI", "Selectable"))) m_int = mv_m(k_sel, "IsInteractable", 0);
+    // Interaction SDK
+    k_iw = find_class("Oculus.Interaction", "InteractableUnityEventWrapper");
+    k_pw = find_class("Oculus.Interaction", "PointableUnityEventWrapper");
+    if ((k_pe = find_class("Oculus.Interaction", "PointerEvent"))) {
+        uint32_t al = 0;
+        int32_t (*vsize)(Il2CppClass *, uint32_t *) = (int32_t (*)(Il2CppClass *, uint32_t *))kl_sym(im, "il2cpp_class_value_size");
+        pe_size = vsize ? vsize(k_pe, &al) : 0;
+        static const char *const nid[] = { "<Identifier>k__BackingField", "Identifier", "_identifier", 0 },
+                                 *const nty[] = { "<Type>k__BackingField", "Type", "_type", 0 },
+                                 *const npo[] = { "<Pose>k__BackingField", "Pose", "_pose", 0 };
+        const char *const *names[3] = { nid, nty, npo };
+        int32_t *offs[3] = { &pe_off_id, &pe_off_type, &pe_off_pose };
+        for (int f = 0; f < 3; f++)
+            for (int j = 0; names[f][j] && *offs[f] < 0; j++) {
+                void *fl = mvy.field(k_pe, names[f][j]);
+                if (fl) *offs[f] = (int32_t)mvy.foff(fl) - OBJ_HDR;   // a value type's offsets count the box header
+            }
+        // A layout that does not fit the struct is a wrong guess: no PointerEvent at all, rather than a bad one.
+        if (pe_size <= 0 || pe_size > 128 || pe_off_type < 0 || pe_off_type + 4 > pe_size ||
+            (pe_off_id >= 0 && pe_off_id + 4 > pe_size) || (pe_off_pose >= 0 && pe_off_pose + 28 > pe_size)) {
+            fprintf(stderr, "[mv-autoplay-ui] PointerEvent layout unexpected (size %d, id %d, type %d, pose %d): "
+                    "Pointable events off\n", pe_size, pe_off_id, pe_off_type, pe_off_pose);
+            pe_off_type = -1;
+        }
+    }
+    if ((k = find_class("Oculus.Interaction", "PointerEventType"))) {   // the enum's own values, not assumed ones
+        static const char *const n[4] = { "Hover", "Unhover", "Select", "Unselect" };
+        int32_t *v[4] = { &pet_hover, &pet_unhover, &pet_select, &pet_unselect };
+        for (int i = 0; i < 4; i++) { void *fl = mvy.field(k, n[i]); if (fl) mvy.fstatic(fl, v[i]); }
+    }
+    // XR Interaction Toolkit: 3.x moved both into sub-namespaces
+    k_xint = mv_cls2("UnityEngine.XR.Interaction.Toolkit.Interactables", "UnityEngine.XR.Interaction.Toolkit", "XRBaseInteractable");
+    k_xior = mv_cls2("UnityEngine.XR.Interaction.Toolkit.Interactors", "UnityEngine.XR.Interaction.Toolkit", "XRBaseInteractor");
+    t_xior = mv_tobj(k_xior);
+    m_xmgr  = mv_m(k_xint, "get_interactionManager", 0);
+    m_xisel = mv_m(k_xint, "get_isSelected", 0);
+    m_xr_mgr = mv_m(k_xior, "get_interactionManager", 0);
+    // EventSystems
+    static const char *const ns = "UnityEngine.EventSystems";
+    k_enter = find_class(ns, "IPointerEnterHandler"); mi_enter = mv_m(k_enter, "OnPointerEnter", 1);
+    k_down  = find_class(ns, "IPointerDownHandler");  mi_down  = mv_m(k_down,  "OnPointerDown", 1);
+    k_up    = find_class(ns, "IPointerUpHandler");    mi_up    = mv_m(k_up,    "OnPointerUp", 1);
+    k_click = find_class(ns, "IPointerClickHandler"); mi_click = mv_m(k_click, "OnPointerClick", 1);
+    k_exit  = find_class(ns, "IPointerExitHandler");  mi_exit  = mv_m(k_exit,  "OnPointerExit", 1);
+    if ((k_ped = find_class(ns, "PointerEventData"))) {
+        m_ped_new    = mv_m1(k_ped, ".ctor", 1);
+        m_ped_press  = mv_m(k_ped, "set_pointerPress", 1);
+        m_ped_raw    = mv_m(k_ped, "set_rawPointerPress", 1);
+        m_ped_clicks = mv_m(k_ped, "set_clickCount", 1);
+        m_ped_elig   = mv_m(k_ped, "set_eligibleForClick", 1);
+    }
+    m_es_cur = mv_m(find_class(ns, "EventSystem"), "get_current", 0);
+    k_trig = find_class("UnityEngine", "Collider");
+    const char *fs = kl_env_str("MV_AUTOPLAY_UI_FAMILIES", "ui,isdk,xri,click,event");
+    mv_fams = 0;
+    for (int f = 0; f < MVF_N; f++) if (strstr(fs, mvf_name[f])) mv_fams |= 1u << f;
+    fprintf(stderr, "[mv-autoplay-ui] on (step 66): families %s; found ui=%s isdk=%s%s xri=%s click=%s event=%s; via %s\n", fs,
+            k_sel ? "y" : "-", k_iw ? "w" : "-", k_pw ? "p" : "", k_xint ? (k_xior ? "y" : "no-interactor-type") : "-",
+            k_click && k_ped ? "y" : "-", k_ue && t_mb ? "y" : "-", m_by ? "FindObjectsByType" : "FindObjectsOfType");
+    return 1;
+}
+
+#define MV_CAND 192
+static void mv_press_tick(void) {
+    static int on = -1, bound;
+    static double t0, next, every, hold, gap;
+    static unsigned maxt;
+    if (on < 0) {
+        on = kl_env_on("MV_AUTOPLAY_UI", kl_env_on("MV_AUTOPLAY", 0));
+        every = kl_env_uint("MV_AUTOPLAY_UI_EVERY", 4); if (!every) every = 4;
+        hold  = kl_env_uint("MV_AUTOPLAY_UI_HOLD_MS", 300) / 1000.0;
+        gap   = kl_env_uint("MV_AUTOPLAY_UI_GAP", 12);
+        maxt  = kl_env_uint("MV_AUTOPLAY_UI_MAX", 3);
+    }
+    if (!on) return;
+    double now = mv_now();
+    if (!t0) { t0 = now; next = now + kl_env_uint("MV_AUTOPLAY_UI_FROM", 10); }
+    if (bound) mv_release(now, t0, 0);          // every frame: a release is due _HOLD_MS after its press
+    if (now < next) return;
+    next = now + every;
+    if (!mprobe_init()) { on = 0; return; }
+    if (!bound) { bound = 1; if (!mv_press_bind()) { on = 0; return; } }
+    mv_release(now, t0, 1);                     // never two presses at once
+
+    // Everything below lives on this stack, which the GC scans: the arrays and
+    // the candidates' objects stay reachable for the whole tick.
+    mv_cand c[MV_CAND];
+    unsigned nc = 0, nskip = 0, found[MVF_N] = { 0 }, trig = 0;
+    char skip[96] = "";
+    #define ADD(obj, fam_, kind_) do {                                                     \
+        mv_cand *x_ = &c[nc]; x_->o = (obj); x_->fam = (uint8_t)(fam_); x_->kind = (kind_); \
+        mv_names(x_->o, x_->lab, sizeof x_->lab, x_->go, sizeof x_->go);                   \
+        x_->id = mv_id(x_->o); found[fam_]++;                                              \
+        int di_ = mvd_get(x_->id, fam_);                                                   \
+        if (di_ < 0) break;                                                                \
+        x_->di = (int16_t)di_;                                                             \
+        if (mv_unsafe(x_->lab) || mv_unsafe(x_->go)) {                                     \
+            mvd[di_].unsafe_ = 1; nskip++;                                                 \
+            snprintf(skip, sizeof skip, "%s", x_->lab[0] ? x_->lab : x_->go); break;       \
+        }                                                                                  \
+        if (mvd[di_].tries >= maxt || (mvd[di_].tries && now - mvd[di_].last < gap)) break; \
+        nc++;                                                                              \
+    } while (0)
+
+    // ui: Unity UI's own list, as step 52, plus a title's own Selectables
+    if ((mv_fams & 1u << MVF_UI) && k_sel) {
+        static const MethodInfo *m_arr;
+        if (!m_arr) m_arr = mv_m(k_sel, "get_allSelectablesArray", 0);
+        Il2CppObject *a = m_arr ? invoke(m_arr, NULL, "Selectable.all") : NULL;
+        uint32_t n = a ? il.array_length(a) : 0;
+        for (uint32_t i = 0; i < n && nc < MV_CAND; i++) {
+            Il2CppObject *o = ((Il2CppObject **)((uint8_t *)a + ARR_DATA))[i];
+            if (!o) continue;
+            Il2CppClass *k = il.object_get_class(o);
+            const char *kind = mv_kind(k), *ns = mvx.ns(k);
+            if (!kind && ns && strncmp(ns, "UnityEngine", 11) && strcmp(ns, "TMPro") &&
+                (mv_is(k_click, k) || mv_is(k_down, k))) kind = il.class_get_name(k);   // a title's own control
+            if (!kind || !mv_b(o, m_act) || !mv_b(o, m_int)) continue;
+            ADD(o, MVF_UI, kind);
+        }
+    }
+    // isdk, xri, click, event: one pass over the active MonoBehaviours
+    Il2CppObject *mbs = (mv_fams & ~(1u << MVF_UI)) ? mv_find(t_mb) : NULL;
+    uint32_t nm = mbs ? il.array_length(mbs) : 0;
+    int need_ior = 0;
+    for (uint32_t i = 0; i < nm && nc < MV_CAND; i++) {
+        Il2CppObject *o = ((Il2CppObject **)((uint8_t *)mbs + ARR_DATA))[i];
+        if (!o) continue;
+        Il2CppClass *k = il.object_get_class(o);
+        const mv_kinfo *ki = mv_class(k);
+        int fam = ki->f & (KF_IW | KF_PW) ? MVF_ISDK : ki->f & KF_XRI ? MVF_XRI :
+                  ki->f & KF_CLICK ? MVF_CLICK : ki->f & KF_EVENT ? MVF_EVENT : -1;
+        if (ki->f & KF_TRIG) { trig++; continue; }
+        if (fam < 0 || !(mv_fams & 1u << fam) || !mv_b(o, m_act)) continue;
+        need_ior |= fam == MVF_XRI;
+        ADD(o, fam, ki->f & KF_IW ? "InteractableUnityEventWrapper" : ki->f & KF_PW ? "PointableUnityEventWrapper" :
+                    il.class_get_name(k));
+    }
+    #undef ADD
+    mv_trig_seen = trig;
+    // xri: an interactor the scene already has — a ray, then any other; never a socket (it would keep the object)
+    Il2CppObject *ior = NULL; int ir = 99;
+    Il2CppObject *iors = need_ior ? mv_find(t_xior) : NULL;
+    for (uint32_t i = 0, n = iors ? il.array_length(iors) : 0; i < n; i++) {
+        Il2CppObject *o = ((Il2CppObject **)((uint8_t *)iors + ARR_DATA))[i];
+        const char *nm2 = o ? il.class_get_name(il.object_get_class(o)) : NULL;
+        if (!nm2 || strstr(nm2, "Socket") || !mv_b(o, m_act)) continue;
+        int r = strstr(nm2, "Ray") ? 0 : strstr(nm2, "Direct") ? 1 : 2;
+        if (r < ir) { ir = r; ior = o; }   // FindObjectsByType's order: the lowest instance ID wins a tie
+    }
+    double t = now - t0;
+    int pick = -1;
+    for (unsigned i = 0; i < nc; i++) {
+        if (c[i].fam == MVF_XRI && !ior) continue;
+        if (pick < 0 || mv_before(&c[i], &c[pick])) pick = (int)i;
+    }
+    if (pick < 0) {
+        fprintf(stderr, "[mv-autoplay-ui] t=%.1fs nothing to press (ui %u, isdk %u, xri %u%s, click %u, event %u found; "
+                "%u skipped%s%s%s; %u trigger-only)\n", t, found[MVF_UI], found[MVF_ISDK], found[MVF_XRI],
+                found[MVF_XRI] && !ior ? " but no interactor" : "", found[MVF_CLICK], found[MVF_EVENT],
+                nskip, skip[0] ? " e.g. '" : "", skip, skip[0] ? "'" : "", trig);
+        mv_coverage(t);
+        return;
+    }
+    mv_cand *p = &c[pick];
+    const char *how = "none"; int threw = 0, held = 0;
+    Il2CppObject *exc = NULL;
+    switch (p->fam) {
+    case MVF_UI: {
+        const MethodInfo *m = mv_kind(il.object_get_class(p->o)) ? mv_m(il.object_get_class(p->o), "OnSubmit", 1) : NULL;
+        void *nul[1] = { 0 };
+        if (m) { il.runtime_invoke(m, p->o, nul, &exc); how = "OnSubmit"; }
+        if (!m || exc) {   // step 52's fallbacks, then the pointer path for a title's own control
+            exc = NULL;
+            how = !strcmp(p->kind, "Button") ? "Press" : !strcmp(p->kind, "Toggle") ? "InternalToggle" :
+                  !strcmp(p->kind, "Dropdown") ? "Show" : NULL;
+            if (how && (m = mv_m(il.object_get_class(p->o), how, 0))) il.runtime_invoke(m, p->o, NULL, &exc);
+            else {
+                Il2CppObject *pd = mv_ped(p->o);
+                mv_iface(p->o, k_enter, mi_enter, pd, &threw);
+                how = mv_iface(p->o, k_down, mi_down, pd, &threw) ? "Down" : "Enter";
+                held = 1;
+            }
+        }
+        threw += exc != NULL;
+        break;
+    }
+    case MVF_ISDK:
+        if (!strcmp(p->kind, "PointableUnityEventWrapper")) {
+            threw += mv_uevent(p->o, "get_WhenHover", pet_hover) < 0;
+            threw += mv_uevent(p->o, "get_WhenSelect", pet_select) < 0;
+        } else {
+            threw += mv_uevent(p->o, "get_WhenHover", -1) < 0;
+            threw += mv_uevent(p->o, "get_WhenSelect", -1) < 0;
+        }
+        how = "When{Hover,Select}"; held = 1;
+        break;
+    case MVF_XRI: {
+        Il2CppObject *mgr = mv_xri_mgr(p->o, ior);
+        const MethodInfo *m = mgr ? mv_m(il.object_get_class(mgr), "SelectEnter", 2) : NULL;
+        if (m) {
+            void *a[2] = { ior, p->o };
+            il.runtime_invoke(m, mgr, a, &exc);
+            threw += exc != NULL; how = "SelectEnter"; held = 1;
+        } else how = "no interaction manager";
+        break;
+    }
+    case MVF_CLICK: {
+        Il2CppObject *pd = mv_ped(p->o);
+        mv_iface(p->o, k_enter, mi_enter, pd, &threw);
+        how = mv_iface(p->o, k_down, mi_down, pd, &threw) ? "Enter+Down" : "Enter";
+        held = 1;
+        break;
+    }
+    case MVF_EVENT: {
+        const mv_kinfo *ki = mv_class(il.object_get_class(p->o));
+        static char evs[96]; size_t o = 0;
+        for (int e = 0; e < ki->nev; e++) {
+            Il2CppObject *ev = *(Il2CppObject **)((uint8_t *)p->o + ki->off[e]);
+            if (!ev || !m_ue_inv) continue;
+            exc = NULL;
+            il.runtime_invoke(m_ue_inv, ev, NULL, &exc);
+            threw += exc != NULL;
+            o += (size_t)snprintf(evs + o, sizeof evs - o, "%s%s.Invoke", o ? "+" : "", ki->ev[e]);
+            if (o >= sizeof evs) break;
+        }
+        how = o ? evs : "no event set";
+        break;
+    }
+    }
+    mvd[p->di].tries++; mvd[p->di].last = now;
+    fprintf(stderr, "[mv-autoplay-ui] t=%.1fs pressed '%s' (%s %s go=%s via %s%s, try %u, %u candidates, %u skipped)\n",
+            t, p->lab[0] ? p->lab : p->go, mvf_name[p->fam], p->kind, p->go, how, threw ? " THREW" : "",
+            mvd[p->di].tries, nc, nskip);
+    if (held) mv_hold(p->o, p->fam == MVF_XRI ? ior : NULL, p->fam, p->kind, p->lab[0] ? p->lab : p->go, now + hold);
+    mv_coverage(t);
+}
+
+'''
+if marker not in s:
+    old = "void kl_mprobe_tick(unsigned frame) {\n"
+    call52 = "    mv_uipress_tick();   // metavision (step 52)\n"
+    def52 = "static void mv_uipress_tick(void) {\n"
+    for a in (old, call52, def52):
+        if s.count(a) != 1:
+            sys.exit(f"overlay: anchor moved upstream in {p}: {a!r}")
+    s = s.replace(def52, "__attribute__((unused)) static void mv_uipress_tick(void) {   // superseded by step 66\n")
+    s = s.replace(call52, "    mv_press_tick();   // " + marker + "\n")
+    s = s.replace(old, code + old)
+    open(p, "w").write(s)
+print("overlay: autoplay presses every framework's selectables (MV_AUTOPLAY_UI_FAMILIES), with coverage")
 PYEOF

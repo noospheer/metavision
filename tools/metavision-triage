@@ -31,6 +31,9 @@ DLFAIL = re.compile(r'guest dlopen\("([^"]+)"\) FAILED')
 START = re.compile(r"^\[hb\] (\S+)")
 SHIM = re.compile(r"\[mv-shim\] (.*)")
 PLAY = re.compile(r"\[mv-autoplay\] (t=\S+ step \d+: .*)")
+# The presser (overlay step 66): elements pressed / found, by family.
+COVER = re.compile(r"\[mv-autoplay-ui\] coverage (\d+)/(\d+) \(([^)]*)\)")
+PRESSER_ON = "[mv-autoplay-ui] on"
 UNITY_E = re.compile(r"^E/Unity: (.*)", re.M)
 QUIT = re.compile(r"^\[guest\] the title quit:", re.M)
 HANDS = "[mv-hands] the title reads hand state"
@@ -157,6 +160,9 @@ def triage(d: Path):
     cyc = re.findall(r"\[mv-autoplay\] t=\S+ mode cycle: (\w+)", text)
     if cyc:
         notes.append("mode cycle reached " + " > ".join(["auto (start)"] + cyc))
+    if cov := coverage(text):
+        n, m, detail = cov
+        notes.append(f"UI coverage {n}/{'?' if m is None else m}" + (f" ({detail})" if detail else ""))
     plays = PLAY.findall(text)
     if plays:
         notes.append(f"auto-play reached {plays[-1]}")
@@ -188,6 +194,20 @@ def triage(d: Path):
     if top:   # the error that decides an ERRORS verdict, named first
         notes.insert(0, f"serious x{top[0]}: {top[1][:140]}")
     return started, pics, ending, notes, serious
+
+
+def coverage(text: str):
+    """(pressed, found, detail) from the presser's last coverage line; None
+    when it did not run. A log from before step 66 has no coverage line: the
+    distinct controls it pressed, out of an unknown number found (None)."""
+    if cov := COVER.findall(text):
+        n, m, detail = cov[-1]
+        return int(n), int(m), detail
+    if PRESSER_ON not in text:
+        return None
+    pressed = set(re.findall(r"\[mv-autoplay-ui\] t=\S+ pressed '([^']*)' \(\S+ go=(\S+)", text))
+    return (len(pressed), None, "pre-step-66 log: found count not logged") if pressed else \
+           (0, 0, "nothing selectable found")
 
 
 def healthy_so_far(text: str, shipped=None):
@@ -314,6 +334,14 @@ def main():
         print(f"{label:{w}}  {v['verdict'].upper():8} {v['summary']}")
         for n in notes:
             print(f"{'':{w}}  {'':8} {n}")
+    covs = [c for _, d in rows_under(base) if (b := d / "klepton-boot.log").is_file()
+            and (c := coverage(b.read_text(errors="replace")))]
+    if covs:
+        known = sum(c[1] for c in covs if c[1] is not None)
+        print(f"\nUI coverage: {sum(c[0] for c in covs)}/{known}{'+?' if any(c[1] is None for c in covs) else ''} "
+              f"elements pressed; "
+              f"{sum(1 for c in covs if c[0])}/{len(covs)} runs pressed something, "
+              f"{sum(1 for c in covs if c[1] == 0)} found nothing selectable")
     counts = {}
     for _, v, _ in rows:
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1
