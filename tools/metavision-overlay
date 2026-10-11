@@ -4826,17 +4826,20 @@ if marker not in s:
 print("overlay: passthrough — see-through eye pass while a title's passthrough layer runs (XR_FB_passthrough)")
 PYEOF
 
-# 65 — a destroyed image's storage is freed even while views of it live. A
-# Metal texture view keeps its parent texture, and so its memory, alive.
-# One engine build deletes a render target's image every frame but keeps the
-# views behind its own reference count, so each frame left a full-size depth
-# target behind and the app reached the memory limit in two seconds. When the
-# guest destroys an image that still has views, its MTLTexture is kept for a
-# moment (work already queued may still read it) and then emptied with
-# setPurgeableState(Empty): the storage goes, no view handle is touched (an
-# early view destroy let handles be reused under the guest — step 51). A view
-# of a destroyed image is already invalid in Vulkan, so nothing valid reads the
-# emptied storage. KL_VK_PURGE_ORPHANS=0 turns it off.
+# 65 — a destroyed image's storage is released even while views of it live.
+# In MoltenVK a view retains its image, so a vkDestroyImage with views still
+# alive frees nothing: the image and its full-size texture live on. One engine
+# build deletes a render target's image every frame but keeps the views behind
+# its own reference count, so each frame left a full-size depth target behind
+# and the app reached the memory limit in two seconds. (Emptying the texture
+# with setPurgeableState freed nothing: MoltenVK still held it resident.) When
+# the guest destroys an image that still has views, a quarter second later the
+# image is given a 1x1 texture of the same shape through MoltenVK's own
+# vkSetMTLTextureMVK — which releases the old texture and its cached views —
+# and each of those views is rebuilt on it. No view handle is touched (an early
+# view destroy let handles be reused under the guest — step 51), and a view of a
+# destroyed image is invalid in Vulkan, so nothing valid reads the stand-in.
+# KL_VK_REBASE_ORPHANS=0 turns it off.
 python3 - "$K/runtime/gfx/kl_vulkan.c" <<'PYEOF'
 import sys
 p = sys.argv[1]
@@ -4873,7 +4876,7 @@ if marker not in s:
         "#include <CoreFoundation/CoreFoundation.h>\n"
         "static int mv_purge_on(void) {\n"
         "    static int on = -1;\n"
-        "    if (on < 0) on = kl_env_on(\"KL_VK_PURGE_ORPHANS\", 1);\n"
+        "    if (on < 0) on = kl_env_on(\"KL_VK_REBASE_ORPHANS\", 1);\n"
         "    return on;\n"
         "}\n"
         "// How many live views an image has (the views table, step 63).\n"
@@ -4886,42 +4889,99 @@ if marker not in s:
         "}\n"
         "#define MV_PURGE_N 256\n"
         "static pthread_mutex_t mv_purge_lock = PTHREAD_MUTEX_INITIALIZER;\n"
-        "static struct { void *tex; double at; } mv_purge_q[MV_PURGE_N];\n"
+        "static struct { klvk_device *d; VkImage img; double at; } mv_purge_q[MV_PURGE_N];\n"
         "static unsigned mv_purge_n;\n"
         "static _Atomic unsigned long mv_purged, mv_purged_mib;\n"
-        "static void mv_purge_one(void *tex) {\n"
-        "    unsigned long bytes = ((unsigned long (*)(void *, SEL))objc_msgSend)(tex, sel_registerName(\"allocatedSize\"));\n"
-        "    ((unsigned long (*)(void *, SEL, unsigned long))objc_msgSend)(tex, sel_registerName(\"setPurgeableState:\"), 4);   // MTLPurgeableStateEmpty\n"
-        "    CFRelease(tex);\n"
-        "    mv_purged++; mv_purged_mib += bytes >> 20;\n"
-        "    static int said;\n"
-        "    if (said < 3) { said++; fprintf(stderr, \"  [vk-purge] emptied the storage of a destroyed image its views kept alive (%lu MiB)\\n\", bytes >> 20); }\n"
+        "#define MV_MSG(ret, ...) ((ret (*)(__VA_ARGS__))objc_msgSend)\n"
+        "static unsigned long mv_tex_u(void *o, const char *sel) { return MV_MSG(unsigned long, void *, SEL)(o, sel_registerName(sel)); }\n"
+        "// A 1x1 texture shaped like `tex` (format, type, layers, mips, samples,\n"
+        "// usage), shared by every image of that shape: what a destroyed image's\n"
+        "// views are rebuilt on, so the full-size storage can go.\n"
+        "static void *mv_placeholder(void *tex) {\n"
+        "    static struct { unsigned long k[6]; void *t; } cache[16];\n"
+        "    static unsigned n;\n"
+        "    unsigned long k[6] = { mv_tex_u(tex, \"pixelFormat\"), mv_tex_u(tex, \"textureType\"), mv_tex_u(tex, \"arrayLength\"),\n"
+        "                           mv_tex_u(tex, \"mipmapLevelCount\"), mv_tex_u(tex, \"sampleCount\"), mv_tex_u(tex, \"usage\") };\n"
+        "    for (unsigned i = 0; i < n; i++) if (!memcmp(cache[i].k, k, sizeof k)) return cache[i].t;\n"
+        "    void *desc = MV_MSG(void *, void *, SEL)((void *)objc_getClass(\"MTLTextureDescriptor\"), sel_registerName(\"new\"));\n"
+        "    if (!desc) return NULL;\n"
+        "    unsigned long side = 1ul << (k[3] > 1 ? k[3] - 1 : 0);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setTextureType:\"), k[1]);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setPixelFormat:\"), k[0]);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setWidth:\"), side);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setHeight:\"), side);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setArrayLength:\"), k[2]);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setMipmapLevelCount:\"), k[3]);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setSampleCount:\"), k[4]);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setUsage:\"), k[5]);\n"
+        "    MV_MSG(void, void *, SEL, unsigned long)(desc, sel_registerName(\"setStorageMode:\"), 2);   // private\n"
+        "    void *dev = MV_MSG(void *, void *, SEL)(tex, sel_registerName(\"device\"));\n"
+        "    void *t = dev ? MV_MSG(void *, void *, SEL, void *)(dev, sel_registerName(\"newTextureWithDescriptor:\"), desc) : NULL;\n"
+        "    CFRelease(desc);\n"
+        "    if (t && n < 16) { memcpy(cache[n].k, k, sizeof k); cache[n].t = t; n++; }\n"
+        "    return t;   // past 16 shapes: one per image, kept (it is tiny)\n"
         "}\n"
-        "// Called as the guest destroys an image, before the real destroy.\n"
+        "// The image the guest destroyed is still alive inside MoltenVK while any\n"
+        "// view of it is (a view retains its image), and so is its texture. Give the\n"
+        "// image the placeholder instead (MoltenVK's own vkSetMTLTextureMVK releases\n"
+        "// the old texture and its cached views) and have each orphan view rebuild on\n"
+        "// it (exporting a view's texture re-derives it from the image's current\n"
+        "// one). Under the views table's lock: a view in the table has not reached\n"
+        "// its real destroy (mv_lv_del runs first and takes the lock), so the image\n"
+        "// is alive for the whole swap.\n"
+        "static void mv_rebase(klvk_device *d, VkImage img) {\n"
+        "    typedef VkResult (*set_tex_fn)(VkImage, void *);\n"
+        "    static set_tex_fn set_tex; static PFN_vkExportMetalObjectsEXT exp; static int resolved;\n"
+        "    if (!resolved) {\n"
+        "        resolved = 1;\n"
+        "        set_tex = (set_tex_fn)mvk_sym(\"vkSetMTLTextureMVK\");\n"
+        "        exp = (PFN_vkExportMetalObjectsEXT)(real_gdpa && d ? real_gdpa(d->dev, \"vkExportMetalObjectsEXT\") : NULL);\n"
+        "        if (!set_tex || !exp) fprintf(stderr, \"  [vk-purge] off: vkSetMTLTextureMVK or vkExportMetalObjectsEXT not found\\n\");\n"
+        "    }\n"
+        "    if (!set_tex || !exp || !d) return;\n"
+        "    pthread_mutex_lock(&mv_lv_lock);\n"
+        "    unsigned views = 0;\n"
+        "    for (unsigned i = 0; i < mv_lv_n; i++) if (mv_lv[i].img == img && mv_lv[i].gone) views++;\n"
+        "    void *tex = views ? eye_mtl_texture(d, img) : NULL;\n"
+        "    void *ph = tex ? mv_placeholder(tex) : NULL;\n"
+        "    if (ph && ph != tex) {\n"
+        "        unsigned long bytes = mv_tex_u(tex, \"allocatedSize\");\n"
+        "        if (set_tex(img, ph) == VK_SUCCESS) {\n"
+        "            for (unsigned i = 0; i < mv_lv_n; i++) {\n"
+        "                if (mv_lv[i].img != img || !mv_lv[i].gone) continue;\n"
+        "                VkExportMetalTextureInfoEXT t = { .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_TEXTURE_INFO_EXT,\n"
+        "                                                  .imageView = mv_lv[i].v, .plane = VK_IMAGE_ASPECT_PLANE_0_BIT };\n"
+        "                VkExportMetalObjectsInfoEXT o = { .sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT, .pNext = &t };\n"
+        "                exp(d->dev, &o);\n"
+        "            }\n"
+        "            mv_purged++; mv_purged_mib += bytes >> 20;\n"
+        "            static int said;\n"
+        "            if (said < 3) { said++; fprintf(stderr, \"  [vk-purge] released the storage of a destroyed image its %u view(s) kept alive (%lu MiB); the views now see a 1x1 stand-in\\n\", views, bytes >> 20); }\n"
+        "        }\n"
+        "    }\n"
+        "    pthread_mutex_unlock(&mv_lv_lock);\n"
+        "}\n"
+        "// Called as the guest destroys an image that still has views.\n"
         "static void mv_purge_hold(klvk_device *d, VkImage img) {\n"
         "    if (!mv_purge_on() || !img || !mv_lv_count(img)) return;\n"
-        "    void *tex = eye_mtl_texture(d, img);\n"
-        "    if (!tex) return;\n"
-        "    CFRetain(tex);\n"
-        "    void *spill = NULL;\n"
         "    pthread_mutex_lock(&mv_purge_lock);\n"
-        "    if (mv_purge_n == MV_PURGE_N) { spill = mv_purge_q[0].tex; memmove(mv_purge_q, mv_purge_q + 1, sizeof mv_purge_q[0] * (MV_PURGE_N - 1)); mv_purge_n--; }\n"
-        "    mv_purge_q[mv_purge_n].tex = tex; mv_purge_q[mv_purge_n].at = mv_life_now(); mv_purge_n++;\n"
+        "    if (mv_purge_n < MV_PURGE_N) { mv_purge_q[mv_purge_n].d = d; mv_purge_q[mv_purge_n].img = img; mv_purge_q[mv_purge_n].at = mv_life_now(); mv_purge_n++; }\n"
         "    pthread_mutex_unlock(&mv_purge_lock);\n"
-        "    if (spill) mv_purge_one(spill);\n"
         "}\n"
-        "// Each submit: empty what was destroyed more than a quarter second ago.\n"
+        "// Each submit: rebase what was destroyed more than a quarter second ago\n"
+        "// (MoltenVK does not retain textures for in-flight work).\n"
         "static void mv_purge_due(void) {\n"
         "    if (!mv_purge_on() || !mv_purge_n) return;\n"
-        "    void *due[MV_PURGE_N]; unsigned k = 0;\n"
+        "    struct { klvk_device *d; VkImage img; } due[MV_PURGE_N]; unsigned k = 0;\n"
         "    double now = mv_life_now();\n"
         "    pthread_mutex_lock(&mv_purge_lock);\n"
         "    unsigned j = 0;\n"
         "    for (unsigned i = 0; i < mv_purge_n; i++)\n"
-        "        if (now - mv_purge_q[i].at > 0.25) due[k++] = mv_purge_q[i].tex; else mv_purge_q[j++] = mv_purge_q[i];\n"
+        "        if (now - mv_purge_q[i].at > 0.25) { due[k].d = mv_purge_q[i].d; due[k].img = mv_purge_q[i].img; k++; }\n"
+        "        else mv_purge_q[j++] = mv_purge_q[i];\n"
         "    mv_purge_n = j;\n"
         "    pthread_mutex_unlock(&mv_purge_lock);\n"
-        "    for (unsigned i = 0; i < k; i++) mv_purge_one(due[i]);\n"
+        "    for (unsigned i = 0; i < k; i++) mv_rebase(due[i].d, due[i].img);\n"
         "}\n"
         "static void mv_lv_stats(unsigned long *live, double *oldest) {\n")
     s = sub(s, "    mv_lv_image_gone(img, __builtin_return_address(0));   // metavision: Vulkan lifecycle trace (step 63)\n",
@@ -4931,11 +4991,11 @@ if marker not in s:
         "    mv_life_submit(n, si, fence);   // metavision: Vulkan lifecycle trace (step 63)\n"
         "    mv_purge_due();   // " + marker + "\n")
     s = sub(s, "\"later destroyed %lu (max %.2f s after), still live %lu (oldest %.1f s) | footprint %llu MiB\\n\",\n",
-        "\"later destroyed %lu (max %.2f s after), still live %lu (oldest %.1f s) | storage emptied %lu (%lu MiB) | footprint %llu MiB\\n\",\n")
+        "\"later destroyed %lu (max %.2f s after), still live %lu (oldest %.1f s) | storage released %lu (%lu MiB) | footprint %llu MiB\\n\",\n")
     s = sub(s, "            mv_orph_max_age, orph_live, orph_old, fp);\n",
         "            mv_orph_max_age, orph_live, orph_old, (unsigned long)mv_purged, (unsigned long)mv_purged_mib, fp);\n")
     open(p, "w").write(s)
-print("overlay: a destroyed image's storage is emptied while views of it live (KL_VK_PURGE_ORPHANS)")
+print("overlay: a destroyed image's storage is released while views of it live (KL_VK_REBASE_ORPHANS)")
 PYEOF
 
 # 66 — autoplay presses what every interaction framework calls selectable, not
