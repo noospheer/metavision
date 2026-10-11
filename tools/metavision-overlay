@@ -5769,3 +5769,47 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: Activity.finish() ends the app")
 PYEOF
+
+# 71 — a volumetric-video plugin's Java object is constructed. The plugin keeps
+# its JavaVM, its Java peer and the AssetManager only from a native onCreated
+# that its Java constructor calls (after its class initialiser loads the
+# library). Nothing ran that constructor, so the first clip it opened
+# dereferenced a null JavaVM and the title crashed. The constructor now loads
+# the library (once, with JNI_OnLoad, as System.loadLibrary would) and calls the
+# library's own onCreated with the object, the AssetManager and "no expansion
+# file", so assets are read through AAssetManager — what Android does.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a volumetric-video plugin's Java object (step 71)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_net[] = {\n",
+        "// " + marker + "\n"
+        "#define MV_SVF_CLASS \"com/microsoft/mixedreality/mrcs/svf/JavaPlugin\"\n"
+        "static klj_val mv_SVFJavaPlugin_init(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)a; (void)n;\n"
+        "    klj_val lib = { .l = kl_jni_new_string(\"SVFUnityPlugin\") };\n"
+        "    klj_UnityPlayer_loadLibrary(env, NULL, &lib, 1);   // the class initialiser's System.loadLibrary\n"
+        "    void *h = klb_dlopen(\"libSVFUnityPlugin.so\", 0x00002);\n"
+        "    typedef void (*on_created_fn)(void *env, void *cls, void *self, void *assets, uint8_t has_obb);\n"
+        "    on_created_fn on_created = h ? (on_created_fn)klb_dlsym(h,\n"
+        "        \"Java_com_microsoft_mixedreality_mrcs_svf_JavaPlugin_onCreated\") : NULL;\n"
+        "    static void *am;\n"
+        "    void *assets = klj_singleton(\"android/content/res/AssetManager\", &am).l;\n"
+        "    if (on_created) on_created(env, NULL, self, assets, 0);\n"
+        "    KLJ_LOG(\"SVF JavaPlugin.<init>: %s\", on_created ? \"onCreated(this, assets, no expansion file) called\"\n"
+        "                                                   : \"the plugin's onCreated was not found\");\n"
+        "    return (klj_val){.l = self};\n"
+        "}\n"
+        "\n"
+        "const klj_binding klj_bind_net[] = {\n"
+        "    {MV_SVF_CLASS, \"<init>\", \"(Lcom/unity3d/player/UnityPlayerActivity;Ljava/lang/String;)V\", mv_SVFJavaPlugin_init},   // " + marker + "\n"
+        "    {MV_SVF_CLASS, \"<init>\", \"(Landroid/app/Activity;Ljava/lang/String;)V\", mv_SVFJavaPlugin_init},\n")
+    open(p, "w").write(s)
+print("overlay: a volumetric-video plugin's Java object is constructed (its onCreated runs)")
+PYEOF
