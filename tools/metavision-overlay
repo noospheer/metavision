@@ -5919,3 +5919,33 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: permissions implied by a declared one are granted")
 PYEOF
+
+# 73 — the LOCAL_FLOOR reference space. OpenXR 1.1 makes it core (before that,
+# XR_EXT_local_floor): LOCAL, lowered to the floor. It was refused, so a Unity
+# OpenXR title asking for a floor origin retried every frame and kept its rig
+# at eye level. Here LOCAL sits above the floor at the tracking origin, so
+# LOCAL_FLOOR is the tracking origin itself, where STAGE is; it is accepted on
+# request and not advertised, so a title that chooses from the list chooses as
+# before.
+python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: LOCAL_FLOOR reference space (step 73)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "enum { KLXR_REF_SPACE_VIEW = 1, KLXR_REF_SPACE_LOCAL = 2, KLXR_REF_SPACE_STAGE = 3 };\n",
+        "enum { KLXR_REF_SPACE_VIEW = 1, KLXR_REF_SPACE_LOCAL = 2, KLXR_REF_SPACE_STAGE = 3 };\n"
+        "enum { KLXR_REF_SPACE_LOCAL_FLOOR = 1000426000 };   // " + marker + "\n")
+    s = sub(s, "        case KLXR_REF_SPACE_STAGE: return \"STAGE\";\n",
+        "        case KLXR_REF_SPACE_STAGE: return \"STAGE\";\n"
+        "        case KLXR_REF_SPACE_LOCAL_FLOOR: return \"LOCAL_FLOOR\";\n")
+    s = sub(s, "        info->referenceSpaceType != KLXR_REF_SPACE_STAGE) {\n",
+        "        info->referenceSpaceType != KLXR_REF_SPACE_STAGE &&\n"
+        "        info->referenceSpaceType != KLXR_REF_SPACE_LOCAL_FLOOR) {   // placed at the origin, as STAGE\n")
+    open(p, "w").write(s)
+print("overlay: the LOCAL_FLOOR reference space is accepted")
+PYEOF
