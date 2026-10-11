@@ -5050,9 +5050,11 @@ static struct {
     const char *(*mname)(const MethodInfo *);
     uint32_t (*mparams)(const MethodInfo *);
     const MethodInfo *(*virt)(Il2CppObject *, const MethodInfo *);
-    uint32_t (*gc_new)(Il2CppObject *, _Bool);
-    Il2CppObject *(*gc_get)(uint32_t);
-    void (*gc_free)(uint32_t);
+    // uintptr_t: newer il2cpp hands out pointer-sized handles; older ones
+    // read only the low half, so the wide type serves both.
+    uintptr_t (*gc_new)(Il2CppObject *, _Bool);
+    Il2CppObject *(*gc_get)(uintptr_t);
+    void (*gc_free)(uintptr_t);
 } mvy;
 // Types and methods, resolved once. Type objects are kept by the runtime (as
 // step 52's t_tmp); no string or other managed object is kept across calls.
@@ -5197,7 +5199,7 @@ static void mv_coverage(double t) {
 }
 
 // ---- a press in two halves: now, and _HOLD_MS later ----
-static struct { uint32_t h, hi; uint8_t fam, live; double at; const char *kind; char what[64]; } mvp;
+static struct { uintptr_t h, hi; uint8_t fam, live; double at; const char *kind; char what[64]; } mvp;
 static Il2CppObject *mv_ped(Il2CppObject *o) {   // a new PointerEventData aimed at o's game object
     if (!k_ped || !m_ped_new) return NULL;
     Il2CppObject *es = invoke(m_es_cur, NULL, "EventSystem.current");
@@ -5258,7 +5260,7 @@ static Il2CppObject *mv_xri_mgr(Il2CppObject *able, Il2CppObject *ior) {
 static void mv_release(double now, double t0, int force) {
     if (!mvp.live || (!force && now < mvp.at)) return;
     mvp.live = 0;
-    Il2CppObject *o = mvy.gc_get(mvp.h), *ior = mvp.hi ? mvy.gc_get(mvp.hi) : NULL;
+    Il2CppObject *o = mvp.h ? mvy.gc_get(mvp.h) : NULL, *ior = mvp.hi ? mvy.gc_get(mvp.hi) : NULL;
     const char *how = "gone";
     int threw = 0;
     if (mv_alive(o)) switch (mvp.fam) {
@@ -5294,7 +5296,7 @@ static void mv_release(double now, double t0, int force) {
         break;
     }
     }
-    mvy.gc_free(mvp.h);
+    if (mvp.h) mvy.gc_free(mvp.h);
     if (mvp.hi) mvy.gc_free(mvp.hi);
     fprintf(stderr, "[mv-autoplay-ui] t=%.1fs released '%s' (%s via %s%s)\n",
             now - t0, mvp.what, mvf_name[mvp.fam], how, threw ? " THREW" : "");
