@@ -6327,3 +6327,113 @@ if marker not in s:
 print(f"overlay: the catalogue carries resource strings ({carried} titles have some)")
 PYEOF
 fi
+
+# 75 — Unity assets that live only in the expansion file. A Unity title whose
+# APK is split ships part of assets/ inside main.<v>.obb, stored uncompressed,
+# and Android's AAssetManager serves those entries as if they were in the APK —
+# AAsset_openFileDescriptor answers with the OBB's descriptor and the entry's
+# offset. Only audio banks were looked up there, so a video a native plugin
+# opened through the asset manager was "not found" and never played. An asset
+# missing from disk is now looked up as assets/<name> in the expansion file and
+# served from its byte window, descriptor and offset included.
+python3 - "$K/runtime/guest/kl_obbmap.c" "$K/runtime/guest/kl_obbmap.h" "$K/runtime/guest/kl_ndk.c" <<'PYEOF'
+import sys
+pc, ph, pn = sys.argv[1:4]
+marker = "metavision: Unity assets served from the expansion file (step 75)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+
+s = open(ph).read()
+if marker not in s:
+    s = sub(ph, s, "FILE *kl_obbmap_fopen(const char *loose, const char *mode);\n",
+        "FILE *kl_obbmap_fopen(const char *loose, const char *mode);\n"
+        "// " + marker + ": the byte window of a STORED assets/<name> entry\n"
+        "// of a Unity title's expansion file; 1 and the window, or 0.\n"
+        "int kl_obbmap_asset_window(const char *name, char *obb, size_t cap,\n"
+        "                           unsigned long long *off, unsigned long long *size);\n"
+        "// A read-only FILE* over that window.\n"
+        "FILE *kl_obbmap_window_fopen(const char *obb, unsigned long long off, unsigned long long size);\n")
+    open(ph, "w").write(s)
+
+s = open(pc).read()
+if marker not in s:
+    s = sub(pc, s, "FILE *kl_obbmap_fopen(const char *loose, const char *mode) {\n",
+        "// " + marker + "\n"
+        "int kl_obbmap_asset_window(const char *name, char *obb, size_t cap,\n"
+        "                           unsigned long long *off, unsigned long long *size) {\n"
+        "    if (!name || g_base_len || !g_n) return 0;   // a UE4 base indexes loose paths instead\n"
+        "    while (name[0] == '.' && name[1] == '/') name += 2;\n"
+        "    char want[1024];\n"
+        "    snprintf(want, sizeof want, \"/assets/%s\", name);\n"
+        "    for (unsigned i = 0; i < g_n; i++) {\n"
+        "        obb_entry *e = &g_ent[i];\n"
+        "        if (e->method != 0 || strcmp(e->loose, want) != 0) continue;\n"
+        "        FILE *f = fopen(e->obb, \"rb\");\n"
+        "        if (!f) return 0;\n"
+        "        uint64_t base;\n"
+        "        int ok = data_offset(f, e, &base);\n"
+        "        fclose(f);\n"
+        "        if (!ok) return 0;\n"
+        "        snprintf(obb, cap, \"%s\", e->obb);\n"
+        "        *off = base; *size = e->size;\n"
+        "        return 1;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}\n"
+        "FILE *kl_obbmap_window_fopen(const char *obb, unsigned long long off, unsigned long long size) {\n"
+        "    int fd = open(obb, O_RDONLY);\n"
+        "    if (fd < 0) return NULL;\n"
+        "    klobb_cookie *c = calloc(1, sizeof *c);\n"
+        "    if (!c) { close(fd); return NULL; }\n"
+        "    c->fd = fd; c->base = off; c->size = size; c->pos = 0;\n"
+        "    FILE *f = funopen(c, klobb_cookie_read, NULL, klobb_cookie_seek, klobb_cookie_close);\n"
+        "    if (!f) { close(fd); free(c); }\n"
+        "    return f;\n"
+        "}\n"
+        "\n"
+        "FILE *kl_obbmap_fopen(const char *loose, const char *mode) {\n")
+    open(pc, "w").write(s)
+
+s = open(pn).read()
+if marker not in s:
+    s = sub(pn, s, "typedef struct { FILE *f; int64_t len; void *buf; char path[1200]; } kl_asset;\n",
+        "typedef struct { FILE *f; int64_t len; void *buf; char path[1200];\n"
+        "                 int64_t start; } kl_asset;   // start: offset in path (" + marker + ")\n")
+    s = sub(pn, s,
+        "    if (!f) f = kl_obbmap_fopen(path, \"rb\");   // audio banks live only in the OBB\n"
+        "    if (!f) return NULL;\n",
+        "    if (!f) f = kl_obbmap_fopen(path, \"rb\");   // audio banks live only in the OBB\n"
+        "    char obb[1024]; unsigned long long at = 0, sz = 0;\n"
+        "    int in_obb = 0;\n"
+        "    if (!f && kl_obbmap_asset_window(fname, obb, sizeof obb, &at, &sz))\n"
+        "        in_obb = (f = kl_obbmap_window_fopen(obb, at, sz)) != NULL;\n"
+        "    if (!f) return NULL;\n")
+    s = sub(pn, s,
+        "    fseeko(f, 0, SEEK_END);\n"
+        "    a->len = ftello(f);\n"
+        "    fseeko(f, 0, SEEK_SET);\n"
+        "    a->f = f;\n"
+        "    snprintf(a->path, sizeof a->path, \"%s\", path);\n",
+        "    if (in_obb) {\n"
+        "        a->len = (int64_t)sz; a->start = (int64_t)at;\n"
+        "        snprintf(a->path, sizeof a->path, \"%s\", obb);\n"
+        "        static int said; if (said++ < 8)\n"
+        "            fprintf(stderr, \"  [asset] %s served from the expansion file (%llu bytes at %llu)\\n\",\n"
+        "                    fname, sz, at);\n"
+        "    } else {\n"
+        "        fseeko(f, 0, SEEK_END);\n"
+        "        a->len = ftello(f);\n"
+        "        fseeko(f, 0, SEEK_SET);\n"
+        "        snprintf(a->path, sizeof a->path, \"%s\", path);\n"
+        "    }\n"
+        "    a->f = f;\n")
+    s = sub(pn, s,
+        "    if (out_start) *out_start = 0;\n"
+        "    if (out_len)   *out_len   = a->len;\n",
+        "    if (out_start) *out_start = a->start;   // non-zero inside the expansion file\n"
+        "    if (out_len)   *out_len   = a->len;\n")
+    open(pn, "w").write(s)
+print("overlay: Unity assets missing from the APK are served from the expansion file")
+PYEOF
