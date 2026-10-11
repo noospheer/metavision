@@ -5882,3 +5882,40 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: a volumetric-video plugin's Java object is constructed (its onCreated runs)")
 PYEOF
+
+# 72 — permissions Android implies from another declared one. Android grants
+# READ_EXTERNAL_STORAGE to an app that declares WRITE_EXTERNAL_STORAGE, and
+# ACCESS_COARSE_LOCATION to one that declares ACCESS_FINE_LOCATION. Only the
+# literal declaration was matched, so a title that asked for the implied one
+# was told "denied" and showed its own permission dialog, whose only button
+# quits.
+python3 - "$K/runtime/jni/kl_jni_window.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: permissions implied by a declared one (step 72)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "        if (strcmp(p, declared[i]) == 0) { *why = \"\"; return 1; }\n"
+        "    *why = \" (not declared in the guest's manifest)\";\n",
+        "        if (strcmp(p, declared[i]) == 0) { *why = \"\"; return 1; }\n"
+        "    // " + marker + "\n"
+        "    static const char *const implied[][2] = {\n"
+        "        {\"android.permission.READ_EXTERNAL_STORAGE\", \"android.permission.WRITE_EXTERNAL_STORAGE\"},\n"
+        "        {\"android.permission.ACCESS_COARSE_LOCATION\", \"android.permission.ACCESS_FINE_LOCATION\"},\n"
+        "    };\n"
+        "    for (size_t k = 0; k < sizeof implied / sizeof *implied; k++)\n"
+        "        if (strcmp(p, implied[k][0]) == 0)\n"
+        "            for (size_t i = 0; i < n; i++)\n"
+        "                if (strcmp(implied[k][1], declared[i]) == 0) {\n"
+        "                    *why = \" (implied by a declared permission)\";\n"
+        "                    return 1;\n"
+        "                }\n"
+        "    *why = \" (not declared in the guest's manifest)\";\n")
+    open(p, "w").write(s)
+print("overlay: permissions implied by a declared one are granted")
+PYEOF
