@@ -4692,3 +4692,118 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: Vulkan lifecycle trace (KL_TRACE_VK_LIFE, diagnostic)")
 PYEOF
+
+# 64 — passthrough. A title that turns on Meta's passthrough leaves its
+# background transparent and expects the headset's cameras behind it; this
+# runtime drew every eye opaque, so such a title showed black (or nothing at
+# all). Now the compositor has a see-through mode: while the title has a
+# passthrough layer running, the eye picture keeps the title's own alpha
+# (premultiplied) and the clear is transparent, so the Vision Pro's real
+# passthrough (the immersive space is .mixed) shows wherever the title left it.
+# Style effects on the camera image (colour maps, edges) cannot be done: the
+# camera image is not available to apps. KL_PASSTHROUGH=0 keeps every frame
+# opaque (the A/B); =1 forces see-through.
+python3 - "$K" <<'PYEOF'
+import sys, os
+K = sys.argv[1]
+marker = "metavision: passthrough (step 64)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+
+# --- kl_reproject.c: the state, and the see-through eye pass -----------------
+p = os.path.join(K, "runtime/gfx/kl_reproject.c")
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "static int klr_translate(void) {\n",
+        "// " + marker + ": whether a title's passthrough layer is running. Set by the\n"
+        "// OVRPlugin and OpenXR passthrough entry points; read for every eye pass.\n"
+        "static int s_passthrough;\n"
+        "void kl_reproject_set_passthrough(int on) {\n"
+        "    int was = __atomic_exchange_n(&s_passthrough, on ? 1 : 0, __ATOMIC_ACQ_REL);\n"
+        "    if (was != (on ? 1 : 0))\n"
+        "        fprintf(stderr, \"  [passthrough] %s — the eye picture is %s\\n\", on ? \"on\" : \"off\",\n"
+        "                on ? \"composited with the title's alpha over the real surroundings\" : \"opaque\");\n"
+        "}\n"
+        "int kl_reproject_passthrough(void) {\n"
+        "    static int env = -2;\n"
+        "    if (env == -2) env = kl_env_int(\"KL_PASSTHROUGH\", -1);\n"
+        "    if (env >= 0) return env;\n"
+        "    return __atomic_load_n(&s_passthrough, __ATOMIC_ACQUIRE);\n"
+        "}\n"
+        "\n"
+        "static int klr_translate(void) {\n")
+    # chroma_on 2 = see-through: the guest's alpha, premultiplied
+    s = sub(p, s, "    u.chroma_on = (uint32_t)kl_reproject_chroma(u.chroma_key, &u.chroma_min,\n"
+                  "                                                &u.chroma_max);\n",
+        "    u.chroma_on = (uint32_t)kl_reproject_chroma(u.chroma_key, &u.chroma_min,\n"
+        "                                                &u.chroma_max);\n"
+        "    if (!u.chroma_on && kl_reproject_passthrough()) u.chroma_on = 2;   // " + marker + "\n")
+    s = sub(p, s, "\"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\\n\"\n",
+        "\"    float4 c = kl_eye_sample2(tex, tex1, samp, in.uv, in.slice, in.srgb, in.src);\\n\"\n"
+        "// " + marker + ": see-through keeps the title's own alpha, premultiplied.\n"
+        "\"    if (in.chromaOn == 2u) {\\n\"\n"
+        "\"        float a = saturate(in.src == 0u ? tex.sample(samp, in.uv, in.slice).a\\n\"\n"
+        "\"                                        : tex1.sample(samp, in.uv, in.slice).a);\\n\"\n"
+        "\"        return float4(c.rgb * a, a);\\n\"\n"
+        "\"    }\\n\"\n")
+    open(p, "w").write(s)
+p = os.path.join(K, "runtime/gfx/kl_reproject.h")
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "int  kl_reproject_chroma(float rgb[3], float *dmin, float *dmax);\n",
+        "int  kl_reproject_chroma(float rgb[3], float *dmin, float *dmax);\n\n"
+        "// " + marker + ": a title's passthrough layer is running, so the eye pass\n"
+        "// keeps its alpha and the room shows through. KL_PASSTHROUGH overrides.\n"
+        "void kl_reproject_set_passthrough(int on);\n"
+        "int  kl_reproject_passthrough(void);\n")
+    open(p, "w").write(s)
+
+# --- KleptonCompositor.swift: a transparent clear while see-through -----------
+p = os.path.join(K, "visionos/Sources/KleptonCompositor.swift")
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "MTLClearColorMake(0, 0, 0, MetavisionShots.hidden ? 0 : 1)   // metavision: hidden clear\n",
+        "MTLClearColorMake(0, 0, 0, MetavisionShots.hidden || kl_reproject_passthrough() != 0 ? 0 : 1)   // metavision: hidden clear; " + marker + "\n")
+    open(p, "w").write(s)
+
+# --- kl_openxr.c: XR_FB_passthrough tracks whether a layer is running ----------
+p = os.path.join(K, "runtime/xr/kl_openxr.c")
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "static char g_pt_handle, g_pt_layer_handle;\n",
+        "static char g_pt_handle, g_pt_layer_handle;\n"
+        "// " + marker + ": started passthrough plus a running layer = see-through.\n"
+        "void kl_reproject_set_passthrough(int on);   // kl_reproject.c\n"
+        "static int g_pt_started, g_pt_layer_running, g_pt_layer_live;\n"
+        "static void klxr_pt_update(void) {\n"
+        "    kl_reproject_set_passthrough(g_pt_started && g_pt_layer_live && g_pt_layer_running);\n"
+        "}\n")
+    # XrPassthroughCreateInfoFB / XrPassthroughLayerCreateInfoFB: flags at +16,
+    # bit 0 = XR_PASSTHROUGH_IS_RUNNING_AT_CREATION_BIT_FB
+    s = sub(p, s, "    *out = &g_pt_handle;\n    return KLXR_SUCCESS;\n}\n",
+        "    *out = &g_pt_handle;\n"
+        "    if (info && (*(const uint64_t *)((const char *)info + 16) & 1)) { g_pt_started = 1; klxr_pt_update(); }\n"
+        "    return KLXR_SUCCESS;\n}\n")
+    s = sub(p, s, "static XrResult klxr_DestroyPassthroughFB(void *pt) { (void)pt; return KLXR_SUCCESS; }\n"
+                  "static XrResult klxr_PassthroughStartFB(void *pt)   { (void)pt; return KLXR_SUCCESS; }\n"
+                  "static XrResult klxr_PassthroughPauseFB(void *pt)   { (void)pt; return KLXR_SUCCESS; }\n",
+        "static XrResult klxr_DestroyPassthroughFB(void *pt) { (void)pt; g_pt_started = 0; klxr_pt_update(); return KLXR_SUCCESS; }\n"
+        "static XrResult klxr_PassthroughStartFB(void *pt)   { (void)pt; g_pt_started = 1; klxr_pt_update(); return KLXR_SUCCESS; }\n"
+        "static XrResult klxr_PassthroughPauseFB(void *pt)   { (void)pt; g_pt_started = 0; klxr_pt_update(); return KLXR_SUCCESS; }\n")
+    s = sub(p, s, "    *out = &g_pt_layer_handle;\n    return KLXR_SUCCESS;\n}\n",
+        "    *out = &g_pt_layer_handle;\n"
+        "    g_pt_layer_live = 1;\n"
+        "    g_pt_layer_running = info && (*(const uint64_t *)((const char *)info + 24) & 1);\n"
+        "    klxr_pt_update();\n"
+        "    return KLXR_SUCCESS;\n}\n")
+    s = sub(p, s, "static XrResult klxr_DestroyPassthroughLayerFB(void *l)      { (void)l; return KLXR_SUCCESS; }\n"
+                  "static XrResult klxr_PassthroughLayerPauseFB(void *l)        { (void)l; return KLXR_SUCCESS; }\n"
+                  "static XrResult klxr_PassthroughLayerResumeFB(void *l)       { (void)l; return KLXR_SUCCESS; }\n",
+        "static XrResult klxr_DestroyPassthroughLayerFB(void *l)      { (void)l; g_pt_layer_live = 0; klxr_pt_update(); return KLXR_SUCCESS; }\n"
+        "static XrResult klxr_PassthroughLayerPauseFB(void *l)        { (void)l; g_pt_layer_running = 0; klxr_pt_update(); return KLXR_SUCCESS; }\n"
+        "static XrResult klxr_PassthroughLayerResumeFB(void *l)       { (void)l; g_pt_layer_running = 1; klxr_pt_update(); return KLXR_SUCCESS; }\n")
+    open(p, "w").write(s)
+print("overlay: passthrough — see-through eye pass while a title's passthrough layer runs (XR_FB_passthrough)")
+PYEOF

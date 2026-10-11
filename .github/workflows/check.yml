@@ -102,3 +102,10 @@ jobs:
 
       - name: Compile runtime and typecheck the app
         run: cd "$K" && make xros
+
+      # The compositor's shaders are C strings compiled on the device at run
+      # time; a mistake in one would otherwise show only as every title black.
+      - name: Compile the compositor's Metal shaders
+        run: |
+          xcrun -sdk xros metal --version >/dev/null 2>&1 || xcodebuild -downloadComponent MetalToolchain
+          tools/metavision-msl-check --compile "$K"

@@ -66,10 +66,13 @@ enum MetavisionShots {
                   to: buf, destinationOffset: 0, destinationBytesPerRow: bpr, destinationBytesPerImage: bpr * h)
         blit.endEncoding()
         let flip = !flipY                // GL storage is bottom-up; a PNG is top-down
+        // Passthrough: the title's alpha is what lets the room show, so it is
+        // measured, and the PNG shows see-through areas as a grey checker.
+        let seeThrough = kl_reproject_passthrough() != 0
         nonisolated(unsafe) let b = buf
         cb.addCompletedHandler { _ in
             DispatchQueue.global(qos: .utility).async {
-                write(b, w: w, h: h, bpr: bpr, bgra: bgra, flip: flip, index: index)
+                write(b, w: w, h: h, bpr: bpr, bgra: bgra, flip: flip, seeThrough: seeThrough, index: index)
                 done()
             }
         }
@@ -78,12 +81,13 @@ enum MetavisionShots {
 
     private static func done() { lock.lock(); busy = false; lock.unlock() }
 
-    private static func write(_ buf: MTLBuffer, w: Int, h: Int, bpr: Int, bgra: Bool, flip: Bool, index: Int) {
+    private static func write(_ buf: MTLBuffer, w: Int, h: Int, bpr: Int, bgra: Bool, flip: Bool,
+                              seeThrough: Bool, index: Int) {
         let step = max(1, w / width)
         let ow = w / step, oh = h / step
         let src = buf.contents().assumingMemoryBound(to: UInt8.self)
         var out = [UInt8](repeating: 255, count: ow * oh * 4)
-        var sum = 0.0, sumSq = 0.0, lit = 0, edges = 0
+        var sum = 0.0, sumSq = 0.0, lit = 0, edges = 0, clear = 0
         for y in 0..<oh {
             let sy = flip ? (h - 1 - y * step) : y * step
             var prev = -1.0
@@ -92,6 +96,15 @@ enum MetavisionShots {
                 let r = Int(bgra ? p[2] : p[0]), g = Int(p[1]), bl = Int(bgra ? p[0] : p[2])
                 let o = (y * ow + x) * 4
                 out[o] = UInt8(r); out[o + 1] = UInt8(g); out[o + 2] = UInt8(bl)
+                if seeThrough {
+                    // Premultiplied colour over a checker that stands in for the room.
+                    let a = Int(p[3])
+                    if a < 128 { clear += 1 }
+                    let bg = ((x / 16 + y / 16) % 2 == 0) ? 96 : 160
+                    out[o] = UInt8(min(255, r + bg * (255 - a) / 255))
+                    out[o + 1] = UInt8(min(255, g + bg * (255 - a) / 255))
+                    out[o + 2] = UInt8(min(255, bl + bg * (255 - a) / 255))
+                }
                 let luma = 0.299 * Double(r) + 0.587 * Double(g) + 0.114 * Double(bl)
                 sum += luma; sumSq += luma * luma
                 if luma > 24 { lit += 1 }
@@ -114,7 +127,8 @@ enum MetavisionShots {
             CGImageDestinationAddImage(dest, img, nil)
             CGImageDestinationFinalize(dest)
         }
-        NSLog("[mv-shot] %@ mean %.0f spread %.0f lit %.0f%% detail %.1f%%", url.lastPathComponent as NSString,
-              mean, spread, 100 * Double(lit) / n, 100 * Double(edges) / n)
+        NSLog("[mv-shot] %@ mean %.0f spread %.0f lit %.0f%% detail %.1f%%%@", url.lastPathComponent as NSString,
+              mean, spread, 100 * Double(lit) / n, 100 * Double(edges) / n,
+              seeThrough ? String(format: " see-through %.0f%%", 100 * Double(clear) / n) as NSString : "" as NSString)
     }
 }

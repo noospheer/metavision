@@ -38,7 +38,9 @@ HANDS = "[mv-hands] the title reads hand state"
 SERIOUS = re.compile(r"Exception|GLSL compilation failed|Kernel at index|Shader error|"
                      r"Failed to (create|compile|load)|is not supported|shader compiler platform", re.I)
 AUDIO = re.compile(r"guest PCM so far: peak (\d+)/")
-SHOT = re.compile(r"\[mv-shot\] (shot_\d+\.png) mean (\d+) spread (\d+|nan) lit (\d+)%(?: detail ([\d.]+)%)?")
+SHOT = re.compile(r"\[mv-shot\] (shot_\d+\.png) mean (\d+) spread (\d+|nan) lit (\d+)%(?: detail ([\d.]+)%)?(?: see-through (\d+)%)?")
+# The compositor's see-through mode, on while a title's passthrough layer runs.
+PT_ON = re.compile(r"\[passthrough\] on\b")
 # GLES compute and storage buffers (ES 3.1) are not available on the ES 3.0
 # context: Unity's compute shaders come back as shader 0 ("no infolog") and its
 # std430 blocks do not compile. A known limitation, reported, not an error.
@@ -93,7 +95,11 @@ def unity_errors(text: str, shipped):
 def shot_has_content(m) -> bool:
     """A screenshot with a picture: lit and varied, or detailed — a starfield or
     a thin grid is dim but drawn (1.5% of pixels on a sharp edge; controller
-    rays alone stay under 1%)."""
+    rays alone stay under 1%). With passthrough on, a shot where the title left
+    part of the view see-through shows the room there: that is a picture too —
+    but not a shot that is all room, where the title drew nothing over it."""
+    if m.group(6) is not None and 1 <= int(m.group(6)) < 99:
+        return True
     lit_ok = int(m.group(4)) >= 3 and (m.group(3) != "nan" and int(m.group(3)) >= 4)
     return lit_ok or (m.group(5) is not None and float(m.group(5)) >= 1.5)
 
@@ -121,15 +127,20 @@ def triage(d: Path):
     shots = list(SHOT.finditer(text))
     if shots:
         dark = [sh for sh in shots if not shot_has_content(sh)]
-        if all(int(sh.group(4)) == 0 and float(sh.group(5) or 0) == 0 for sh in shots):
+        if all(int(sh.group(4)) == 0 and float(sh.group(5) or 0) == 0 and int(sh.group(6) or 0) == 0 for sh in shots):
             notes.append(f"BLACK CONTENT: all {len(shots)} screenshot(s) dark or flat")
+        elif all(int(sh.group(6) or 0) >= 99 for sh in shots):
+            notes.append(f"DARK CONTENT: room only — all {len(shots)} screenshot(s) see-through, nothing drawn over passthrough")
         elif len(shots) - len(dark) < 2:
             # Something drawn, but at most one shot with real content: a sparse or
             # dark scene, or only the controllers. Never a pass, never "black".
             notes.append(f"DARK CONTENT: {len(shots) - len(dark)}/{len(shots)} screenshot(s) show content")
         else:
             notes.append(f"screenshots: {len(shots)} ({len(dark)} dark/flat) in this folder")
-    if PASSTHROUGH.search(text):
+    if PT_ON.search(text):
+        through = [int(sh.group(6)) for sh in shots if sh.group(6) is not None]
+        notes.append("passthrough on" + (f": the room shows through {sum(through) // len(through)}% of the view on average" if through else ""))
+    elif PASSTHROUGH.search(text):
         notes.append("needs passthrough (not available)")
     if GLES_COMPUTE.search(text):
         notes.append("needs GLES compute (not available): its compute effects are missing")

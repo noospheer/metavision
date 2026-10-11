@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""metavision-msl-check — compile the compositor's Metal shaders ahead of time.
+
+The compositor's shaders live in C string literals (kl_reproject.c) and are
+compiled by the device at run time, so a typo in one is otherwise found only
+when every title draws nothing. This pulls each `static const char kl_msl_*[]`
+literal out of the (overlaid) source and, with --compile, runs Apple's Metal
+compiler over it for visionOS.
+
+usage: tools/metavision-msl-check [--compile] [KLEPTON_DIR]
+"""
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ESC = {"n": "\n", "t": "\t", '"': '"', "\\": "\\", "'": "'", "0": "\0"}
+
+
+def literals(src: str):
+    for m in re.finditer(r"static const char (kl_msl_\w+)\[\]\s*=", src):
+        i, out = m.end(), []
+        while True:
+            # Skip whitespace and // comments between the literal's pieces.
+            while True:
+                ws = re.compile(r"\s+|//[^\n]*").match(src, i)
+                if not ws:
+                    break
+                i = ws.end()
+            if src[i] == ";":
+                break
+            if src[i] != '"':
+                sys.exit(f"msl-check: {m.group(1)}: unexpected {src[i:i + 20]!r}")
+            i += 1
+            while src[i] != '"':
+                if src[i] == "\\":
+                    out.append(ESC.get(src[i + 1], src[i + 1]))
+                    i += 2
+                else:
+                    out.append(src[i])
+                    i += 1
+            i += 1
+        yield m.group(1), "".join(out)
+
+
+def main():
+    args = sys.argv[1:]
+    compile_ = "--compile" in args
+    args = [a for a in args if a != "--compile"]
+    k = Path(args[0] if args else Path(__file__).resolve().parent.parent / "vendor/klepton")
+    src = (k / "runtime/gfx/kl_reproject.c").read_text()
+    found = list(literals(src))
+    if not found:
+        sys.exit("msl-check: no kl_msl_* shaders found")
+    bad = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, code in found:
+            f = Path(tmp) / f"{name}.metal"
+            f.write_text(code)
+            if not compile_:
+                print(f"msl-check: {name}: {len(code)} bytes")
+                continue
+            r = subprocess.run(["xcrun", "-sdk", "xros", "metal", "-c", str(f), "-o", str(f.with_suffix(".air"))],
+                               capture_output=True, text=True)
+            print(f"msl-check: {name}: {'ok' if r.returncode == 0 else 'FAILED'}")
+            if r.returncode:
+                bad += 1
+                print(r.stderr, file=sys.stderr)
+    sys.exit(1 if bad else 0)
+
+
+if __name__ == "__main__":
+    main()
