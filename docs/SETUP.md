@@ -307,11 +307,17 @@ minute. `--no-adaptive` always runs the full time. The headset can come off at
 any point: the runner sees it asleep, puts the run back, and `test` again
 carries on.
 
-Autoplay also **presses Unity UI buttons directly** (`MV_AUTOPLAY_UI`, on with
-`MV_AUTOPLAY`): every 4 s from 10 s in, the least-pressed active, interactable
-Button, Toggle or Dropdown, skipping labels that read like leaving the title
-(quit, exit, back, home, reset). Each press is logged with its label
-(`[mv-autoplay-ui] pressed 'English'`).
+Autoplay also **presses what each title calls selectable, directly**
+(`MV_AUTOPLAY_UI`, on with `MV_AUTOPLAY`): every 4 s from 10 s in, the
+least-pressed active element of Unity UI (Button, Toggle, Dropdown, a title's
+own Selectable), the Interaction SDK's event wrappers, the XR Interaction
+Toolkit's interactables, pointer-handler scripts, or press-named `UnityEvent`
+fields, released 300 ms later — skipping names that read like leaving the
+title (quit, exit, back, home, reset; camelCase too). Each press is logged
+(`[mv-autoplay-ui] pressed 'English'`), and `[mv-autoplay-ui] coverage N/M`
+says how many of the elements found have been pressed; triage reports it.
+`MV_AUTOPLAY_UI_FAMILIES` (default `ui,isdk,xri,click,event`),
+`MV_AUTOPLAY_UI_HOLD_MS`, `_GAP` and `_MAX` tune it.
 
 A **hands-only** title (its manifest requires `oculus.software.handtracking`)
 is opened with a **two-hand start gesture**: both hands up in front of the

@@ -72,6 +72,10 @@ that will not start, and what is still open.
 | the input probe read `KL_PROBE_INPUT` and ignored it | every Unity title ran the probe (managed calls, class constructors, scene searches every 120 frames) unasked | it runs only when asked; its axis-name strings are made at the call | overlay step 62 |
 | (diagnostic) whether a title sees its GPU work finish | a title that pools render targets made a new one every frame and never destroyed its views | `KL_TRACE_VK_LIFE=1`: once a second, submits, fence waits and status results, timeline-semaphore signals/reads/waits, idle waits, large images and views made/destroyed/live, views whose image was destroyed first (when, and whether, each is destroyed, and by which library), footprint; on in test passes | overlay step 63 |
 | a title's `Application.Quit` made `nativeRender` answer false, which Android's UnityPlayer answers with `finish()`; the false was ignored | the title froze on its last frame; one whose watchdog checks that the quit happened crashed itself on purpose seconds later | after 30 false answers in a row the app logs `[guest] the title quit` and exits with status 0 (`KL_EXIT_ON_QUIT=0` off); triage reports **quit** with the scripted input just before it | overlay step 61 |
+| passthrough: the eye picture was always composited opaque | a title that turns on Meta passthrough leaves its background clear for the cameras behind it: black | while a title's passthrough layer runs (OpenXR `XR_FB_passthrough` or an OVRPlugin reconstruction/surface-projected layer), the eye pass keeps the title's alpha, premultiplied, over the visionOS passthrough; screenshots log the see-through share and show it as a grey checker; triage counts the room as a picture, but not a frame that is all room (`KL_PASSTHROUGH=0` opaque, `=1` forced). Styles and colour maps cannot be applied: the camera image is not available to apps | overlay step 64 |
+| a Metal texture view keeps its parent's storage | an engine build that deletes a render target's image every frame but keeps its views reached the memory limit in two seconds | a destroyed image that still has views has its storage emptied (`setPurgeableState(Empty)`) a quarter second later; no view handle is touched (`KL_VK_PURGE_ORPHANS=0` off); `[vk-life]` counts what was emptied | overlay step 65 |
+| autoplay pressed only Unity UI controls | 32 of 41 titles had nothing it could press | it also presses Interaction SDK event wrappers, XR Interaction Toolkit interactables (with an interactor the scene has), pointer-handler scripts and press-named `UnityEvent` fields; one element per tick, least-pressed first, in the same order every run; unsafe words now also caught in camelCase; `[mv-autoplay-ui] coverage N/M` per title (`MV_AUTOPLAY_UI_FAMILIES`) | overlay step 66 |
+| every title was told OVRPlugin 1.60 | a title's C# gates features on the plugin version: below 1.86 it decided a controller was in the hand, so hand data never became valid (hand-particle titles drew nothing); below 1.71 Unity OpenXR titles switched Meta's feature off | each title is told the version it shipped with (read from its `libOVRPlugin.so` into the launcher catalogue; `KL_OVRP_VERSION` overrides); `ovrp_UnityOpenXR_*` answered (the GetInstanceProcAddr hook hands the function back — a null answer crashed three titles in the A/B), `ovrp_GetControllerIsInHand` (no controller held while hands are tracked), eye layer size, and Insight Passthrough (initialise, state, support, styles, meshes, surface geometry) | overlay steps 67, 68 |
 | (test) autoplay pressed Menu at 12 s | a title answering Menu with a quit ended before the rest of its input was tried | Menu (controller and voice) from about 30 s in | `klepton-overlay/MetavisionAutoplay.swift` |
 | GLES compute and storage buffers (ES 3.1) on the ES 3.0 context | compute shaders come back as shader 0 ("no infolog"); std430 blocks do not compile; GPU skinning, compute effects and instanced particles are missing | known limitation: triage notes it and does not count it as an error | — |
 | (diagnostic) release builds carry no managed stack traces, so an exception logged every frame named nothing | a title threw a NullReferenceException every frame with no trace | Unity's dlsym of `il2cpp_runtime_invoke` gets a wrapper that logs `[mv-throw] Class.Method threw Type` once per distinct pair (`MV_LOG_THROWS=0` off) | shims/mv_shims.c |
@@ -166,11 +170,14 @@ OVRPlugin call in order — the step where a title stops is the last one.
   Services invalidates the layer renderer and the render loop ends. The hung
   work is most likely ANGLE's Metal work for the title's GL frame. Next: a run
   with Metal shader validation to find the draw.
-- **A depth buffer allocated every frame** in one Vulkan Unity title (about 100
-  in 1.5 s, where others make 3 to 6): memory climbs by gigabytes in a second
-  and the process is killed for memory with no crash report. Why Unity
-  reallocates is not established; next, a count of live attachment images and
-  the memory each is bound to.
+- **A depth buffer allocated every frame** in one Vulkan Unity title: the
+  engine destroys each image but keeps its views behind its own reference
+  count; step 65 empties that storage. Why it reallocates every frame is not
+  established (likely a 24-bit depth request answered with 32-bit).
+- **GLES compute** for titles shipped with GLES shaders only: their compute
+  effects need compute on the GLES path (ANGLE's Metal backend has none) or
+  ANGLE on Vulkan. A project of its own.
+- **Environment depth / raycasts** (`XR_META_environment_depth`): not offered.
 - **Hand tracking in OpenXR titles.** metavision's hands reach titles through
   OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
 - **An OpenXR title exits on its own about 5 s in**, after its first frames,
