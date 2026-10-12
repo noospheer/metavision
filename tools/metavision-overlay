@@ -16550,3 +16550,136 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: a stopped or closed AAudio stream gives its mixer slot back")
 PYEOF
+
+# 168 — two older hazards beside the mixer slots of steps 165-167.
+#  - kl_audio_close freed the ring and the converter's scratch under the unit
+#    lock only, and kl_audio_open (a second stream in another format) and
+#    kl_audio_restart (a rate change; from the watchdog thread, the session
+#    notifications or a write's own watchdog) replaced them the same way,
+#    while another producer could be inside kl_audio_write_src using them. They
+#    now exclude writes through the gate in shims/mv_mixslots.h (host-tested):
+#    raise a flag that makes a writer waiting for room return short at once
+#    (as on a stop) and that holds back new writers, then take the write lock,
+#    then the unit lock (the order a write that runs the watchdog already
+#    takes them in). A write re-checks, under the write lock, that the device
+#    is open in the format it measured its input in. A rebuild from inside a
+#    write does not take the write lock again. Reopening in the same format
+#    leaves writers alone, as before.
+#  - OpenSL ES had four player slots and a fifth CreateAudioPlayer stopped and
+#    wiped slot 0, a player the guest still owned and might be playing. Now 16
+#    slots, a slot is the guest's from CreateAudioPlayer to Destroy (a player
+#    created but not yet realized is no longer handed out twice), and a full
+#    table refuses with SL_RESULT_MEMORY_FAILURE, logged.
+python3 - "$K/runtime/media/kl_audio.c" "$K/runtime/media/kl_opensl.c" <<'PYEOF'
+import sys
+marker = "metavision: close, open and restart exclude writes (step 168)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "static pthread_mutex_t  g_wlock = PTHREAD_MUTEX_INITIALIZER;\n",
+        "static pthread_mutex_t  g_wlock = PTHREAD_MUTEX_INITIALIZER;\n"
+        "static atomic_int       g_wexcl;   // " + marker + ": >0 while the ring is replaced\n")
+    # the unit-level open, close and restart keep their bodies; the public
+    # names wrap them in the gate
+    s = sub(p, s, "int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {\n",
+        "static int mv_audio_open_unit(unsigned rate, unsigned channels, unsigned bits) {\n")
+    s = sub(p, s, "void kl_audio_close(void) {\n", "// " + marker + r'''
+int kl_audio_open(unsigned rate, unsigned channels, unsigned bits) {
+    pthread_mutex_lock(&g_lock);
+    int same = g_open && rate == g_in_rate && channels == g_in_ch && bits == g_in_bits;
+    pthread_mutex_unlock(&g_lock);
+    if (same) return mv_audio_open_unit(rate, channels, bits);   // touches nothing
+    int took = mv_mix_exclude(&g_wlock, &g_wexcl);
+    int rc = mv_audio_open_unit(rate, channels, bits);
+    mv_mix_admit(&g_wlock, &g_wexcl, took);
+    return rc;
+}
+
+static void mv_audio_close_unit(void) {
+''')
+    s = sub(p, s, "int kl_audio_active(void) {", "// " + marker + r'''
+void kl_audio_close(void) {
+    int took = mv_mix_exclude(&g_wlock, &g_wexcl);
+    mv_audio_close_unit();
+    mv_mix_admit(&g_wlock, &g_wexcl, took);
+}
+
+int kl_audio_active(void) {''')
+    s = sub(p, s, "int kl_audio_restart(void) {\n", "static int mv_audio_restart_unit(void) {\n")
+    s = sub(p, s, "void kl_audio_session_ready(double sample_rate) {\n", "// " + marker + r'''
+int kl_audio_restart(void) {
+    if (!g_open) return -1;
+    int took = mv_mix_exclude(&g_wlock, &g_wexcl);   // not again from inside a write
+    int rc = mv_audio_restart_unit();
+    mv_mix_admit(&g_wlock, &g_wexcl, took);
+    return rc;
+}
+
+void kl_audio_session_ready(double sample_rate) {
+''')
+    s = sub(p, s, "    pthread_mutex_lock(&g_wlock);\n\n    float *conv = NULL;\n",
+        "    mv_mix_write_enter(&g_wlock, &g_wexcl);   // " + marker + "\n"
+        "    // closed, or reopened in another format, since the check above\n"
+        "    if (!g_open || !g_ring || g_in_ch * 2 != in_frame) { mv_mix_write_leave(&g_wlock); return 0; }\n"
+        "\n    float *conv = NULL;\n")
+    s = sub(p, s, "    if (!frames) { pthread_mutex_unlock(&g_wlock); return 0; }\n",
+        "    if (!frames) { mv_mix_write_leave(&g_wlock); return 0; }\n")
+    s = sub(p, s, "    if (slot < 0) { pthread_mutex_unlock(&g_wlock); return 0; }\n",
+        "    if (slot < 0) { mv_mix_write_leave(&g_wlock); return 0; }\n")
+    s = sub(p, s, "    pthread_mutex_unlock(&g_wlock);\n    return written == frames ? bytes : written * in_frame;\n",
+        "    mv_mix_write_leave(&g_wlock);\n    return written == frames ? bytes : written * in_frame;\n")
+    s = sub(p, s, "        if (!g_playing || g_interrupted) break;\n",
+        "        if (!g_playing || g_interrupted) break;\n"
+        "        if (mv_mix_write_yield(&g_wexcl)) break;   // the ring is being replaced\n")
+    open(p, "w").write(s)
+
+p = sys.argv[2]
+s = open(p).read()
+marker = "metavision: 16 OpenSL players, a full table refuses (step 168)"
+if marker not in s:
+    s = sub(p, s, "#define SL_RESULT_FEATURE_UNSUPPORTED 12\n",
+        "#define SL_RESULT_FEATURE_UNSUPPORTED 12\n"
+        "#define SL_RESULT_MEMORY_FAILURE      3    // " + marker + "\n")
+    s = sub(p, s, "#define KL_SL_MAX_PLAYERS 4\n", "#define KL_SL_MAX_PLAYERS 16   // " + marker + "\n")
+    s = sub(p, s, "    int             running, started;\n",
+        "    int             running, started;\n"
+        "    int             claimed;                // the guest's, CreateAudioPlayer to Destroy (step 168)\n")
+    s = sub(p, s, "    if (p) { player_stop(p); return; }\n",
+        "    if (p) {\n"
+        "        player_stop(p);\n"
+        "        pthread_mutex_lock(&g_players_lock);   // " + marker + "\n"
+        "        p->claimed = 0;\n"
+        "        pthread_mutex_unlock(&g_players_lock);\n"
+        "        return;\n"
+        "    }\n")
+    s = sub(p, s, r'''    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++)
+        if (!g_players[i].started) { p = &g_players[i]; break; }
+    if (!p) p = &g_players[0];
+    pthread_mutex_unlock(&g_players_lock);
+''', r'''    // ''' + marker + r''': a slot the guest still owns (created, realized or
+    // not, and not destroyed) is never taken back; a full table refuses.
+    for (int i = 0; i < KL_SL_MAX_PLAYERS; i++)
+        if (!g_players[i].started && !g_players[i].claimed) { p = &g_players[i]; break; }
+    if (p) p->claimed = 1;
+    pthread_mutex_unlock(&g_players_lock);
+    if (!p) {
+        static unsigned said;
+        if (said++ < 16)
+            fprintf(stderr, "  [sl] CreateAudioPlayer: all %d players are in use — refused "
+                            "(SL_RESULT_MEMORY_FAILURE), no live player taken\n", KL_SL_MAX_PLAYERS);
+        if (out) *out = NULL;
+        return SL_RESULT_MEMORY_FAILURE;
+    }
+''')
+    # the claim is read under g_players_lock: the wipe must not show it clear
+    s = sub(p, s, "    memset(p, 0, sizeof *p);\n    p->generation = gen;\n",
+        "    pthread_mutex_lock(&g_players_lock);\n"
+        "    memset(p, 0, sizeof *p);\n    p->generation = gen;\n    p->claimed = 1;\n"
+        "    pthread_mutex_unlock(&g_players_lock);\n")
+    open(p, "w").write(s)
+print("overlay: close/open/restart exclude writes; 16 OpenSL players, a full table refuses")
+PYEOF

@@ -1,11 +1,15 @@
 // Host test for mv_mixslots.h, the audio mixer's producer slots: register,
-// release, reuse, a full table, and producers coming and going on several
-// threads under one write lock while a reader advances (as in kl_audio.c).
+// release, reuse, a full table, producers coming and going on several threads
+// under one write lock while a reader advances (as in kl_audio.c), and the
+// gate that lets a close free the ring under writers waiting in it.
 #include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 #include "../mv_mixslots.h"
 
 #define CAP 48001u
@@ -130,9 +134,76 @@ static void threads(void) {
     assert(atomic_load(&writes) > 0);
 }
 
+// ---- the gate: close/reopen frees the ring while writers wait in it ----
+static pthread_mutex_t gwlock = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int gexcl;
+static float *gring;                   // touched only under gwlock
+static int gopen;
+static _Atomic int gstop;
+static _Atomic long gwrites, gbailed;
+
+static uint64_t now_ms(void) {
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+static void nap_ms(int ms) { struct timespec t = {0, ms * 1000000L}; nanosleep(&t, NULL); }
+
+static void *gate_writer(void *a) {
+    (void)a;
+    while (!atomic_load(&gstop)) {
+        mv_mix_write_enter(&gwlock, &gexcl);
+        if (!gopen || !gring) { mv_mix_write_leave(&gwlock); nap_ms(1); continue; }
+        // a device rebuilt from inside the write (the writer's watchdog) does
+        // not take the lock again
+        int took = mv_mix_exclude(&gwlock, &gexcl);
+        assert(!took);
+        mv_mix_admit(&gwlock, &gexcl, took);
+        // the ring is full and nothing drains it: wait as kl_audio does, up to
+        // a 2 s deadline, unless someone needs the ring
+        uint64_t deadline = now_ms() + 2000;
+        while (!mv_mix_write_yield(&gexcl) && now_ms() < deadline) nap_ms(2);
+        if (mv_mix_write_yield(&gexcl)) atomic_fetch_add(&gbailed, 1);
+        memset(gring, 0, 4096 * sizeof(float));   // still ours: no one freed it
+        atomic_fetch_add(&gwrites, 1);
+        mv_mix_write_leave(&gwlock);
+    }
+    return NULL;
+}
+
+static void gate(void) {
+    gring = calloc(4096, sizeof(float)); gopen = 1;
+    pthread_t w[4];
+    for (int i = 0; i < 4; i++) pthread_create(&w[i], NULL, gate_writer, NULL);
+    nap_ms(20);
+    uint64_t worst = 0;
+    for (int round = 0; round < 100; round++) {
+        uint64_t t0 = now_ms();
+        int took = mv_mix_exclude(&gwlock, &gexcl);          // close
+        uint64_t waited = now_ms() - t0;
+        if (waited > worst) worst = waited;
+        assert(took);
+        free(gring); gring = NULL; gopen = 0;
+        mv_mix_admit(&gwlock, &gexcl, took);
+        took = mv_mix_exclude(&gwlock, &gexcl);              // open again
+        gring = calloc(4096, sizeof(float)); gopen = 1;
+        mv_mix_admit(&gwlock, &gexcl, took);
+        nap_ms(3);
+    }
+    atomic_store(&gstop, 1);
+    for (int i = 0; i < 4; i++) pthread_join(w[i], NULL);
+    free(gring);
+    // writers parked in their wait were let out at once, not after the deadline
+    assert(worst < 500);
+    assert(atomic_load(&gbailed) > 0);
+    printf("t_mixslots: gate ok (100 close/open with 4 waiting writers, worst wait %llu ms, "
+           "%ld writes, %ld let out early)\n", (unsigned long long)worst,
+           atomic_load(&gwrites), atomic_load(&gbailed));
+}
+
 int main(void) {
     basics();
     threads();
+    gate();
     printf("t_mixslots: ok (%d slots; threaded run: %ld writes, %ld reclaimed, %ld refused)\n",
            MV_MIX_MAX_SRC, atomic_load(&writes), atomic_load(&reclaimed_n),
            atomic_load(&refused));

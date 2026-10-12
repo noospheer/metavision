@@ -16,7 +16,10 @@
 // whose producer still has audio ahead of the reader is LIVE and is never
 // taken.
 #pragma once
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
+#include <time.h>
 
 #define MV_MIX_MAX_SRC 16
 
@@ -65,4 +68,48 @@ static inline int mv_mix_slot_release(const void **keys, uint64_t *pos, int *n,
         return 1;
     }
     return 0;
+}
+
+// ---- the gate between writers and whoever replaces the ring (step 168) ----
+//
+// A write holds the mixer's write lock for its whole length, including its
+// wait for room in the ring. Closing, reopening or rebuilding the device frees
+// and replaces the ring, so it must exclude writes: it raises `excl` (a writer
+// waiting for room sees it and returns short at once, as on a stop) and then
+// takes the write lock, so it never waits out a writer's full deadline. A
+// writer re-checks that the device is open once it holds the lock. The device
+// can be rebuilt from inside a write (the writer's own watchdog); that thread
+// already holds the lock and is marked in-write, so it does not take it again.
+static _Thread_local int mv_mix_in_write;
+
+// A writer arriving while the ring is being replaced stands back until it is
+// done: the lock is not fair, and a feeder that writes back to back would
+// otherwise take it again ahead of the closer, over and over.
+static inline void mv_mix_write_enter(pthread_mutex_t *wlock, atomic_int *excl) {
+    while (atomic_load_explicit(excl, memory_order_acquire) > 0) {
+        struct timespec t = {0, 500000};
+        nanosleep(&t, NULL);
+    }
+    pthread_mutex_lock(wlock);
+    mv_mix_in_write = 1;
+}
+static inline void mv_mix_write_leave(pthread_mutex_t *wlock) {
+    mv_mix_in_write = 0;
+    pthread_mutex_unlock(wlock);
+}
+// A writer waiting for room gives up when this is set.
+static inline int mv_mix_write_yield(atomic_int *excl) {
+    return atomic_load_explicit(excl, memory_order_acquire) > 0;
+}
+// Returns whether it took the lock (pass that to mv_mix_admit).
+static inline int mv_mix_exclude(pthread_mutex_t *wlock, atomic_int *excl) {
+    if (mv_mix_in_write) return 0;
+    atomic_fetch_add_explicit(excl, 1, memory_order_acq_rel);
+    pthread_mutex_lock(wlock);
+    return 1;
+}
+static inline void mv_mix_admit(pthread_mutex_t *wlock, atomic_int *excl, int took) {
+    if (!took) return;
+    pthread_mutex_unlock(wlock);
+    atomic_fetch_sub_explicit(excl, 1, memory_order_acq_rel);
 }
