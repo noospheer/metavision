@@ -13072,3 +13072,90 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: a crash Klepton catches clears the load guard's record")
 PYEOF
+
+# 138 — the load guard refuses on the second strike, not the first. The test
+# runner, and the wearer, end a title by killing the process, and that can land
+# in the middle of loading a late-loaded plugin: one such kill must not refuse
+# the plugin for good. A launch found dead mid-load of a library now records a
+# strike (.klepton-dlstrike beside the list) and logs it; the library is
+# refused only when the NEXT launch also dies loading it. A launch that loads
+# it to the end clears the strike, and a death in a different library moves
+# the strike there, so the two deaths must be consecutive and the same
+# library. Code signing's kill is deterministic, so a real one costs exactly
+# one extra launch. The engine-library exemption and the caught-crash rule
+# (step 137) are unchanged; KL_DLOPEN_GUARD_RESET=1 clears the strike too.
+python3 - "$K/runtime/kl_dl.c" <<'PYEOF'
+import sys
+marker = "metavision: the load guard's two strikes (step 138)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "static void kl_guard_init_locked(void) {\n"
+    s = sub(p, s, old, "// " + marker + r'''
+// The library the previous launch also died loading, or NULL; and its file.
+static char  g_guard_strike_path[1024];
+static char *g_guard_strike;
+static void kl_guard_strike_load_locked(void) {
+    FILE *f = fopen(g_guard_strike_path, "r");
+    if (!f) return;
+    char line[256];
+    if (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (*line) g_guard_strike = strdup(line);
+    }
+    fclose(f);
+}
+// A launch died loading `killed`. 1: first strike, recorded and not refused.
+// 0: the launch before died loading it too, so refuse it.
+static int kl_guard_strike_one_locked(const char *killed) {
+    if (g_guard_strike && kl_guard_same(g_guard_strike, killed)) {
+        unlink(g_guard_strike_path);
+        free(g_guard_strike);
+        g_guard_strike = NULL;
+        return 0;
+    }
+    free(g_guard_strike);
+    g_guard_strike = strdup(killed);
+    int fd = open(g_guard_strike_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd >= 0) {
+        char l[300];
+        int ln = snprintf(l, sizeof l, "%.255s\n", killed);
+        if (ln > 0 && write(fd, l, (size_t)ln) == ln) fsync(fd);
+        close(fd);
+    }
+    fprintf(stderr, "  [dl] %s: previous launch died while loading it (strike 1 of 2: "
+                    "refused only if the next launch dies loading it too)\n", killed);
+    return 1;
+}
+// It loaded to the end: whatever killed a launch during its load before, it
+// was not the library.
+static void kl_guard_strike_clear_locked(const char *base) {
+    if (!g_guard_strike || !kl_guard_same(g_guard_strike, base)) return;
+    unlink(g_guard_strike_path);
+    fprintf(stderr, "  [dl] %s loaded: its strike is cleared\n", g_guard_strike);
+    free(g_guard_strike);
+    g_guard_strike = NULL;
+}
+
+''' + old)
+    old = '    snprintf(g_guard_list, sizeof g_guard_list, "%s/.klepton-dlrefused", dir);\n'
+    s = sub(p, s, old, old +
+            '    snprintf(g_guard_strike_path, sizeof g_guard_strike_path, "%s/.klepton-dlstrike", dir);   // ' + marker + '\n')
+    old = "        unlink(gp);\n"
+    s = sub(p, s, old, old + "        unlink(g_guard_strike_path);   // " + marker + "\n")
+    old = "    int fd = open(gp, O_RDWR | O_CREAT | O_CLOEXEC, 0644);\n"
+    s = sub(p, s, old, "    kl_guard_strike_load_locked();   // " + marker + "\n" + old)
+    old = "        } else if (!kl_guard_listed_locked(killed) && g_guard_nrefused < KL_GUARD_REFUSED) {\n"
+    s = sub(p, s, old,
+            "        } else if (!kl_guard_listed_locked(killed) && kl_guard_strike_one_locked(killed)) {\n"
+            "            // " + marker + ": first strike, recorded and logged, not refused\n" + old)
+    old = ("                g_guard_depth--;\n"
+           "                kl_guard_write_locked(0);\n")
+    s = sub(p, s, old, old + "                kl_guard_strike_clear_locked(b);   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: the load guard refuses a library on the second consecutive killed launch")
+PYEOF

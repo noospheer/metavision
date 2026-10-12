@@ -33,9 +33,11 @@ ITERS = re.compile(r"\[cp\] alive: (\d+) iters")
 FATAL = re.compile(r"fatal: (.*)")
 FAULT = re.compile(r"fault: signal (\d+) at (0x[0-9a-f]+), pc (\S+)")
 DLFAIL = re.compile(r'guest dlopen\("([^"]+)"\) FAILED')
-# The load guard (overlay step 136): a library whose load killed a launch
-# (an uncatchable kill, e.g. code signing) is refused from then on.
+# The load guard (overlay steps 136, 138): a library two consecutive launches
+# died loading (an uncatchable kill, e.g. code signing) is refused from then
+# on; the first such death is only a strike.
 GUARDED = re.compile(r"\[dl\] (\S+) (?:killed the previous launch during load|refused: it killed an earlier launch)")
+GUARD_STRIKE = re.compile(r"\[dl\] (\S+): previous launch died while loading it \(strike 1 of 2")
 GUARD_ESSENTIAL = re.compile(r"\[dl\] (\S+) was loading when the previous launch died")
 START = re.compile(r"^\[hb\] (\S+)")
 SHIM = re.compile(r"\[mv-shim\] (.*)")
@@ -281,11 +283,13 @@ def triage(d: Path):
     # Quest makes too.
     shipped = shipped_libs(d)
     killers = guarded(text)
-    notes = [f"could not load {n}" + (": refused after a killed launch (it was loading when an earlier "
-                                       "launch was killed; KL_DLOPEN_GUARD_RESET=1 retries it)" if n in killers else "")
+    notes = [f"could not load {n}" + (": refused after killed launches (two launches in a row died loading it; "
+                                       "KL_DLOPEN_GUARD_RESET=1 retries it)" if n in killers else "")
              for n in load_failures(text, shipped)]
     for m in GUARD_ESSENTIAL.finditer(text):
         notes.append(f"the previous launch was killed while loading {m.group(1)} (an engine library: not refused)")
+    for n in sorted({m.group(1) for m in GUARD_STRIKE.finditer(text)} - set(killers)):
+        notes.append(f"the previous launch died while loading {n} (strike 1 of 2: refused if the next launch dies loading it too)")
     ending = "running when closed"
     if m := FATAL.search(text):
         ending = "stopped: " + m.group(1).strip()
