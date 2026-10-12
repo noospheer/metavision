@@ -42,8 +42,10 @@ GUARD_ESSENTIAL = re.compile(r"\[dl\] (\S+) was loading when the previous launch
 START = re.compile(r"^\[hb\] (\S+)")
 SHIM = re.compile(r"\[mv-shim\] (.*)")
 PLAY = re.compile(r"\[mv-autoplay\] (t=\S+ step \d+: .*)")
-# The presser (overlay step 66): elements pressed / found, by family.
+# The presser (overlay step 66): elements pressed / found, by family. An Unreal
+# title's (overlay step 155) logs the same line with its own families (umg, actor).
 COVER = re.compile(r"\[mv-autoplay-ui\] coverage (\d+)/(\d+) \(([^)]*)\)")
+UNREAL = "libUE4"
 PRESSER_ON = "[mv-autoplay-ui] on"
 # Why it is not on (overlay step 120), and when it can list only Unity UI.
 PRESSER_OFF = re.compile(r"\[mv-autoplay-ui\] off: ([^\n]*)")
@@ -369,7 +371,8 @@ def triage(d: Path):
     if cov := coverage(text):
         n, m, detail = cov
         notes.append(f"UI coverage {n}/{'?' if m is None else m}" + (f" ({detail})" if detail else "")
-                     + ("; no scene search, Unity UI only" if PRESSER_NOSCAN in text else ""))
+                     + ("; no scene search, Unity UI only" if PRESSER_NOSCAN in text else "")
+                     + ("; Unreal" if UNREAL in text else ""))
     elif why := presser_absent(text):
         notes.append(f"UI coverage none, presser {why[0]}: {why[1]}")
     plays = PLAY.findall(text)
@@ -428,8 +431,11 @@ def presser_absent(text: str):
         return None
     if m := PRESSER_OFF.search(text):
         return "off", m.group(1).strip()
-    if "libUE4" in text:
-        return "not attached", "an Unreal title (the presser is for Unity IL2CPP)"
+    if UNREAL in text:
+        if "[mv-autoplay] on" not in text:
+            return "not attached", "auto-play was off"
+        return "not attached", ("an Unreal title whose presser never reported (a log from before overlay step 155, "
+                                "or the engine's game thread never reached the HMD frame wait)")
     if "libunity" not in text:
         return "not attached", "not a Unity title"
     if "libil2cpp" not in text:
@@ -581,6 +587,12 @@ def main():
               f"{sum(1 for c in covs if c[1] == 0)} found nothing selectable"
               + (f"; {len(absent)} runs without the presser ("
                  + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + ")" if absent else ""))
+        ue = [c for t in texts if UNREAL in t and (c := coverage(t))]
+        ue_absent = sum(1 for t in texts if UNREAL in t and presser_absent(t))
+        if ue or ue_absent:
+            print(f"  of them Unreal: {sum(c[0] for c in ue)}/{sum(c[1] for c in ue if c[1] is not None)} elements pressed; "
+                  f"{sum(1 for c in ue if c[0])}/{len(ue)} attached runs pressed something"
+                  + (f"; {ue_absent} runs without the presser" if ue_absent else ""))
     counts = {}
     for _, v, _ in rows:
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1

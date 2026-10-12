@@ -325,9 +325,14 @@ title (quit, exit, back, home, reset; camelCase too). Each press is logged
 (`[mv-autoplay-ui] pressed 'English'`), and `[mv-autoplay-ui] coverage N/M`
 says how many of the elements found have been pressed; triage reports it, or
 why the presser never attached (`[mv-autoplay-ui] off: ...`, a run that ended
-before 10 s, a title that is not Unity IL2CPP).
+before 10 s, a title that is neither Unity IL2CPP nor Unreal).
 `MV_AUTOPLAY_UI_FAMILIES` (default `ui,isdk,xri,click,event,pointable,call,touch`),
-`MV_AUTOPLAY_UI_HOLD_MS`, `_GAP` and `_MAX` tune it.
+`MV_AUTOPLAY_UI_HOLD_MS`, `_GAP` and `_MAX` tune it. In an **Unreal Engine 4**
+title the same presser works through the engine's own exports, on its game
+thread: UMG buttons, check boxes, sliders and combo boxes that are shown and
+have a listener (`umg`), and actors with a click, cursor-over or touch listener
+or Blueprint event (`actor`); actors that only react to overlaps are counted as
+trigger-only. Its coverage line reads `coverage N/M (umg a/b, actor c/d; ...)`.
 
 A **hands-only** title (its manifest requires `oculus.software.handtracking`)
 is opened with a **two-hand start gesture**: both hands up in front of the

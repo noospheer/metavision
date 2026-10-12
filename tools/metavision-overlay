@@ -12803,6 +12803,707 @@ if marker not in s:
 print("overlay: the video player's threads: snapshots under the lock, graves wait for a context, the mixer leaves")
 PYEOF
 
+# 155 — the presser for Unreal Engine 4 titles. Step 66's presser lists and
+# presses through IL2CPP, so an Unreal title got no button pressing and no
+# coverage line. UE4's Android builds export nearly every engine symbol, so this
+# one reaches the engine by name too: classes from Z_Construct_UClass_<class>,
+# live objects from GetObjectsOfClass (class defaults, archetypes and objects
+# being loaded, unreachable or pending kill excluded), delegate and property
+# offsets from the engine's own reflection tables (the exported
+# Z_Construct_UClass_<class>_Statics::NewProp_<name> blocks, each checked by its
+# name string, kind and array size), and UObjectBase's class, name and outer
+# checked against the engine's own class names. Each tick (as step 66: from
+# _FROM s, every _EVERY s, one element, least-pressed first, at most _MAX times,
+# not again within _GAP s; the host's language first, as step 107) it gathers:
+#   umg    UButton, UCheckBox, USlider and UComboBoxString with a listener on
+#          their delegate, constructed, Visible and enabled with every ancestor
+#          enabled and not hiding them, up to a user widget in the viewport or in
+#          a visible widget component. A button is hovered and pressed, and after
+#          _HOLD_MS released, clicked and unhovered (UButton's own Slate
+#          handlers); a check box toggles (SetIsChecked, then its Slate callback
+#          broadcasts); a slider moves a quarter of its range (SetValue, then
+#          HandleOnValueChanged, inside a capture); a combo box takes its next
+#          option (SetSelectedIndex).
+#   actor  an actor with a click, cursor-over or touch listener on itself or a
+#          primitive component, or whose Blueprint implements ReceiveActorOnClicked
+#          / BeginCursorOver / OnInputTouchBegin: the cursor goes over it and it is
+#          clicked (DispatchMouseOverEvents, DispatchOnClicked with the left mouse
+#          button, DispatchOnInputTouchBegin when it listens to touch); after
+#          _HOLD_MS the touch ends and the cursor leaves. An actor that only
+#          listens to overlaps is counted as trigger-only, not pressed.
+# The release finds its object again through a weak pointer. Labels (the text
+# block on or beside a control), object names, actor class names, the functions a
+# control's delegates call ("BndEvt__QuitButton_..."), a wrapping user widget's
+# instance name, and the dialog a "Yes" agrees to are read with step 52's
+# mv_unsafe; an unsafe UMG control is disabled when first seen (step 79's guard,
+# MV_AUTOPLAY_UI_GUARD) and counted as skipped. Coverage is logged as step 66's
+# "[mv-autoplay-ui] coverage N/M (umg a/b, actor c/d; U unsafe skipped, T
+# trigger-only)". It runs only on the engine's game thread (GGameThreadId, the
+# gettid the engine stores), from step 156's frame hook; anything missing or
+# unexpected leaves it off with "[mv-autoplay-ui] off: <why>". Measured on three
+# UE 4.27 builds: every export and table resolves, the offsets agree.
+python3 - "$K/runtime/diag/kl_mprobe.c" "$K/runtime/diag/kl_mprobe.h" <<'PYEOF'
+import sys
+p, h = sys.argv[1], sys.argv[2]
+marker = "metavision: the presser for Unreal Engine 4 titles (step 155)"
+def sub(s, old, new, f):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {f}: {old[:60]!r}")
+    return s.replace(old, new)
+code = r'''// metavision: the presser for Unreal Engine 4 titles (step 155)
+// UE4's Android builds export nearly every engine symbol, so the presser
+// reaches the engine the way the Unity one reaches IL2CPP: by name, through
+// the image registry. The only fixed offsets are UObjectBase's first five
+// fields, which every UE4 release shares (and which are checked against the
+// engine's own class names at bind); every delegate and property offset is
+// read from the engine's reflection tables, the exported
+// Z_Construct_UClass_<class>_Statics::NewProp_<name> parameter blocks, each
+// checked by its name string and kind before it is used.
+#include <pthread.h>
+typedef struct { void *data; int32_t num, max; } mvu_tarray;   // TArray<UObject*>
+typedef struct { uint8_t b[256]; } mvu_reply;                 // FReply (0xb8 bytes in 4.27), returned through x8
+typedef struct { uint8_t b[24]; } mvu_key;                    // FKey: FName + TSharedPtr<FKeyDetails>
+#define MVU_FLAGS(o)  (*(const uint32_t *)((const uint8_t *)(o) + 8))
+#define MVU_CLASS(o)  (*(void *const *)((const uint8_t *)(o) + 16))
+#define MVU_NAME(o)   ((const void *)((const uint8_t *)(o) + 24))
+#define MVU_OUTER(o)  (*(void *const *)((const uint8_t *)(o) + 32))
+#define MVU_INDEX(o)  (*(const int32_t *)((const uint8_t *)(o) + 12))
+// RF_ClassDefaultObject, ArchetypeObject, NeedInitialization, NeedLoad,
+// NeedPostLoad, BeginDestroyed, FinishDestroyed, InheritableComponentTemplate
+#define MVU_RF_SKIP 0x419630u
+// EInternalObjectFlags Async, AsyncLoading, Unreachable, PendingKill
+#define MVU_IF_SKIP 0x3C000000u
+
+enum { MVU_UMG, MVU_ACTOR, MVU_NF };
+static const char *const mvu_fam[MVU_NF] = { "umg", "actor" };
+enum { C_WIDGET, C_USERW, C_PANEL, C_CONTENT, C_TEXT, C_BUTTON, C_CHECK, C_SLIDER, C_COMBO,
+       C_WCOMP, C_WINTER, C_PRIM, C_ACTOR, C_N };
+static const char *const mvu_csym[C_N] = {
+    "_Z26Z_Construct_UClass_UWidgetv", "_Z30Z_Construct_UClass_UUserWidgetv",
+    "_Z31Z_Construct_UClass_UPanelWidgetv", "_Z33Z_Construct_UClass_UContentWidgetv",
+    "_Z29Z_Construct_UClass_UTextBlockv", "_Z26Z_Construct_UClass_UButtonv",
+    "_Z28Z_Construct_UClass_UCheckBoxv", "_Z26Z_Construct_UClass_USliderv",
+    "_Z34Z_Construct_UClass_UComboBoxStringv", "_Z35Z_Construct_UClass_UWidgetComponentv",
+    "_Z46Z_Construct_UClass_UWidgetInteractionComponentv", "_Z38Z_Construct_UClass_UPrimitiveComponentv",
+    "_Z25Z_Construct_UClass_AActorv" };
+// The reflection tables: FPropertyParamsBaseWithOffset is { NameUTF8, RepNotifyFuncUTF8,
+// PropertyFlags (u64), Flags (EPropertyGenFlags, u8) @24, ObjectFlags @28, ArrayDim @32, Offset @36 }.
+enum { P_TEXT, P_SMIN, P_SMAX, P_B_CLICK, P_B_PRESS, P_B_REL, P_CHECK, P_SLIDE, P_COMBO,
+       P_PC_CLICK, P_PC_OVER, P_PC_TOUCH, P_PC_OVERLAP, P_A_CLICK, P_A_OVER, P_A_TOUCH, P_A_OVERLAP, P_N };
+static const struct { const char *sym, *name; uint8_t gen; } mvu_psym[P_N] = {   // gen 0: a multicast delegate
+    { "_ZN37Z_Construct_UClass_UTextBlock_Statics12NewProp_TextE", "Text", 0x1d },
+    { "_ZN34Z_Construct_UClass_USlider_Statics16NewProp_MinValueE", "MinValue", 0x0a },
+    { "_ZN34Z_Construct_UClass_USlider_Statics16NewProp_MaxValueE", "MaxValue", 0x0a },
+    { "_ZN34Z_Construct_UClass_UButton_Statics17NewProp_OnClickedE", "OnClicked", 0 },
+    { "_ZN34Z_Construct_UClass_UButton_Statics17NewProp_OnPressedE", "OnPressed", 0 },
+    { "_ZN34Z_Construct_UClass_UButton_Statics18NewProp_OnReleasedE", "OnReleased", 0 },
+    { "_ZN36Z_Construct_UClass_UCheckBox_Statics27NewProp_OnCheckStateChangedE", "OnCheckStateChanged", 0 },
+    { "_ZN34Z_Construct_UClass_USlider_Statics22NewProp_OnValueChangedE", "OnValueChanged", 0 },
+    { "_ZN42Z_Construct_UClass_UComboBoxString_Statics26NewProp_OnSelectionChangedE", "OnSelectionChanged", 0 },
+    { "_ZN46Z_Construct_UClass_UPrimitiveComponent_Statics17NewProp_OnClickedE", "OnClicked", 0 },
+    { "_ZN46Z_Construct_UClass_UPrimitiveComponent_Statics25NewProp_OnBeginCursorOverE", "OnBeginCursorOver", 0 },
+    { "_ZN46Z_Construct_UClass_UPrimitiveComponent_Statics25NewProp_OnInputTouchBeginE", "OnInputTouchBegin", 0 },
+    { "_ZN46Z_Construct_UClass_UPrimitiveComponent_Statics31NewProp_OnComponentBeginOverlapE", "OnComponentBeginOverlap", 0 },
+    { "_ZN33Z_Construct_UClass_AActor_Statics17NewProp_OnClickedE", "OnClicked", 0 },
+    { "_ZN33Z_Construct_UClass_AActor_Statics25NewProp_OnBeginCursorOverE", "OnBeginCursorOver", 0 },
+    { "_ZN33Z_Construct_UClass_AActor_Statics25NewProp_OnInputTouchBeginE", "OnInputTouchBegin", 0 },
+    { "_ZN33Z_Construct_UClass_AActor_Statics27NewProp_OnActorBeginOverlapE", "OnActorBeginOverlap", 0 },
+};
+static int32_t mvu_poff[P_N];
+static uint8_t mvu_pgen[P_N];
+// A bool or an enum comes back in w0 with only its low byte defined (AAPCS64),
+// so every such return is declared 32-bit and masked here.
+static struct {
+    void *cls[C_N];
+    void (*objs_of)(void *, mvu_tarray *, uint32_t, uint32_t, uint32_t);
+    uint32_t (*child_of)(void *, void *);
+    void *(*typed_outer)(void *, void *);
+    void (*mfree)(void *);
+    uint32_t (*name_str)(const void *, uint16_t *, uint32_t);
+    void (*name_new)(void *, const char *, int);
+    void *(*find_fn)(void *, uint64_t, int);
+    const mvu_tarray *(*text_str)(const void *);
+    void *(*content)(void *);
+    int32_t (*nkids)(void *);
+    void *(*kid)(void *, int32_t);
+    void *(*parent)(void *);
+    uint32_t (*enabled)(void *), (*vis)(void *), (*constructed)(void *), (*in_viewport)(void *);
+    void (*set_enabled)(void *, uint32_t);
+    void *(*wc_user)(void *);
+    uint32_t (*wc_visible)(void *);
+    void (*weak_set)(void *, const void *);
+    void *(*weak_get)(const void *);
+    void (*b_hover)(void *), (*b_unhover)(void *), (*b_press)(void *), (*b_release)(void *);
+    mvu_reply (*b_click)(void *);
+    uint32_t (*c_is)(void *);
+    void (*c_set)(void *, uint32_t), (*c_changed)(void *, uint32_t);
+    float (*s_get)(void *);
+    void (*s_set)(void *, float), (*s_changed)(void *, float), (*s_cap_begin)(void *), (*s_cap_end)(void *);
+    int32_t (*o_count)(void *), (*o_sel)(void *);
+    void (*o_set)(void *, int32_t);
+    void (*clicked)(void *, mvu_key *);
+    void (*over)(void *, void *);
+    void (*touch_begin)(void *, uint32_t), (*touch_end)(void *, uint32_t);
+    const uint8_t *lmb;                 // EKeys::LeftMouseButton
+    const uint32_t *gt;                 // GGameThreadId
+    const uint8_t *gt_ok;               // GIsGameThreadIdInitialized
+    uint64_t fn_ev[4];                  // FNames of the actor events a Blueprint overrides
+} ue;
+
+static void mvu_u16(const uint16_t *c, int32_t n, char *o, size_t cap) {   // UTF-16 to UTF-8
+    size_t j = 0;
+    for (int32_t i = 0; c && i < n && c[i] && j + 4 < cap; i++) {
+        unsigned u = c[i];
+        if (u < 0x20) u = ' ';
+        if (u < 0x80) o[j++] = (char)u;
+        else if (u < 0x800) { o[j++] = (char)(0xC0 | u >> 6); o[j++] = (char)(0x80 | (u & 63)); }
+        else { o[j++] = (char)(0xE0 | u >> 12); o[j++] = (char)(0x80 | ((u >> 6) & 63)); o[j++] = (char)(0x80 | (u & 63)); }
+    }
+    o[j] = 0;
+}
+static void mvu_fname(const void *fn, char *o, size_t cap) {   // an FName, as text
+    uint16_t b[1100];   // FName::ToString(TCHAR*, uint32) writes the whole name (at most 1023) and its number
+    uint32_t n = ue.name_str(fn, b, 1100);
+    mvu_u16(b, n < 1100 ? (int32_t)n : 1099, o, cap);
+}
+static int mvu_isa(const void *o, int c) { return o && ue.cls[c] && (ue.child_of(MVU_CLASS(o), ue.cls[c]) & 1); }
+static unsigned mvu_all(int c, void **out, unsigned cap) {   // every live object of a class and its subclasses
+    mvu_tarray a = { 0, 0, 0 };
+    ue.objs_of(ue.cls[c], &a, 1, MVU_RF_SKIP, MVU_IF_SKIP);
+    unsigned n = a.num > 0 ? (unsigned)a.num : 0;
+    if (n > cap) n = cap;
+    if (a.data) { memcpy(out, a.data, n * sizeof *out); ue.mfree(a.data); }
+    return n;
+}
+static int mvu_bound(const void *o, int p) {   // a multicast delegate with a listener
+    const uint8_t *d = (const uint8_t *)o + mvu_poff[p];
+    return mvu_pgen[p] == 0x1c ? d[0] != 0                      // sparse: bIsBound
+                               : *(const int32_t *)(d + 8) > 0; // inline: InvocationList.Num
+}
+// The functions an inline delegate calls (FScriptDelegate: FWeakObjectPtr, FName),
+// e.g. "BndEvt__QuitButton_K2Node_ComponentBoundEvent_0_OnButtonClickedEvent__DelegateSignature".
+static int mvu_bound_unsafe(const void *o, int p, char *ev, size_t cap) {
+    if (mvu_pgen[p] != 0x1b) return 0;
+    const uint8_t *d = (const uint8_t *)o + mvu_poff[p];
+    const uint8_t *l = *(const uint8_t *const *)d;
+    int32_t n = *(const int32_t *)(d + 8);
+    for (int32_t i = 0; l && i < n && i < 16; i++) {
+        char nm[128];
+        mvu_fname(l + 16 * i + 8, nm, sizeof nm);
+        if (mv_unsafe(nm)) { snprintf(ev, cap, "%s", nm); return 1; }
+    }
+    return 0;
+}
+static int mvu_text(void *w, char *o, size_t cap, int depth) {   // the first text block's text at or under w
+    if (!w || depth > 3) return 0;
+    if (mvu_isa(w, C_TEXT)) {
+        const mvu_tarray *s = ue.text_str((const uint8_t *)w + mvu_poff[P_TEXT]);
+        if (s && s->data && s->num > 1) { mvu_u16((const uint16_t *)s->data, s->num - 1, o, cap); return o[0] != 0; }
+        return 0;
+    }
+    if (mvu_isa(w, C_CONTENT)) return mvu_text(ue.content(w), o, cap, depth + 1);
+    if (mvu_isa(w, C_PANEL)) {
+        int32_t n = ue.nkids(w);
+        for (int32_t i = 0; i < n && i < 8; i++) if (mvu_text(ue.kid(w, i), o, cap, depth + 1)) return 1;
+    }
+    return 0;
+}
+// Shown: constructed, Visible, enabled, every ancestor enabled and not hiding or
+// hit-test-blocking it, up to a user widget in the viewport or in a visible
+// widget component.
+static int mvu_shown(void *w, void *const *roots, unsigned nr) {
+    if (!(ue.constructed(w) & 1) || (ue.vis(w) & 0xff) != 0) return 0;
+    void *x = w;
+    for (int d = 0; x && d < 48; d++) {
+        if (!(ue.enabled(x) & 1)) return 0;
+        unsigned v = ue.vis(x) & 0xff;
+        if (x != w && v != 0 && v != 4) return 0;   // Visible, SelfHitTestInvisible
+        void *p = ue.parent(x);
+        if (!p) {
+            if (mvu_isa(x, C_USERW)) {
+                if (ue.in_viewport(x) & 1) return 1;
+                for (unsigned i = 0; i < nr; i++) if (roots[i] == x) return 1;
+            }
+            p = ue.typed_outer(x, ue.cls[C_USERW]);   // a tree's root: on to the user widget that owns it
+        }
+        x = p;
+    }
+    return 0;
+}
+static int mvu_confirm(const char *s) {   // a label that agrees to whatever the dialog asks
+    static const char *const ok[] = { "yes", "ok", "confirm", "accept", "sure", 0 };
+    char l[64]; size_t i = 0;
+    for (; s[i] && i < 63; i++) l[i] = (char)tolower((unsigned char)s[i]);
+    l[i] = 0;
+    for (int k = 0; ok[k]; k++) if (!strcmp(l, ok[k])) return 1;
+    return 0;
+}
+static uint8_t mvu_lang(const char *lab, const char *nm) {   // as step 107: 0 the host's language, 1 none, 2 English, 3 another
+    static char host[16];
+    if (!host[0]) { char country[16]; kl_jni_locale_parts(host, sizeof host, country, sizeof country); if (!host[0]) host[0] = '?'; }
+    int g = mv_lang_of(lab);
+    if (g < 0) g = mv_lang_of(nm);
+    if (g < 0) return 1;
+    return !strcmp(mv_langs[g].code, host) ? 0 : !strcmp(mv_langs[g].code, "en") ? 2 : 3;
+}
+
+// ---- everything ever found: coverage, as the Unity presser counts it ----
+#define MVU_DISC 4096
+typedef struct { const void *o; int32_t idx; uint8_t fam, unsafe_, tries; double last; } mvu_disc;
+static mvu_disc mvud[MVU_DISC];
+static unsigned mvud_n, mvu_trig_seen;
+static int mvud_get(const void *o, int fam) {
+    int32_t idx = MVU_INDEX(o);
+    for (unsigned i = 0; i < mvud_n; i++) if (mvud[i].o == o && mvud[i].idx == idx && mvud[i].fam == fam) return (int)i;
+    if (mvud_n == MVU_DISC) return -1;
+    memset(&mvud[mvud_n], 0, sizeof mvud[0]);
+    mvud[mvud_n].o = o; mvud[mvud_n].idx = idx; mvud[mvud_n].fam = (uint8_t)fam;
+    return (int)mvud_n++;
+}
+static void mvu_coverage(double t) {
+    unsigned tot[MVU_NF] = { 0 }, hit[MVU_NF] = { 0 }, uns = 0, T = 0, H = 0;
+    for (unsigned i = 0; i < mvud_n; i++) {
+        if (mvud[i].unsafe_) { uns++; continue; }
+        tot[mvud[i].fam]++; T++;
+        if (mvud[i].tries) { hit[mvud[i].fam]++; H++; }
+    }
+    static unsigned lt = ~0u, lh = ~0u, lu = ~0u, ltr = ~0u;
+    if (T == lt && H == lh && uns == lu && mvu_trig_seen == ltr) return;
+    lt = T; lh = H; lu = uns; ltr = mvu_trig_seen;
+    char d[200]; size_t o = 0;
+    for (int f = 0; f < MVU_NF; f++)
+        if (tot[f]) o += (size_t)snprintf(d + o, sizeof d - o, "%s%s %u/%u", o ? ", " : "", mvu_fam[f], hit[f], tot[f]);
+    fprintf(stderr, "[mv-autoplay-ui] coverage %u/%u (%s%s%u unsafe skipped, %u trigger-only) at %.1fs\n",
+            H, T, d, o ? "; " : "", uns, mvu_trig_seen, t);
+}
+
+// ---- binding ----
+static int mvu_bind(kl_image *im) {
+    static const struct { void **fn; const char *sym; } need[] = {
+        { (void **)&ue.objs_of, "_Z17GetObjectsOfClassPK6UClassR6TArrayIP7UObject22TSizedDefaultAllocatorILi32EEEb12EObjectFlags20EInternalObjectFlags" },
+        { (void **)&ue.child_of, "_ZNK7UStruct9IsChildOfEPKS_" },
+        { (void **)&ue.typed_outer, "_ZNK18UObjectBaseUtility13GetTypedOuterEP6UClass" },
+        { (void **)&ue.mfree, "_ZN7FMemory4FreeEPv" },
+        { (void **)&ue.name_str, "_ZNK5FName8ToStringEPDsj" },
+        { (void **)&ue.name_new, "_ZN5FNameC1EPKc9EFindName" },
+        { (void **)&ue.find_fn, "_ZNK6UClass18FindFunctionByNameE5FNameN17EIncludeSuperFlag4TypeE" },
+        { (void **)&ue.text_str, "_ZNK5FText8ToStringEv" },
+        { (void **)&ue.content, "_ZNK14UContentWidget10GetContentEv" },
+        { (void **)&ue.nkids, "_ZNK12UPanelWidget16GetChildrenCountEv" },
+        { (void **)&ue.kid, "_ZNK12UPanelWidget10GetChildAtEi" },
+        { (void **)&ue.parent, "_ZNK7UWidget9GetParentEv" },
+        { (void **)&ue.enabled, "_ZNK7UWidget12GetIsEnabledEv" },
+        { (void **)&ue.vis, "_ZNK7UWidget13GetVisibilityEv" },
+        { (void **)&ue.constructed, "_ZNK7UWidget13IsConstructedEv" },
+        { (void **)&ue.in_viewport, "_ZNK11UUserWidget12IsInViewportEv" },
+        { (void **)&ue.set_enabled, "_ZN7UWidget12SetIsEnabledEb" },
+        { (void **)&ue.wc_user, "_ZNK16UWidgetComponent19GetUserWidgetObjectEv" },
+        { (void **)&ue.wc_visible, "_ZNK16UWidgetComponent15IsWidgetVisibleEv" },
+        { (void **)&ue.weak_set, "_ZN14FWeakObjectPtraSEPK7UObject" },
+        { (void **)&ue.weak_get, "_ZNK14FWeakObjectPtr3GetEv" },
+        { (void **)&ue.b_hover, "_ZN7UButton18SlateHandleHoveredEv" },
+        { (void **)&ue.b_unhover, "_ZN7UButton20SlateHandleUnhoveredEv" },
+        { (void **)&ue.b_press, "_ZN7UButton18SlateHandlePressedEv" },
+        { (void **)&ue.b_release, "_ZN7UButton19SlateHandleReleasedEv" },
+        { (void **)&ue.b_click, "_ZN7UButton18SlateHandleClickedEv" },
+        { (void **)&ue.c_is, "_ZNK9UCheckBox9IsCheckedEv" },
+        { (void **)&ue.c_set, "_ZN9UCheckBox12SetIsCheckedEb" },
+        { (void **)&ue.c_changed, "_ZN9UCheckBox32SlateOnCheckStateChangedCallbackE14ECheckBoxState" },
+        { (void **)&ue.s_get, "_ZNK7USlider8GetValueEv" },
+        { (void **)&ue.s_set, "_ZN7USlider8SetValueEf" },
+        { (void **)&ue.s_changed, "_ZN7USlider20HandleOnValueChangedEf" },
+        { (void **)&ue.s_cap_begin, "_ZN7USlider25HandleOnMouseCaptureBeginEv" },
+        { (void **)&ue.s_cap_end, "_ZN7USlider23HandleOnMouseCaptureEndEv" },
+        { (void **)&ue.o_count, "_ZNK15UComboBoxString14GetOptionCountEv" },
+        { (void **)&ue.o_sel, "_ZNK15UComboBoxString16GetSelectedIndexEv" },
+        { (void **)&ue.o_set, "_ZN15UComboBoxString16SetSelectedIndexEi" },
+        { (void **)&ue.clicked, "_ZN19UPrimitiveComponent17DispatchOnClickedE4FKey" },
+        { (void **)&ue.over, "_ZN19UPrimitiveComponent23DispatchMouseOverEventsEPS_S0_" },
+        { (void **)&ue.touch_begin, "_ZN19UPrimitiveComponent25DispatchOnInputTouchBeginEN11ETouchIndex4TypeE" },
+        { (void **)&ue.touch_end, "_ZN19UPrimitiveComponent23DispatchOnInputTouchEndEN11ETouchIndex4TypeE" },
+        { (void **)&ue.lmb, "_ZN5EKeys15LeftMouseButtonE" },
+    };
+    for (size_t i = 0; i < sizeof need / sizeof *need; i++)
+        if (!(*need[i].fn = kl_sym(im, need[i].sym))) {
+            fprintf(stderr, "[mv-autoplay-ui] off: libUE4 lacks an export (%s)\n", need[i].sym);
+            return 0;
+        }
+    for (int c = 0; c < C_N; c++) {
+        void *(*ctor)(void) = (void *(*)(void))kl_sym(im, mvu_csym[c]);
+        if (!ctor || !(ue.cls[c] = ctor())) {
+            fprintf(stderr, "[mv-autoplay-ui] off: libUE4 lacks an export (%s)\n", mvu_csym[c]);
+            return 0;
+        }
+    }
+    // UObjectBase { vtable, ObjectFlags, InternalIndex, ClassPrivate @16, NamePrivate @24, OuterPrivate @32 }:
+    // a class's own name and its class's name say whether that holds here.
+    char a[32], b[32], k[32];
+    mvu_fname(MVU_NAME(ue.cls[C_BUTTON]), a, sizeof a);
+    mvu_fname(MVU_NAME(ue.cls[C_ACTOR]), b, sizeof b);
+    mvu_fname(MVU_NAME(MVU_CLASS(ue.cls[C_ACTOR])), k, sizeof k);
+    if (strcmp(a, "Button") || strcmp(b, "Actor") || strcmp(k, "Class")) {
+        fprintf(stderr, "[mv-autoplay-ui] off: UObject layout is not UE4's (class names read '%s', '%s', '%s')\n", a, b, k);
+        return 0;
+    }
+    for (int p = 0; p < P_N; p++) {
+        const uint8_t *s = kl_sym(im, mvu_psym[p].sym);
+        const char *n = s ? *(const char *const *)s : NULL;
+        uint8_t gen = s ? s[24] : 0;
+        int32_t dim = s ? *(const int32_t *)(s + 32) : 0, off = s ? *(const int32_t *)(s + 36) : 0;
+        int kind_ok = mvu_psym[p].gen ? gen == mvu_psym[p].gen : (gen == 0x1b || gen == 0x1c);
+        if (!n || strcmp(n, mvu_psym[p].name) || !kind_ok || dim != 1 || off <= 0 || off > 0x10000) {
+            fprintf(stderr, "[mv-autoplay-ui] off: reflection table %s is not the layout this reads "
+                            "(name '%s', kind 0x%x, dim %d, offset %d)\n",
+                    mvu_psym[p].name, n ? n : "?", gen, dim, off);
+            return 0;
+        }
+        mvu_poff[p] = off; mvu_pgen[p] = gen;
+    }
+    static const char *const ev[4] = { "ReceiveActorOnClicked", "ReceiveActorBeginCursorOver",
+                                       "ReceiveActorOnInputTouchBegin", "ReceiveActorBeginOverlap" };
+    for (int e = 0; e < 4; e++) { uint64_t fn = 0; ue.name_new(&fn, ev[e], 0 /* FNAME_Find */); ue.fn_ev[e] = fn; }
+    fprintf(stderr, "[mv-autoplay-ui] on (step 155): Unreal Engine; families umg,actor; game thread %u; "
+                    "via GetObjectsOfClass and the engine's reflection tables\n", *ue.gt);
+    return 1;
+}
+
+// Which actor events a class's Blueprint implements: its own UFunction, not AActor's.
+static uint8_t mvu_aclass(void *k) {
+    static struct { void *k; uint8_t f; } kc[512];
+    static unsigned n;
+    for (unsigned i = 0; i < n; i++) if (kc[i].k == k) return kc[i].f;
+    uint8_t f = 0;
+    for (int e = 0; e < 4; e++) {
+        if (!ue.fn_ev[e]) continue;
+        void *fn = ue.find_fn(k, ue.fn_ev[e], 1 /* IncludeSuper */);
+        if (fn && MVU_OUTER(fn) != ue.cls[C_ACTOR]) f |= (uint8_t)(1u << e);
+    }
+    if (n < 512) { kc[n].k = k; kc[n].f = f; n++; }
+    return f;
+}
+
+// ---- a press in two halves: now, and _HOLD_MS later (a weak pointer in between) ----
+enum { K_BUTTON, K_CHECK, K_SLIDER, K_COMBO, K_ACTOR };
+static struct { uint64_t w; uint8_t fam, kind, touch, live; double at; char what[64]; } mvuh;
+static void mvu_release(double now, double t0, int force) {
+    if (!mvuh.live || (!force && now < mvuh.at)) return;
+    mvuh.live = 0;
+    void *o = ue.weak_get(&mvuh.w);
+    const char *how;
+    if (!o) how = "nothing: it is gone";
+    else if (mvuh.kind == K_BUTTON) {
+        ue.b_release(o); (void)ue.b_click(o); ue.b_unhover(o);
+        how = "SlateHandleReleased+Clicked+Unhovered";
+    } else {
+        if (mvuh.touch) ue.touch_end(o, 0);
+        ue.over(o, NULL);
+        how = mvuh.touch ? "DispatchOnInputTouchEnd+MouseOverEvents(end)" : "DispatchMouseOverEvents(end)";
+    }
+    fprintf(stderr, "[mv-autoplay-ui] t=%.1fs released '%s' (%s via %s)\n", now - t0, mvuh.what, mvu_fam[mvuh.fam], how);
+}
+
+typedef struct { void *o, *press; uint8_t fam, kind, lang, touch; int16_t di; char lab[64], nm[64], kn[48]; } mvu_cand;
+static int mvu_before(const mvu_cand *a, const mvu_cand *b) {
+    const mvu_disc *x = &mvud[a->di], *y = &mvud[b->di];
+    if (x->tries != y->tries) return x->tries < y->tries;
+    if (x->last != y->last) return x->last < y->last;
+    if (a->lang != b->lang) return a->lang < b->lang;
+    if (a->fam != b->fam) return a->fam < b->fam;
+    int c = strcmp(a->nm, b->nm);
+    if (c) return c < 0;
+    c = strcmp(a->lab, b->lab);
+    if (c) return c < 0;
+    return a->di < b->di;
+}
+
+// A candidate's name (its object name), label (the text on it or beside it) and,
+// in ev, why it reads like leaving when neither of those says so: a function its
+// delegates call ("BndEvt__QuitButton_..."), the instance name of the user widget
+// wrapping it ("ExitButton"), or the dialog a "Yes" in it agrees to ("QuitConfirm").
+static void mvu_names(mvu_cand *x, char *ev, size_t cap) {
+    ev[0] = 0;
+    mvu_fname(MVU_NAME(x->o), x->nm, sizeof x->nm);
+    if (x->fam != MVU_UMG) return;
+    if ((x->kind == K_BUTTON || x->kind == K_CHECK) && !mvu_text(ue.content(x->o), x->lab, sizeof x->lab, 0)) {
+        void *pa = ue.parent(x->o);   // a label beside it: an overlay of a button and its text
+        int32_t n = pa ? ue.nkids(pa) : 0;
+        for (int32_t i = 0; i < n && i < 8; i++) {
+            void *s = ue.kid(pa, i);
+            if (s != x->o && mvu_text(s, x->lab, sizeof x->lab, 1)) break;
+        }
+    }
+    static const int ps[4][3] = { { P_B_CLICK, P_B_PRESS, P_B_REL }, { P_CHECK, -1, -1 },
+                                  { P_SLIDE, -1, -1 }, { P_COMBO, -1, -1 } };
+    for (int j = 0; x->kind < 4 && j < 3; j++)
+        if (ps[x->kind][j] >= 0 && mvu_bound_unsafe(x->o, ps[x->kind][j], ev, cap)) return;
+    void *u = ue.typed_outer(x->o, ue.cls[C_USERW]);
+    if (u) {
+        char un[64];
+        mvu_fname(MVU_NAME(u), un, sizeof un);
+        if ((ue.parent(u) || mvu_confirm(x->lab) || mvu_confirm(x->nm)) && mv_unsafe(un)) snprintf(ev, cap, "%s", un);
+    }
+}
+
+#define MVU_CAND 256
+#define MVU_BUF 8192
+void kl_mprobe_ue4_tick(void) {
+    static int on = -1, bound, guard;
+    static double t0, first, next, every, hold, gap, guard_at;
+    static unsigned maxt;
+    static kl_image *im;
+    if (!on) return;
+    if (on < 0) {
+        im = kl_find_image("libUE4.so");
+        if (!im || !kl_env_on("MV_AUTOPLAY_UI", kl_env_on("MV_AUTOPLAY", 0))) { on = 0; return; }   // not an Unreal title, or not a test run
+        every = kl_env_uint("MV_AUTOPLAY_UI_EVERY", 4); if (!every) every = 4;
+        hold  = kl_env_uint("MV_AUTOPLAY_UI_HOLD_MS", 300) / 1000.0;
+        gap   = kl_env_uint("MV_AUTOPLAY_UI_GAP", 12);
+        maxt  = kl_env_uint("MV_AUTOPLAY_UI_MAX", 3);
+        guard = kl_env_on("MV_AUTOPLAY_UI_GUARD", 1);
+        ue.gt = kl_sym(im, "GGameThreadId");
+        ue.gt_ok = kl_sym(im, "GIsGameThreadIdInitialized");
+        if (!ue.gt || !ue.gt_ok) {
+            fprintf(stderr, "[mv-autoplay-ui] off: libUE4 lacks an export (GGameThreadId)\n");
+            on = 0; return;
+        }
+        on = 1;
+    }
+    double now = mv_now();
+    if (!first) first = now;
+    // Only on the game thread, at the top of its frame (the hook is the HMD's
+    // frame wait, which a render-thread splash calls too): UObjects belong to it.
+    uint64_t tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    if (!*ue.gt_ok || (uint32_t)tid != *ue.gt) {
+        static int said;
+        if (!t0 && !said && now - first > 120) {
+            said = 1;
+            fprintf(stderr, "[mv-autoplay-ui] off: the frame hook has not run on the game thread in 120 s "
+                            "(game thread %u, hook thread %u)\n", *ue.gt, (unsigned)tid);
+        }
+        return;
+    }
+    if (!t0) { t0 = now; next = now + kl_env_uint("MV_AUTOPLAY_UI_FROM", 10); }
+    if (bound > 0) mvu_release(now, t0, 0);
+    int guard_only = now < next;
+    if (guard_only && !(guard_at && now >= guard_at)) return;
+    guard_at = 0;
+    if (!guard_only) next = now + every;
+    if (!bound) bound = mvu_bind(im) ? 1 : -1;
+    if (bound < 0) { on = 0; return; }
+    mvu_release(now, t0, 1);   // never two presses at once
+
+    static void *buf[MVU_BUF];
+    static mvu_cand c[MVU_CAND];
+    unsigned nc = 0, nskip = 0, found[MVU_NF] = { 0 }, trig = 0, nw[4] = { 0 };
+    char skip[96] = "";
+    // user widgets shown in the world, through a visible widget component
+    void *roots[256]; unsigned nr = 0;
+    unsigned nwc = mvu_all(C_WCOMP, buf, MVU_BUF);
+    for (unsigned i = 0; i < nwc && nr < 256; i++) {
+        void *u = ue.wc_user(buf[i]);
+        if (u && (ue.wc_visible(buf[i]) & 1)) roots[nr++] = u;
+    }
+    unsigned nwi = mvu_all(C_WINTER, buf, MVU_BUF);
+
+    #define ADD(obj, press_, fam_, kind_, kn_) do {                                          \
+        mvu_cand *x_ = &c[nc]; memset(x_, 0, sizeof *x_);                                    \
+        x_->o = (obj); x_->press = (press_); x_->fam = (uint8_t)(fam_); x_->kind = (uint8_t)(kind_); \
+        snprintf(x_->kn, sizeof x_->kn, "%s", (kn_));                                        \
+        found[fam_]++;                                                                       \
+        int di_ = mvud_get(x_->o, fam_);                                                     \
+        if (di_ < 0) break;                                                                  \
+        x_->di = (int16_t)di_;                                                               \
+        if (mvud[di_].unsafe_) { nskip++; break; }                                           \
+        if (mvud[di_].tries >= maxt || (mvud[di_].tries && now - mvud[di_].last < gap)) break; \
+        mvu_names(x_, ev_, sizeof ev_);                                                      \
+        x_->lang = mvu_lang(x_->lab, x_->nm);                                                \
+        if (mv_unsafe(x_->lab) || mv_unsafe(x_->nm) || mv_unsafe(x_->kn) || ev_[0]) {        \
+            if ((fam_) == MVU_UMG && guard) {                                                \
+                ue.set_enabled(x_->o, 0);                                                    \
+                fprintf(stderr, "[mv-autoplay-ui] guarded '%s'%s%s%s: no scripted tap reaches it\n", \
+                        x_->lab[0] ? x_->lab : x_->nm, ev_[0] ? " (" : "", ev_, ev_[0] ? ")" : ""); \
+            }                                                                                \
+            mvud[di_].unsafe_ = 1; nskip++;                                                  \
+            snprintf(skip, sizeof skip, "%s", x_->lab[0] ? x_->lab : x_->nm); break;         \
+        }                                                                                    \
+        nc++;                                                                                \
+    } while (0)
+
+    // umg: buttons, check boxes, sliders and combo boxes shown with a listener
+    static const struct { int c, k; const char *name; int p[3]; } kinds[4] = {
+        { C_BUTTON, K_BUTTON, "Button",         { P_B_CLICK, P_B_PRESS, P_B_REL } },
+        { C_CHECK,  K_CHECK,  "CheckBox",       { P_CHECK, -1, -1 } },
+        { C_SLIDER, K_SLIDER, "Slider",         { P_SLIDE, -1, -1 } },
+        { C_COMBO,  K_COMBO,  "ComboBoxString", { P_COMBO, -1, -1 } },
+    };
+    for (int k = 0; k < 4; k++) {
+        unsigned n = mvu_all(kinds[k].c, buf, MVU_BUF);
+        nw[k] = n;
+        for (unsigned i = 0; i < n && nc < MVU_CAND; i++) {
+            void *w = buf[i];
+            int any = 0;
+            for (int j = 0; j < 3; j++) if (kinds[k].p[j] >= 0 && mvu_bound(w, kinds[k].p[j])) any = 1;
+            if (!any || !mvu_shown(w, roots, nr)) continue;
+            char ev_[128] = "";
+            ADD(w, w, MVU_UMG, kinds[k].k, kinds[k].name);
+        }
+    }
+    // actor: a component's or its actor's click, cursor-over or touch with a
+    // listener, or a Blueprint implementing the actor's own event; one per actor
+    static struct { void *a, *pc; uint8_t inter, touch, own; } act[1024];
+    unsigned na = 0, nact_click = 0;
+    unsigned np = mvu_all(C_PRIM, buf, MVU_BUF);
+    for (unsigned i = 0; i < np; i++) {
+        void *pc = buf[i], *a = ue.typed_outer(pc, ue.cls[C_ACTOR]);
+        if (!a || (MVU_FLAGS(a) & 0x30u)) continue;   // an actor's class default or archetype
+        uint8_t af = mvu_aclass(MVU_CLASS(a));
+        int own = mvu_bound(pc, P_PC_CLICK) || mvu_bound(pc, P_PC_OVER) || mvu_bound(pc, P_PC_TOUCH);
+        int touch = mvu_bound(pc, P_PC_TOUCH) || mvu_bound(a, P_A_TOUCH) || (af & 4);
+        int inter = own || (af & 7) || mvu_bound(a, P_A_CLICK) || mvu_bound(a, P_A_OVER) || mvu_bound(a, P_A_TOUCH);
+        int overlap = (af & 8) || mvu_bound(a, P_A_OVERLAP) || mvu_bound(pc, P_PC_OVERLAP);
+        if (!inter && !overlap) continue;
+        unsigned j = 0;
+        while (j < na && act[j].a != a) j++;
+        if (j == na) {
+            if (na == 1024) continue;
+            memset(&act[na], 0, sizeof act[0]); act[na].a = a; na++;
+        }
+        if (inter && (!act[j].pc || (own && !act[j].own))) { act[j].pc = pc; act[j].own = (uint8_t)own; }
+        act[j].inter |= (uint8_t)inter; act[j].touch |= (uint8_t)touch;
+    }
+    for (unsigned j = 0; j < na && nc < MVU_CAND; j++) {
+        if (!act[j].inter) { trig++; continue; }   // overlap only: a hand has to go there; counted, not pressed
+        nact_click++;
+        char kn[48], ev_[128] = "";
+        mvu_fname(MVU_NAME(MVU_CLASS(act[j].a)), kn, sizeof kn);
+        ADD(act[j].a, act[j].pc, MVU_ACTOR, K_ACTOR, kn);
+        if (nc && c[nc - 1].o == act[j].a) c[nc - 1].touch = act[j].touch;
+    }
+    #undef ADD
+    if (guard_only) return;
+    mvu_trig_seen = trig;
+    {   // what the scan saw, whenever that changes
+        static unsigned l[8] = { ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u };
+        unsigned v[8] = { nw[0], nw[1], nw[2], nw[3], na, nact_click, nwc, nwi };
+        if (memcmp(l, v, sizeof v)) {
+            memcpy(l, v, sizeof v);
+            fprintf(stderr, "[mv-autoplay-ui] scan at %.1fs: %u buttons, %u check boxes, %u sliders, %u combo boxes "
+                            "(%u shown with a listener); %u interactive actors (%u clickable, %u overlap-only); "
+                            "%u widget components, %u widget interaction components\n",
+                    now - t0, nw[0], nw[1], nw[2], nw[3], found[MVU_UMG], na, nact_click, trig, nwc, nwi);
+        }
+    }
+    double t = now - t0;
+    int pick = -1;
+    for (unsigned i = 0; i < nc; i++) if (pick < 0 || mvu_before(&c[i], &c[pick])) pick = (int)i;
+    if (pick < 0) {
+        fprintf(stderr, "[mv-autoplay-ui] t=%.1fs nothing to press (umg %u, actor %u found; %u skipped%s%s%s; %u trigger-only)\n",
+                t, found[MVU_UMG], found[MVU_ACTOR], nskip, skip[0] ? " e.g. '" : "", skip, skip[0] ? "'" : "", trig);
+        mvu_coverage(t);
+        return;
+    }
+    mvu_cand *p = &c[pick];
+    const char *how = "none"; int held = 0;
+    char hb[64];
+    switch (p->kind) {
+    case K_BUTTON:
+        ue.b_hover(p->o); ue.b_press(p->o);
+        how = "SlateHandleHovered+Pressed"; held = 1;
+        break;
+    case K_CHECK: {
+        uint32_t st = !(ue.c_is(p->o) & 1);
+        ue.c_set(p->o, st); ue.c_changed(p->o, st);   // ECheckBoxState: Unchecked 0, Checked 1
+        how = st ? "SetIsChecked(true)+SlateOnCheckStateChanged" : "SetIsChecked(false)+SlateOnCheckStateChanged";
+        break;
+    }
+    case K_SLIDER: {
+        float lo = *(const float *)((const uint8_t *)p->o + mvu_poff[P_SMIN]);
+        float hi = *(const float *)((const uint8_t *)p->o + mvu_poff[P_SMAX]);
+        if (!(hi > lo)) { lo = 0; hi = 1; }
+        float v = ue.s_get(p->o), f = (v - lo) / (hi - lo);
+        f = f < 0.5f ? f + 0.25f : f - 0.25f;
+        v = lo + f * (hi - lo);
+        ue.s_cap_begin(p->o); ue.s_set(p->o, v); ue.s_changed(p->o, v); ue.s_cap_end(p->o);
+        snprintf(hb, sizeof hb, "SetValue(%.3g)+HandleOnValueChanged", (double)v); how = hb;
+        break;
+    }
+    case K_COMBO: {
+        int32_t n = ue.o_count(p->o), s = ue.o_sel(p->o);
+        if (n > 1) {
+            int32_t to = s < 0 ? 0 : (s + 1) % n;
+            ue.o_set(p->o, to);
+            snprintf(hb, sizeof hb, "SetSelectedIndex(%d of %d)", to, n); how = hb;
+        } else how = "one option: nothing to choose";
+        break;
+    }
+    case K_ACTOR: {
+        mvu_key k; memset(&k, 0, sizeof k); memcpy(k.b, ue.lmb, 8);   // EKeys::LeftMouseButton's name, no details
+        ue.over(NULL, p->press); ue.clicked(p->press, &k);
+        if (p->touch) ue.touch_begin(p->press, 0);   // ETouchIndex::Touch1
+        how = p->touch ? "DispatchMouseOverEvents+OnClicked+OnInputTouchBegin" : "DispatchMouseOverEvents+OnClicked";
+        held = 1;
+        break;
+    }
+    }
+    mvud[p->di].tries++; mvud[p->di].last = now;
+    fprintf(stderr, "[mv-autoplay-ui] t=%.1fs pressed '%s' (%s %s go=%s via %s, try %u, %u candidates, %u skipped)\n",
+            t, p->lab[0] ? p->lab : p->nm, mvu_fam[p->fam], p->kn, p->nm, how, mvud[p->di].tries, nc, nskip);
+    if (held) {
+        mvuh.w = 0; ue.weak_set(&mvuh.w, p->press);
+        mvuh.fam = p->fam; mvuh.kind = p->kind; mvuh.touch = p->touch; mvuh.at = now + hold; mvuh.live = 1;
+        snprintf(mvuh.what, sizeof mvuh.what, "%s", p->lab[0] ? p->lab : p->nm);
+    }
+    guard_at = now + 0.6;
+    mvu_coverage(t);
+}
+'''
+s = open(p).read()
+if marker not in s:
+    s = sub(s, "void kl_mprobe_tick(unsigned frame) {\n", code + "\nvoid kl_mprobe_tick(unsigned frame) {\n", p)
+    open(p, "w").write(s)
+s = open(h).read()
+if marker not in s:
+    s = sub(s, "void kl_mprobe_tick(unsigned frame);\n",
+               "void kl_mprobe_tick(unsigned frame);\n\n"
+               "// " + marker + ": the UI presser for an Unreal\n"
+               "// Engine 4 guest. Call it from a frame hook the engine's game thread reaches;\n"
+               "// it acts only there, and only during auto-play (MV_AUTOPLAY / MV_AUTOPLAY_UI).\n"
+               "void kl_mprobe_ue4_tick(void);\n", h)
+    open(h, "w").write(s)
+print("overlay: the UI presser reaches Unreal Engine 4 titles (UMG controls, clickable actors)")
+PYEOF
+
+# 156 — the Unreal presser's clock. An Unreal guest runs its own frame loop, so
+# the driver's between-frames tick (where step 66 runs) never comes. The HMD's
+# frame wait does: UE 4.27's FOculusHMD::StartGameFrame_GameThread calls
+# ovrp_WaitToBeginFrame on the game thread at the top of every frame (the plugin
+# wrapper's slot filled from "ovrp_WaitToBeginFrame", the same in all three
+# builds measured), before the world ticks. xrWaitFrame gets the same call for an
+# OpenXR title. Both call step 155's tick, which returns at once for any other
+# guest and acts only on the game thread (a render-thread splash also waits here).
+python3 - "$K/runtime/xr/kl_ovrp.c" "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+po, px = sys.argv[1], sys.argv[2]
+marker = "metavision: the Unreal presser's clock (step 156)"
+def sub(s, old, new, f):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {f}: {old[:60]!r}")
+    return s.replace(old, new)
+call = "    { extern void kl_mprobe_ue4_tick(void); kl_mprobe_ue4_tick(); }   // " + marker + "\n"
+s = open(po).read()
+if marker not in s:
+    old = "static uint64_t klovrp_WaitToBeginFrame(long frame_index) {\n    ovrp_hit(\"ovrp_WaitToBeginFrame\");\n"
+    s = sub(s, old, old + call, po)
+    open(po, "w").write(s)
+s = open(px).read()
+if marker not in s:
+    old = "    if (!s->running) KLXR_RET(KLXR_ERROR_SESSION_NOT_RUNNING);\n\n    // Block here if the driver has a display to be paced by"
+    s = sub(s, old, old.replace("\n\n", "\n" + call + "\n", 1), px)
+    open(px, "w").write(s)
+print("overlay: the HMD frame wait ticks the Unreal presser")
+PYEOF
+
 # 136 — a persistent load guard: a guest library whose load killed the app is
 # refused from then on. Some deaths cannot be caught: visionOS code signing
 # kills a process with SIGKILL the instant it executes a page it will not
