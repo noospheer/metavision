@@ -91,8 +91,60 @@ static void test_hands(void *(*dls)(void *, const char *)) {
     for (uint32_t i = 0; i < mh[2]; i++) assert((uint32_t)((int16_t *)(mesh + 0x8cac))[i] < mh[1]);
     assert(((float *)(mesh + 0x2616c))[0] == 1.0f);       // first vertex wholly on its bone
 
-    assert(hs(0, 0, st) == 0 && *(int32_t *)st == 0);     // left hand never seen
+    // OpenXR joints: both hands open, palm down, fingers along -Z (the left the
+    // right mirrored in X). Each joint's -Z must run along its finger and its
+    // +Y out of the back of the hand, whichever hand it is.
+    static const float xr[MV_XR_JOINTS][3] = {
+        {0,0,0}, {0,0,0},
+        {-0.025f,0,-0.02f}, {-0.04f,0,-0.045f}, {-0.05f,0,-0.07f}, {-0.055f,0,-0.09f},
+        {-0.01f,0,-0.01f}, {-0.02f,0,-0.09f}, {-0.02f,0,-0.13f}, {-0.02f,0,-0.155f}, {-0.02f,0,-0.18f},
+        {0,0,-0.01f}, {0,0,-0.095f}, {0,0,-0.135f}, {0,0,-0.16f}, {0,0,-0.19f},
+        {0.01f,0,-0.01f}, {0.02f,0,-0.09f}, {0.02f,0,-0.13f}, {0.02f,0,-0.155f}, {0.02f,0,-0.18f},
+        {0.015f,0,-0.01f}, {0.035f,0,-0.08f}, {0.035f,0,-0.11f}, {0.035f,0,-0.13f}, {0.035f,0,-0.15f} };
+    mv_hands_xr x;
+    assert(mv_hands_xr_read(1, &x) == 0);                 // nothing published yet
+    for (int hand = 0; hand < 2; hand++) {
+        float pos[MV_XR_JOINTS * 3];
+        for (int j = 0; j < MV_XR_JOINTS; j++) {
+            pos[3*j] = hand ? xr[j][0] : -xr[j][0]; pos[3*j+1] = xr[j][1]; pos[3*j+2] = xr[j][2];
+        }
+        mv_hands_publish_xr(hand, 1, pos, root, 12.5);
+        if (hand == 0) mv_hands_publish(0, 1, model, root, NULL, pinch, 12.5);
+        assert(mv_hands_xr_read(hand, &x) == 1 && !x.motion_valid);
+        for (int j = 0; j < MV_XR_JOINTS; j++) {
+            float *q = x.pose[j];
+            float l = q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3];
+            assert(fabsf(l - 1) < 1e-4f);
+            assert(x.radius[j] > 0.004f && x.radius[j] < 0.04f);
+            // the rotation's Y and Z columns
+            float yy = 1 - 2*(q[0]*q[0] + q[2]*q[2]);                 // Y.y
+            float zz = 1 - 2*(q[0]*q[0] + q[1]*q[1]);                 // Z.z
+            int thumb = j >= 2 && j <= 5;
+            if (!thumb) assert(yy > 0.99f);                           // back of the hand up
+            else        assert(yy > 0.5f);                            // nail up and outwards
+            if (j != 0 && !thumb) assert(zz > 0.9f);                  // +Z back towards the wrist
+        }
+        float *ip = x.pose[7];                                        // index proximal, in tracking space
+        assert(fabsf(ip[4] - (0.1f + (hand ? -0.02f : 0.02f))) < 1e-5f && fabsf(ip[5] - 1.2f) < 1e-5f);
+        float *pm = x.pose[0];                                        // palm: mid middle metacarpal
+        assert(fabsf(pm[6] - (-0.3f - 0.0525f)) < 1e-5f);
+    }
+    assert(x.pinch[1] > 0.9f && x.aim[3] != 0);           // pinches and the ray from the frame
+    float moved[MV_XR_JOINTS * 3];
+    for (int j = 0; j < MV_XR_JOINTS; j++) {
+        moved[3*j] = xr[j][0]; moved[3*j+1] = xr[j][1] + 0.01f; moved[3*j+2] = xr[j][2];
+    }
+    mv_hands_publish_xr(1, 1, moved, root, 12.51);
+    assert(mv_hands_xr_read(1, &x) == 1 && x.motion_valid);
+    assert(fabsf(x.lin[7][1] - 1.0f) < 1e-3f && fabsf(x.ang[7][0]) < 1e-3f);   // 1 cm in 10 ms, no turn
+
+    assert(hs(0, 0, st) == 0);                            // left hand: published above
+    mv_hands_publish(0, 0, NULL, NULL, NULL, NULL, 13);
+    mv_hands_publish_xr(0, 0, NULL, NULL, 13);
+    assert(mv_hands_xr_read(0, &x) == 0);                 // lost
+    assert(hs(0, 0, st) == 0 && *(int32_t *)st == 0);     // left hand not tracked
     mv_hands_set_enabled(0);
+    assert(mv_hands_xr_read(1, &x) == 0);                 // hands-free: OpenXR hands ignored too
     assert(hs(0, 1, st) == 0 && *(int32_t *)st == 0);     // hands-free: hands ignored
     assert(sk(1, skel) != 0 && gm(1, mesh) != 0);         // and no skeleton
     mv_hands_set_enabled(1);

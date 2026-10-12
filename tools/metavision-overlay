@@ -12025,3 +12025,293 @@ static int mv_pe_call(Il2CppObject *o, const MethodInfo *m, int32_t pet) {   // 
     open(p, "w").write(s)
 print("overlay: autoplay grabs Interaction SDK pointable elements with their own pointer events")
 PYEOF
+
+# 140 — XR_EXT_hand_tracking and XR_FB_hand_tracking_aim are advertised and
+# dispatched. An OpenXR title built on Unity's hand-tracking packages enables
+# XR_EXT_hand_tracking (the "Hand Tracking Subsystem" feature) and
+# XR_FB_hand_tracking_aim ("Meta Hand Tracking Aim") only when the runtime lists
+# them. Neither was listed, so the subsystem never started ("Couldn't enable
+# Meta aim retrieval in plugin", xrGetInstanceProcAddr("xrCreateHandTrackerEXT")
+# not served) and the title had no hands, while OVRPlugin titles got the same
+# visionOS hands through shims/mv_hands.c. KL_XR_HAND_TRACKING=0 withholds both.
+python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+marker = "metavision: OpenXR hand tracking advertised (step 140)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    # KLXR_GATE_HANDS (unless KL_XR_HAND_TRACKING=0) joins the gate enum, whose
+    # line keeps its own comment.
+    old = "       KLXR_GATE_USER_PRESENCE = 3 };"
+    s = sub(p, s, old, "       KLXR_GATE_USER_PRESENCE = 3, KLXR_GATE_HANDS = 140 };")
+    old = '    { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },\n'
+    s = sub(p, s, old, old +
+        "    // " + marker + ": served from the visionOS\n"
+        "    // hand skeleton (shims/mv_hands.c), as OVRPlugin's hand calls are.\n"
+        '    { "XR_EXT_hand_tracking",                 4, KLXR_GATE_HANDS },\n'
+        '    { "XR_FB_hand_tracking_aim",              2, KLXR_GATE_HANDS },\n')
+    old = ("    default:\n"
+           "        return 1;\n"
+           "    }\n"
+           "}\n"
+           "\n"
+           "static void klxr_ext_resolve(void) {\n")
+    s = sub(p, s, old,
+           "    case KLXR_GATE_HANDS:   // " + marker + "\n"
+           '        return kl_env_on("KL_XR_HAND_TRACKING", 1);\n' + old)
+    old = "    X(xrCreateSwapchainAndroidSurfaceKHR)\n"
+    s = sub(p, s, old,
+        "    X(xrCreateSwapchainAndroidSurfaceKHR)                                     \\\n"
+        "    /* " + marker + " */                  \\\n"
+        "    X(xrCreateHandTrackerEXT) X(xrDestroyHandTrackerEXT)                      \\\n"
+        "    X(xrLocateHandJointsEXT)\n")
+    old = '        {"xrLocateSpace",          (void *)klxr_LocateSpace},\n'
+    s = sub(p, s, old, old +
+        "        // " + marker + "\n"
+        '        {"xrCreateHandTrackerEXT",  (void *)mv_xr_CreateHandTrackerEXT},\n'
+        '        {"xrDestroyHandTrackerEXT", (void *)mv_xr_DestroyHandTrackerEXT},\n'
+        '        {"xrLocateHandJointsEXT",   (void *)mv_xr_LocateHandJointsEXT},\n')
+    open(p, "w").write(s)
+print("overlay: XR_EXT_hand_tracking and XR_FB_hand_tracking_aim advertised and dispatched")
+PYEOF
+
+# 141 — xrGetSystemProperties answers XrSystemHandTrackingPropertiesEXT. A title
+# asks whether the SYSTEM tracks hands by chaining it, and a zeroed
+# supportsHandTracking reads "no": the hand subsystem then never creates a
+# tracker. Walked with step 111's probe (the chain can be stack garbage on this
+# call), written only for an instance that enabled XR_EXT_hand_tracking.
+python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+marker = "metavision: hand tracking answered in xrGetSystemProperties (step 141)"
+step111 = "metavision: passthrough answered in xrGetSystemProperties (step 111)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **instance) {\n"
+    s = sub(p, s, old, "// " + marker + r''': XR_EXT_hand_tracking
+// enabled on the instance (the hand-tracking entry points read it too), and the
+// system properties' hand-tracking struct answered "supported". Hands-free mode
+// does not change this answer: it can be switched while a title runs, and an
+// ignored hand is reported inactive at every locate instead.
+static int mv_xr_ext_hand_tracking_on, mv_xr_ext_hand_aim_on;
+static void mv_xr_hand_props_chain(const void *next) {
+    if (!mv_xr_ext_hand_tracking_on) return;
+    for (int depth = 0; next && depth < 16; depth++) {
+        struct { int32_t type; uint32_t pad; const void *next; } h;
+        if (!mv_xr_probe(next, &h, sizeof h)) return;
+        if (h.type == 1000051000) {          // XrSystemHandTrackingPropertiesEXT
+            *(uint32_t *)((char *)(uintptr_t)next + 16) = 1;   // supportsHandTracking
+            static int said;
+            if (!said++) fprintf(stderr, "  [xr] xrGetSystemProperties: "
+                                         "XrSystemHandTrackingPropertiesEXT -> supported\n");
+        }
+        next = h.next;
+    }
+}
+
+''' + old)
+    old = "    mv_xr_fb_passthrough_on = 0;   // " + step111 + "\n"
+    s = sub(p, s, old, old +
+        "    mv_xr_ext_hand_tracking_on = mv_xr_ext_hand_aim_on = 0;   // " + marker + "\n")
+    old = '        if (strcmp(name, "XR_FB_passthrough") == 0) mv_xr_fb_passthrough_on = 1;   // ' + step111 + '\n'
+    s = sub(p, s, old, old +
+        '        if (strcmp(name, "XR_EXT_hand_tracking") == 0) mv_xr_ext_hand_tracking_on = 1;   // ' + marker + '\n'
+        '        if (strcmp(name, "XR_FB_hand_tracking_aim") == 0) mv_xr_ext_hand_aim_on = 1;     // ' + marker + '\n')
+    old = '    mv_xr_system_props_chain(props->next);   // ' + step111 + '\n'
+    s = sub(p, s, old, old +
+        '    mv_xr_hand_props_chain(props->next);     // ' + marker + '\n')
+    open(p, "w").write(s)
+print("overlay: xrGetSystemProperties answers XrSystemHandTrackingPropertiesEXT")
+PYEOF
+
+# 142 — the hand trackers themselves. xrLocateHandJointsEXT answers the 26
+# joints of the measured hand (shims/mv_hands.c: OpenXR's joint frames built from
+# the visionOS joint positions, radii scaled to the hand) in the base space, by
+# the same latched tracking space and composition xrLocateSpace uses. A chained
+# XrHandJointVelocitiesEXT gets the derived per-joint motion (against a static
+# base only), XrHandTrackingAimStateFB the pointing ray, pinch strengths and
+# status. In hands-free mode, or while the hand is lost, the hand is inactive
+# with every flag clear.
+python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+marker = "metavision: OpenXR hand trackers (step 142)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "// ---------------------------------------------------------------- XR_FB_passthrough\n"
+    s = sub(p, s, old, "// ---------------------------------------------------------------- " + marker + r'''
+//
+// Struct offsets are the Khronos header's (LP64): XrHandTrackerCreateInfoEXT
+// hand 16, handJointSet 20; XrHandJointsLocateInfoEXT baseSpace 16, time 24;
+// XrHandJointLocationsEXT isActive 16, jointCount 20, jointLocations 24;
+// XrHandJointVelocitiesEXT jointCount 16, jointVelocities 24;
+// XrHandTrackingAimStateFB status 16, aimPose 24, pinchStrengthIndex..Little 52.
+// The joints are located at the latched sample, as action spaces are: the
+// requested time is not extrapolated to.
+#include "mv_hands.h"
+extern int mv_hands_xr_read(int hand, mv_hands_xr *out) __attribute__((weak));
+enum { MV_XR_TYPE_HAND_TRACKER_CREATE_INFO = 1000051001,
+       MV_XR_TYPE_HAND_JOINTS_LOCATE_INFO = 1000051002,
+       MV_XR_TYPE_HAND_JOINT_LOCATIONS = 1000051003,
+       MV_XR_TYPE_HAND_JOINT_VELOCITIES = 1000051004,
+       MV_XR_TYPE_HAND_TRACKING_AIM_STATE_FB = 1000111001 };
+enum { MV_XR_HAND_TRACKER_MAX = 8, MV_XR_MAGIC_HAND_TRACKER = 0x584b4c48 /* 'XKLH' */ };
+typedef struct { uint64_t flags; XrPosef pose; float radius; } mv_xr_joint_location;
+typedef struct { uint64_t flags; XrVector3f lin, ang; } mv_xr_joint_velocity;
+_Static_assert(sizeof(mv_xr_joint_location) == 40, "XrHandJointLocationEXT");
+_Static_assert(sizeof(mv_xr_joint_velocity) == 32, "XrHandJointVelocityEXT");
+_Static_assert(MV_XR_JOINTS == 26, "XR_HAND_JOINT_COUNT_EXT");
+typedef struct {
+    uint32_t magic;
+    klxr_session *session;
+    int hand;                 // 0 left, 1 right (XrHandEXT minus one)
+    int active;               // what the last locate answered, for the log
+} mv_xr_hand_tracker;
+static mv_xr_hand_tracker g_mv_hand_trackers[MV_XR_HAND_TRACKER_MAX];
+
+static mv_xr_hand_tracker *mv_xr_hand_tracker_of(void *h) {
+    for (int i = 0; i < MV_XR_HAND_TRACKER_MAX; i++)
+        if (h == &g_mv_hand_trackers[i] && g_mv_hand_trackers[i].magic == MV_XR_MAGIC_HAND_TRACKER)
+            return &g_mv_hand_trackers[i];
+    return NULL;
+}
+
+static XrResult mv_xr_CreateHandTrackerEXT(void *session, const void *info, void **out) {
+    klxr_session *s = klxr_sess(session);
+    if (!s) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !out) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    const char *c = info;
+    if (*(const int32_t *)c != MV_XR_TYPE_HAND_TRACKER_CREATE_INFO)
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    int32_t hand = *(const int32_t *)(c + 16), set = *(const int32_t *)(c + 20);
+    if (hand != 1 && hand != 2) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    // XR_HAND_JOINT_SET_DEFAULT_EXT; every other set belongs to an extension
+    // that is not advertised.
+    if (set != 0) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    if (!mv_hands_xr_read) KLXR_RET(KLXR_ERROR_FEATURE_UNSUPPORTED);
+    for (int i = 0; i < MV_XR_HAND_TRACKER_MAX; i++) {
+        mv_xr_hand_tracker *t = &g_mv_hand_trackers[i];
+        if (t->magic == MV_XR_MAGIC_HAND_TRACKER) continue;
+        *t = (mv_xr_hand_tracker){ MV_XR_MAGIC_HAND_TRACKER, s, hand - 1, -1 };
+        *out = t;
+        fprintf(stderr, "  [xr] xrCreateHandTrackerEXT: %s hand%s\n",
+                hand == 1 ? "left" : "right",
+                mv_xr_ext_hand_aim_on ? " (with the FB aim state)" : "");
+        return KLXR_SUCCESS;
+    }
+    KLXR_RET(KLXR_ERROR_LIMIT_REACHED);
+}
+
+static XrResult mv_xr_DestroyHandTrackerEXT(void *tracker) {
+    mv_xr_hand_tracker *t = mv_xr_hand_tracker_of(tracker);
+    if (!t) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    t->magic = 0;
+    return KLXR_SUCCESS;
+}
+
+static XrResult mv_xr_LocateHandJointsEXT(void *tracker, const void *info, void *locations) {
+    mv_xr_hand_tracker *t = mv_xr_hand_tracker_of(tracker);
+    if (!t) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    if (!info || !locations) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    const char *li = info;
+    char *lo = locations;
+    if (*(const int32_t *)li != MV_XR_TYPE_HAND_JOINTS_LOCATE_INFO ||
+        *(const int32_t *)lo != MV_XR_TYPE_HAND_JOINT_LOCATIONS)
+        KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+    klxr_space *bs = klxr_space_of(*(void *const *)(li + 16));
+    if (!bs) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+    int64_t time = *(const int64_t *)(li + 24);
+    uint32_t count = *(uint32_t *)(lo + 20);
+    mv_xr_joint_location *joints = *(mv_xr_joint_location **)(lo + 24);
+    if (count != MV_XR_JOINTS || !joints) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+
+    // The chained outputs: velocities and the aim state, each at most once.
+    mv_xr_joint_velocity *vel = NULL;
+    char *aim = NULL;
+    const void *next = *(void **)(lo + 8);
+    for (int depth = 0; next && depth < 16; depth++) {
+        struct { int32_t type; uint32_t pad; const void *next; } h;
+        if (!mv_xr_probe(next, &h, sizeof h)) break;
+        char *n = (char *)(uintptr_t)next;
+        if (h.type == MV_XR_TYPE_HAND_JOINT_VELOCITIES && !vel) {
+            if (*(uint32_t *)(n + 16) != MV_XR_JOINTS) KLXR_RET(KLXR_ERROR_VALIDATION_FAILURE);
+            vel = *(mv_xr_joint_velocity **)(n + 24);
+        } else if (h.type == MV_XR_TYPE_HAND_TRACKING_AIM_STATE_FB && !aim) {
+            aim = n;
+        }
+        next = h.next;
+    }
+
+    mv_hands_xr x;
+    int bs_tracked = 1;
+    klxr_head_delta pred = klxr_frame_head_delta(bs->session, time);
+    XrPosef base = klxr_space_pose_ex(bs, &bs_tracked, NULL, NULL, NULL, &pred);
+    int active = bs_tracked && mv_hands_xr_read && mv_hands_xr_read(t->hand, &x);
+
+    *(uint32_t *)(lo + 16) = (uint32_t)active;
+    memset(joints, 0, MV_XR_JOINTS * sizeof *joints);
+    if (vel) memset(vel, 0, MV_XR_JOINTS * sizeof *vel);
+    if (aim) memset(aim + 16, 0, 8 + sizeof(XrPosef) + 4 * sizeof(float));
+    if (active != t->active) {
+        fprintf(stderr, "  [xr] xrLocateHandJointsEXT: %s hand %s\n",
+                t->hand ? "right" : "left", active ? "tracked" : "inactive");
+        t->active = active;
+    }
+    for (int j = 0; j < MV_XR_JOINTS; j++) joints[j].pose.orientation.w = 1;
+    if (!active) {
+        if (aim) ((XrPosef *)(aim + 24))->orientation.w = 1;
+        return KLXR_SUCCESS;
+    }
+
+    XrQuaternionf to_base = klxr_qconj(base.orientation);
+    // A velocity is stated in the base's frame, which is only the measured
+    // number turned when the base does not move (see xrLocateSpace).
+    int base_static = bs->reference_type == KLXR_REF_SPACE_LOCAL ||
+                      bs->reference_type == KLXR_REF_SPACE_STAGE ||
+                      bs->reference_type == KLXR_REF_SPACE_LOCAL_FLOOR;
+    for (int j = 0; j < MV_XR_JOINTS; j++) {
+        const float *f = x.pose[j];
+        XrPosef jp = { { f[0], f[1], f[2], f[3] }, { f[4], f[5], f[6] } };
+        joints[j].pose = klxr_pose_rel(base, jp);
+        joints[j].radius = x.radius[j];
+        joints[j].flags = KLXR_SPACE_ORIENTATION_VALID | KLXR_SPACE_POSITION_VALID |
+                          KLXR_SPACE_ORIENTATION_TRACKED | KLXR_SPACE_POSITION_TRACKED;
+        if (vel && base_static && x.motion_valid) {
+            vel[j].lin = klxr_qrot(to_base, (XrVector3f){ x.lin[j][0], x.lin[j][1], x.lin[j][2] });
+            vel[j].ang = klxr_qrot(to_base, (XrVector3f){ x.ang[j][0], x.ang[j][1], x.ang[j][2] });
+            vel[j].flags = KLXR_VELOCITY_LINEAR_VALID | KLXR_VELOCITY_ANGULAR_VALID;
+        }
+    }
+    if (aim) {
+        enum { AIM_COMPUTED = 0x1, AIM_VALID = 0x2, AIM_INDEX_PINCHING = 0x4,
+               AIM_DOMINANT = 0x80 };
+        uint64_t status = AIM_COMPUTED | AIM_VALID | (t->hand == 1 ? AIM_DOMINANT : 0);
+        float *pinch = (float *)(aim + 52);
+        for (int f = 1; f < 5; f++) {        // index, middle, ring, little
+            pinch[f - 1] = x.pinch[f];
+            if (x.pinch[f] >= 0.9f) status |= (uint64_t)AIM_INDEX_PINCHING << (f - 1);
+        }
+        *(uint64_t *)(aim + 16) = status;
+        XrPosef ap = { { x.aim[0], x.aim[1], x.aim[2], x.aim[3] },
+                       { x.aim[4], x.aim[5], x.aim[6] } };
+        *(XrPosef *)(aim + 24) = klxr_pose_rel(base, ap);
+    }
+    return KLXR_SUCCESS;
+}
+
+''' + old)
+    open(p, "w").write(s)
+print("overlay: xrCreateHandTrackerEXT / xrLocateHandJointsEXT answer the visionOS hand, with the FB aim state")
+PYEOF

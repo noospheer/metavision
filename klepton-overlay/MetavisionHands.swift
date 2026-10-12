@@ -16,6 +16,10 @@ private func mv_hands_publish(_ hand: Int32, _ tracked: Int32,
                               _ time: Double)
 @_silgen_name("mv_hands_set_enabled")
 private func mv_hands_set_enabled(_ on: Int32)
+@_silgen_name("mv_hands_publish_xr")
+private func mv_hands_publish_xr(_ hand: Int32, _ tracked: Int32,
+                                 _ pos: UnsafePointer<Float>?, _ root: UnsafePointer<Float>?,
+                                 _ time: Double)
 
 enum MetavisionHands {
     private typealias J = HandSkeleton.JointName
@@ -34,6 +38,23 @@ enum MetavisionHands {
     private static let tips: [J] = [.thumbTip, .indexFingerTip, .middleFingerTip,
                                     .ringFingerTip, .littleFingerTip]
 
+    /// XrHandJointEXT -> ARKit joint, for the runtime's OpenXR hand tracking
+    /// (mv_hands_publish_xr). The palm (nil) is derived there. The thumb's
+    /// knuckle / intermediate base / intermediate tip are its CMC, MCP and IP
+    /// joints, i.e. OpenXR's thumb metacarpal, proximal and distal.
+    private static let xrJoints: [J?] = [
+        nil, .wrist,
+        .thumbKnuckle, .thumbIntermediateBase, .thumbIntermediateTip, .thumbTip,
+        .indexFingerMetacarpal, .indexFingerKnuckle, .indexFingerIntermediateBase,
+        .indexFingerIntermediateTip, .indexFingerTip,
+        .middleFingerMetacarpal, .middleFingerKnuckle, .middleFingerIntermediateBase,
+        .middleFingerIntermediateTip, .middleFingerTip,
+        .ringFingerMetacarpal, .ringFingerKnuckle, .ringFingerIntermediateBase,
+        .ringFingerIntermediateTip, .ringFingerTip,
+        .littleFingerMetacarpal, .littleFingerKnuckle, .littleFingerIntermediateBase,
+        .littleFingerIntermediateTip, .littleFingerTip,
+    ]
+
     static func publish(left: HandAnchor?, right: HandAnchor?) {
         let on = !MetavisionHandsFree.shared.ignoresHands
         mv_hands_set_enabled(on ? 1 : 0)
@@ -41,6 +62,7 @@ enum MetavisionHands {
         for (hand, anchor) in [(0, left), (1, right)] {
             guard on, let a = anchor, a.isTracked, let sk = a.handSkeleton else {
                 mv_hands_publish(Int32(hand), 0, nil, nil, nil, nil, t)
+                mv_hands_publish_xr(Int32(hand), 0, nil, nil, t)
                 continue
             }
             var model = [Float](); model.reserveCapacity(24 * 7)
@@ -75,6 +97,16 @@ enum MetavisionHands {
                     mv_hands_publish(Int32(hand), 1, m.baseAddress, r.baseAddress,
                                      p.baseAddress, s.baseAddress, t)
                 }}
+            }}
+
+            // The same frame for OpenXR: every joint's position in the anchor's frame.
+            var xr = [Float](); xr.reserveCapacity(26 * 3)
+            for j in xrJoints {
+                let c = j.map { sk.joint($0).anchorFromJointTransform.columns.3 } ?? SIMD4<Float>(0, 0, 0, 1)
+                xr += [c.x, c.y, c.z]
+            }
+            xr.withUnsafeBufferPointer { x in root.withUnsafeBufferPointer { r in
+                mv_hands_publish_xr(Int32(hand), 1, x.baseAddress, r.baseAddress, t)
             }}
         }
     }

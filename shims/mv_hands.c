@@ -378,6 +378,159 @@ void mv_hands_publish(int hand, int tracked, const float *model, const float *ro
     pthread_mutex_unlock(&g_lock);
 }
 
+// ---- OpenXR's hand: the measured joints, joint by joint ----------------------
+//
+// XR_EXT_hand_tracking describes the hand the user has, not a rig: 26 joints,
+// each a pose and a radius. ARKit names 25 of them (the palm is derived), and the
+// joint mapping is one to one: the thumb's knuckle, intermediate base and
+// intermediate tip are its metacarpal (CMC), proximal (MCP) and distal (IP)
+// joints, and each finger's metacarpal, knuckle, intermediate base, intermediate
+// tip and tip are its metacarpal, proximal, intermediate, distal and tip joints.
+//
+// The orientations are OpenXR's, built from the positions, as the OVRPlugin path
+// above does: ARKit's joint axes are not used. OpenXR's convention is -Z along
+// the bone towards the fingertip and +Y out of the back of the hand, so each
+// joint's -Z is the direction to the next joint distally (a tip keeps its distal
+// bone's), and its +Y is the back of the hand (from the index and little
+// knuckles about the wrist, by chirality) made perpendicular to that. The thumb
+// is turned against the palm, so its nail faces half way between the back of the
+// hand and away from the palm's centre.
+enum { XJ_PALM = 0, XJ_WRIST = 1, XJ_THUMB = 2, XJ_INDEX = 6, XJ_MIDDLE = 11,
+       XJ_LITTLE = 21 };   // a finger: metacarpal, proximal, intermediate, distal, tip
+
+// Radii in metres for a hand whose wrist-to-middle-knuckle span is 9.5 cm,
+// scaled by the measured span: palm, wrist, thumb x4, index/middle/ring/little x5.
+#define XR_SPAN_NOMINAL 0.095f
+static const float k_xr_radius[MV_XR_JOINTS] = {
+    0.025f, 0.027f,
+    0.019f, 0.015f, 0.012f, 0.010f,
+    0.022f, 0.0110f, 0.0095f, 0.0085f, 0.0075f,
+    0.022f, 0.0115f, 0.0100f, 0.0088f, 0.0078f,
+    0.020f, 0.0105f, 0.0090f, 0.0080f, 0.0070f,
+    0.018f, 0.0090f, 0.0080f, 0.0072f, 0.0065f,
+};
+
+static struct {
+    int tracked, motion_valid, seen;
+    double time;
+    float pose[MV_XR_JOINTS][7];
+    float radius[MV_XR_JOINTS];
+    float lin[MV_XR_JOINTS][3], ang[MV_XR_JOINTS][3];
+} g_xr[2];
+
+// Which joint each one points at: the next one distally, or (a tip) -1.
+static int xr_next(int j) {
+    if (j == XJ_PALM) return XJ_MIDDLE + 1;          // along the middle metacarpal
+    if (j == XJ_WRIST) return XJ_MIDDLE + 1;         // towards the middle knuckle
+    if (j >= XJ_THUMB && j < XJ_INDEX) return j == XJ_INDEX - 1 ? -1 : j + 1;
+    return (j - XJ_INDEX) % 5 == 4 ? -1 : j + 1;
+}
+
+// One hand's joints in tracking space (p, palm slot already filled) -> poses.
+static void xr_orient(int hand, const mv_vec3 *p, float pose[MV_XR_JOINTS][7]) {
+    mv_vec3 a = v_sub(p[XJ_INDEX + 1], p[XJ_WRIST]), b = v_sub(p[XJ_LITTLE + 1], p[XJ_WRIST]);
+    // Right hand palm down, fingers forward: index to the left of the little
+    // finger, and (little x index) points up out of the back. Mirrored for the left.
+    mv_vec3 back = v_unit(hand ? v_cross(b, a) : v_cross(a, b));
+    for (int j = 0; j < MV_XR_JOINTS; j++) {
+        int n = xr_next(j);
+        mv_vec3 fwd = n >= 0 ? v_sub(p[n], p[j])
+                    : v_sub(p[j], p[j - 1]);         // a tip: its distal bone
+        if (j == XJ_PALM) fwd = v_sub(p[XJ_MIDDLE + 1], p[XJ_MIDDLE]);
+        if (v_len(fwd) < 1e-6f) fwd = v_sub(p[XJ_MIDDLE + 1], p[XJ_WRIST]);
+        mv_vec3 z = v_unit(v_scale(fwd, -1));        // +Z back along the bone
+        mv_vec3 y = back;
+        if (j >= XJ_THUMB && j < XJ_INDEX) {
+            mv_vec3 out = v_unit(v_sub(p[XJ_THUMB + 1], p[XJ_PALM]));
+            y = v_add(back, out);
+        }
+        y = v_sub(y, v_scale(z, v_dot(y, z)));
+        if (v_len(y) < 1e-4f) {                      // bone along the back: any perpendicular
+            y = v_cross(z, (mv_vec3){ 1, 0, 0 });
+            if (v_len(y) < 1e-4f) y = v_cross(z, (mv_vec3){ 0, 1, 0 });
+        }
+        y = v_unit(y);
+        mv_vec3 x = v_cross(y, z);
+        mv_quat q = q_from_basis(x, y, z);
+        pose[j][0] = q.x; pose[j][1] = q.y; pose[j][2] = q.z; pose[j][3] = q.w;
+        pose[j][4] = p[j].x; pose[j][5] = p[j].y; pose[j][6] = p[j].z;
+    }
+}
+
+void mv_hands_publish_xr(int hand, int tracked, const float *pos, const float *root,
+                         double time_s) {
+    if (hand < 0 || hand > 1) return;
+    tracked = tracked && pos && root;
+    float pose[MV_XR_JOINTS][7], radius[MV_XR_JOINTS];
+    if (tracked) {           // computed outside the lock, as mv_hands_publish does
+        mv_pose r = pose_from(root);
+        mv_vec3 p[MV_XR_JOINTS];
+        for (int j = 1; j < MV_XR_JOINTS; j++)
+            p[j] = v_add(r.p, q_rot(r.o, (mv_vec3){ pos[3*j], pos[3*j + 1], pos[3*j + 2] }));
+        // The palm: the middle of the middle finger's metacarpal.
+        p[XJ_PALM] = v_scale(v_add(p[XJ_MIDDLE], p[XJ_MIDDLE + 1]), 0.5f);
+        xr_orient(hand, p, pose);
+        float k = v_len(v_sub(p[XJ_MIDDLE + 1], p[XJ_WRIST])) / XR_SPAN_NOMINAL;
+        if (!(k > 0.7f && k < 1.4f)) k = k > 1 ? 1.4f : 0.7f;
+        for (int j = 0; j < MV_XR_JOINTS; j++) radius[j] = k_xr_radius[j] * k;
+    }
+    pthread_mutex_lock(&g_lock);
+    double dt = time_s - g_xr[hand].time;
+    int motion = tracked && g_xr[hand].tracked && dt > 1e-4 && dt < 0.1;
+    if (tracked) {
+        for (int j = 0; j < MV_XR_JOINTS; j++) {
+            if (!motion) {
+                memset(g_xr[hand].lin[j], 0, sizeof g_xr[hand].lin[j]);
+                memset(g_xr[hand].ang[j], 0, sizeof g_xr[hand].ang[j]);
+                continue;
+            }
+            const float *o = g_xr[hand].pose[j], *c = pose[j];
+            for (int k = 0; k < 3; k++) g_xr[hand].lin[j][k] = (float)((c[4 + k] - o[4 + k]) / dt);
+            // The turn since the last sample, as a rotation vector over dt.
+            mv_quat d = q_norm(q_mul((mv_quat){ c[0], c[1], c[2], c[3] },
+                                     q_conj((mv_quat){ o[0], o[1], o[2], o[3] })));
+            if (d.w < 0) d = (mv_quat){ -d.x, -d.y, -d.z, -d.w };
+            float s = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
+            float w = s > 1e-7f ? 2.0f * atan2f(s, d.w) / (s * (float)dt) : 2.0f / (float)dt;
+            g_xr[hand].ang[j][0] = d.x * w; g_xr[hand].ang[j][1] = d.y * w; g_xr[hand].ang[j][2] = d.z * w;
+        }
+        memcpy(g_xr[hand].pose, pose, sizeof pose);
+        memcpy(g_xr[hand].radius, radius, sizeof radius);
+        if (!g_xr[hand].seen) {
+            g_xr[hand].seen = 1;
+            fprintf(stderr, "  [mv-hands] %s hand seen: %d OpenXR joints\n",
+                    hand ? "right" : "left", MV_XR_JOINTS);
+        }
+    }
+    g_xr[hand].tracked = tracked;
+    g_xr[hand].motion_valid = motion;
+    g_xr[hand].time = time_s;
+    pthread_mutex_unlock(&g_lock);
+}
+
+int mv_hands_xr_read(int hand, mv_hands_xr *out) {
+    if (hand < 0 || hand > 1 || !out) return 0;
+    pthread_mutex_lock(&g_lock);
+    int ok = g_enabled && g_xr[hand].tracked;
+    if (ok) {
+        memcpy(out->pose, g_xr[hand].pose, sizeof out->pose);
+        memcpy(out->radius, g_xr[hand].radius, sizeof out->radius);
+        memcpy(out->lin, g_xr[hand].lin, sizeof out->lin);
+        memcpy(out->ang, g_xr[hand].ang, sizeof out->ang);
+        out->motion_valid = g_xr[hand].motion_valid;
+        out->time = g_xr[hand].time;
+        // The aim ray and pinches are mv_hands_publish's, from the same frame;
+        // before it has seen this hand, the wrist stands in for the ray.
+        mv_pose a = g_hand[hand].seen ? g_hand[hand].pointer
+                  : pose_from(g_xr[hand].pose[XJ_WRIST]);
+        float aim[7] = { a.o.x, a.o.y, a.o.z, a.o.w, a.p.x, a.p.y, a.p.z };
+        memcpy(out->aim, aim, sizeof aim);
+        for (int i = 0; i < 5; i++) out->pinch[i] = g_hand[hand].seen ? g_hand[hand].pinch[i] : 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
 static int32_t mv_GetHandTrackingEnabled(int32_t *out) {
     if (!out) return OVRP_FAIL_INVALID_PARAM;
     pthread_mutex_lock(&g_lock);
