@@ -11,6 +11,9 @@ could not load, or still running when closed), its most frequent errors, and
 how far the scripted input got. verdict() is what `test` records per run:
 
     pass     drew, ran to the end, no crash, no errors of the kinds below
+             (silence included, when the title is quiet by design: it ships
+             no audio content, or only short interaction effects)
+    silent   drew, no serious error, never made a sound although it ships some
     errors   ran, but logged exceptions, shader/compute failures or a failed load
     black    ran to the end without ever drawing a frame
     stopped  the runtime stopped it (an entry point it does not implement)
@@ -18,7 +21,9 @@ how far the scripted input got. verdict() is what `test` records per run:
              scripted input just before, which is usually what asked for it
     crashed  a fault, a system crash report, or it exited on its own early
 """
+import hashlib
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -61,12 +66,145 @@ RUNTIME_LIBS = {"libvulkan.so", "libvulkan.so.1", "libEGL.so", "libGLESv2.so", "
 BENIGN = re.compile(r"OBB has mismatching GUID.*got ''")
 
 
-def shipped_libs(d: Path):
-    """The title's own .so names (build/guests/<title>/lib/arm64-v8a), or None."""
+def guest_dir(d: Path):
+    """The title's unpacked APK (build/guests/<title>) for a run directory, or None."""
     for p in [d, *d.parents]:
         if p.name.startswith("mv_"):
-            lib = Path(__file__).resolve().parent.parent / "build" / "guests" / p.name / "lib" / "arm64-v8a"
-            return {x.name for x in lib.glob("*.so")} if lib.is_dir() else None
+            g = Path(__file__).resolve().parent.parent / "build" / "guests" / p.name
+            return g if g.is_dir() else None
+    return None
+
+
+def shipped_libs(d: Path):
+    """The title's own .so names (build/guests/<title>/lib/arm64-v8a), or None."""
+    g = guest_dir(d)
+    lib = g / "lib" / "arm64-v8a" if g else None
+    return {x.name for x in lib.glob("*.so")} if lib and lib.is_dir() else None
+
+
+# What a title can play without being asked: sound files and banks it ships
+# (FMOD .bank/.fsb, Wwise .bnk/.wem/.pck, plain audio), videos (which may
+# carry a soundtrack), and, for Unity, its AudioClips and the soundtracks of
+# VideoClips a VideoPlayer actually sends somewhere — in the APK and in any
+# expansion OBB it reads its data from.
+AUDIO_FILES = (".mp3", ".ogg", ".wav", ".m4a", ".aac", ".flac", ".opus",
+               ".bank", ".fsb", ".bnk", ".wem", ".pck")
+VIDEO_FILES = (".mp4", ".m4v", ".mov", ".webm", ".mkv")
+# A middleware sound engine the title links: its banks can hide inside Unity
+# assets (FMOD's "bank as TextAsset" mode), so with no bank file seen, its
+# sound content cannot be told from the data.
+AUDIO_ENGINES = re.compile(r"fmodstudio|AkSoundEngine|wwise", re.I)
+# Clips this short are effects (a click, a whoosh, a pinch), played on an
+# interaction the scripted input may never make — not music or ambience.
+SHORT_CLIP_S = 2.0
+AUDIO_SCAN_V = 2
+
+
+def title_obbs(g: Path):
+    """The expansion OBBs pulled for this title (pull/<package>/obb/*.obb)."""
+    m = re.search(r'package="([^"]+)"', (g / "AndroidManifest.xml").read_text(errors="replace")) \
+        if (g / "AndroidManifest.xml").is_file() else None
+    obb = g.parent.parent.parent / "pull" / m.group(1) / "obb" if m else None
+    return sorted(obb.glob("*.obb")) if obb and obb.is_dir() else []
+
+
+def audio_content(d: Path):
+    """The audio a title ships, from its unpacked APK and OBBs: {"files":
+    [...], "videos": n, "clips": n, "longest": s, "video_audio": n,
+    "engines": [...]}; None when it cannot be told (no unpacked APK, not a
+    Unity title, data in an OBB that was not pulled, or UnityPy missing).
+    Cached next to the unpacked APK (build/guests/<title>.audio.json)."""
+    import zipfile
+    g = guest_dir(d)
+    assets = g / "assets" if g else None
+    if not assets or not (assets / "bin" / "Data").is_dir():
+        return None
+    entries = []
+    for root, _, fs in os.walk(assets):
+        for f in fs:
+            st = os.stat(os.path.join(root, f))
+            entries.append((os.path.relpath(os.path.join(root, f), assets), st.st_size, int(st.st_mtime)))
+    obbs = title_obbs(g)
+    if (assets / "unity_obb_guid").is_file() and not obbs:
+        return None                                  # its data lives in an OBB we do not have
+    libs = sorted(shipped_libs(d) or ())
+    sig = hashlib.sha1(repr((AUDIO_SCAN_V, sorted(entries), libs,
+                             [(o.name, o.stat().st_size, int(o.stat().st_mtime)) for o in obbs])).encode()).hexdigest()
+    cache = g.parent / f"{g.name}.audio.json"
+    try:
+        c = json.loads(cache.read_text())
+        if c.get("sig") == sig:
+            return c["info"]
+    except Exception:
+        pass
+    try:
+        import UnityPy
+    except ImportError:
+        return None
+    names = [e[0] for e in entries]
+    try:
+        env = UnityPy.Environment()
+        env.load_folder(str(assets))
+        for o in obbs:
+            names += zipfile.ZipFile(o).namelist()
+            env.load_zip_file(str(o))
+    except Exception:
+        return None
+    info = {"files": sorted({n.rsplit("/", 1)[-1] for n in names if n.lower().endswith(AUDIO_FILES)}),
+            "videos": sum(1 for n in names if n.lower().endswith(VIDEO_FILES)),
+            "clips": 0, "longest": 0.0, "video_audio": 0,
+            "engines": [x for x in libs if AUDIO_ENGINES.search(x)]}
+    vclips_audio = players = players_audio = 0
+    try:
+        for o in env.objects:
+            n = o.type.name
+            if n == "AudioClip":
+                info["clips"] += 1
+                try:
+                    length = float(o.read().m_Length or 0)
+                except Exception:
+                    length = 1e9                     # unreadable: assume it is long
+                info["longest"] = max(info["longest"], length)
+            elif n == "VideoClip":
+                try:
+                    vclips_audio += bool(o.read_typetree().get("m_AudioChannelCount"))
+                except Exception:
+                    vclips_audio += 1
+            elif n == "VideoPlayer":
+                players += 1
+                try:
+                    tt = o.read_typetree()
+                except Exception:
+                    players_audio += 1
+                    continue
+                mode = tt.get("m_AudioOutputMode")   # 0 none, 1 AudioSource, 2 direct, 3 API only
+                muted = mode == 2 and all(tt.get("m_DirectAudioMutes") or [True])
+                if mode in (1, 2, 3) and tt.get("m_ControlledAudioTrackCount") and not muted:
+                    players_audio += 1
+    except Exception:
+        return None
+    # A soundtrack counts when a placed VideoPlayer plays it, or when none is
+    # placed (a script makes one, and a new VideoPlayer outputs sound).
+    info["video_audio"] = vclips_audio if players_audio or not players else 0
+    try:
+        cache.write_text(json.dumps({"sig": sig, "info": info}))
+    except OSError:
+        pass
+    return info
+
+
+def quiet_by_design(info):
+    """Why silence is what this title does on its own, or None when it ships
+    sound it could be playing (or that cannot be told). Sound made at run
+    time from nothing shipped (speech synthesis, a synth in code) is not
+    seen here; such a title is quiet by design only until it speaks."""
+    if not info or info["files"] or info["videos"] or info["video_audio"] or info.get("engines"):
+        return None
+    if info["clips"] == 0:
+        return "it ships no audio clips, sound banks, audio files or video soundtracks it plays"
+    if info["longest"] < SHORT_CLIP_S:
+        return (f"its only sounds are {info['clips']} short effect clip(s) (longest "
+                f"{info['longest']:.1f} s), played on an interaction")
     return None
 
 
@@ -151,8 +289,26 @@ def triage(d: Path):
         notes.append("needs GLES compute (not available): its compute effects are missing")
     peaks = [int(m.group(1)) for m in AUDIO.finditer(text)]
     if peaks and max(peaks) == 0:
-        notes.append("SILENT: the title produced no sound (audio peak 0)"
-                     + ("; it records, so sound may be only an input" if RECORDS.search(text) else ""))
+        # Silence is a failure only when the title ships sound to play: one
+        # with no audio content, or only short interaction effects, is quiet
+        # by design (decided from its data, never its name).
+        info = audio_content(d)
+        records = RECORDS.search(text)
+        if why := quiet_by_design(info):
+            notes.append(f"quiet by design: no sound, and none expected — {why}"
+                         + ("; it records (the microphone is an input)" if records else ""))
+        else:
+            ships = ""
+            if info:
+                parts = [f"{info['clips']} audio clip(s)"
+                         + (f" (longest {info['longest']:.0f} s)" if info["clips"] else "")]
+                if info["files"]:
+                    parts.append(f"{len(info['files'])} sound file(s)/bank(s)")
+                if info["videos"] or info["video_audio"]:
+                    parts.append(f"{info['videos'] + info['video_audio']} video(s) that may carry sound")
+                ships = "; it ships " + ", ".join(parts)
+            notes.append("SILENT: the title produced no sound (audio peak 0)" + ships
+                         + ("; it records, so sound may be only an input" if records else ""))
     if HANDS in text:
         notes.append("uses hand tracking")
     said = len(re.findall(r'\[mv-autoplay\][^\n]* say "', text))
@@ -215,12 +371,13 @@ def coverage(text: str):
            (0, 0, "nothing selectable found")
 
 
-def healthy_so_far(text: str, shipped=None):
+def healthy_so_far(text: str, shipped=None, expect_sound=True):
     """Whether a run in progress has already shown everything a pass needs, so
     `test --adaptive` can end it early: at least two screenshots with a picture,
     sound, the input-mode cycle through hands and hands-free, and nothing
     serious — no fault, no fatal stop, no failed library load, no serious Unity
-    error. Returns (ok, what is still missing)."""
+    error. Sound is not waited for when the title is quiet by design
+    (expect_sound=False, from quiet_by_design). Returns (ok, what is still missing)."""
     # The same tests triage() applies at the end, so a run ends early only when
     # its final verdict would be a pass.
     if FAULT.search(text) or FATAL.search(text) or load_failures(text, shipped):
@@ -230,7 +387,7 @@ def healthy_so_far(text: str, shipped=None):
     lit = [m for m in SHOT.finditer(text) if shot_has_content(m)]
     if len(lit) < 2 and not re.search(r"\[mv-shot\] eye format \d+ not captured", text):   # no shots to wait for
         return False, "two screenshots with a picture"
-    if max((int(m.group(1)) for m in AUDIO.finditer(text)), default=0) == 0:
+    if expect_sound and max((int(m.group(1)) for m in AUDIO.finditer(text)), default=0) == 0:
         return False, "sound"
     cyc = set(re.findall(r"\[mv-autoplay\] t=\S+ mode cycle: (\w+)", text))
     if not {"hands", "handsfree"} <= cyc:

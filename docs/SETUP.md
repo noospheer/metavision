@@ -291,7 +291,11 @@ judged by `tools/metavision-triage`: **pass**, **errors** (exceptions,
 shader/compute failures, a library that would not load; the summary names the
 error that decided it), **black** (never drew, or every screenshot empty),
 **dark** (at most one screenshot with content: a sparse scene, or only the
-controllers; a serious error outranks it), **silent** (drew, no serious error, but never made a sound),
+controllers; a serious error outranks it), **silent** (drew, no serious error, but never made a sound although the title
+ships sound to play; one whose APK and OBB hold no audio clips, sound banks,
+audio files or played video soundtracks, or only short interaction effects, is
+a pass noted "quiet by design" — read from the title's data with UnityPy,
+cached in `build/guests/<title>.audio.json`),
 **stopped** (an unimplemented entry point), **quit** (the title closed itself;
 the summary names the scripted input just before it), **asleep** (sent to the
 background mid-run — the headset taken off; re-run, not counted) or

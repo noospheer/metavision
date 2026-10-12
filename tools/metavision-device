@@ -732,6 +732,7 @@ async def cmd_test(a):
         cap = 25 if probe else state["seconds"] + (25 if hands_only(tree) else 0)   # + the start gesture
         seen, text = 0, ""                     # --adaptive: the boot log read so far
         adaptive_said = False
+        expect_sound = None
         while time.time() - t0 < cap:
             await asyncio.sleep(5)
             if await pc.process_identifier_for_bundle_identifier(bundle) != pid:
@@ -750,7 +751,9 @@ async def cmd_test(a):
                         finally:
                             await afc.fclose(h)
                         seen = size
-                    ok, _missing = triage.healthy_so_far(text, triage.shipped_libs(out))
+                    if expect_sound is None:     # once per run: the title's own audio content
+                        expect_sound = triage.quiet_by_design(triage.audio_content(out)) is None
+                    ok, _missing = triage.healthy_so_far(text, triage.shipped_libs(out), expect_sound)
                     if ok:
                         early = round(time.time() - t0)
                         break
