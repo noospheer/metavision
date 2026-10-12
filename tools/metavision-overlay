@@ -12140,9 +12140,11 @@ PYEOF
 # base only), XrHandTrackingAimStateFB the pointing ray, pinch strengths and
 # status. In hands-free mode, or while the hand is lost, the hand is inactive
 # with every flag clear.
-python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
-import sys
+python3 - "$K/runtime/xr/kl_openxr.c" "$ROOT/shims/mv_hands.h" <<'PYEOF'
+import os, sys
 marker = "metavision: OpenXR hand trackers (step 142)"
+# the shim header by its path from this file: the runtime's include path has no shims/
+hands_h = os.path.relpath(sys.argv[2], os.path.dirname(os.path.abspath(sys.argv[1])))
 def sub(p, s, old, new):
     if s.count(old) != 1:
         sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
@@ -12160,7 +12162,7 @@ if marker not in s:
 // XrHandTrackingAimStateFB status 16, aimPose 24, pinchStrengthIndex..Little 52.
 // The joints are located at the latched sample, as action spaces are: the
 // requested time is not extrapolated to.
-#include "mv_hands.h"
+#include "@MV_HANDS_H@"
 extern int mv_hands_xr_read(int hand, mv_hands_xr *out) __attribute__((weak));
 enum { MV_XR_TYPE_HAND_TRACKER_CREATE_INFO = 1000051001,
        MV_XR_TYPE_HAND_JOINTS_LOCATE_INFO = 1000051002,
@@ -12312,6 +12314,7 @@ static XrResult mv_xr_LocateHandJointsEXT(void *tracker, const void *info, void 
 }
 
 ''' + old)
+    s = s.replace("@MV_HANDS_H@", hands_h)
     open(p, "w").write(s)
 print("overlay: xrCreateHandTrackerEXT / xrLocateHandJointsEXT answer the visionOS hand, with the FB aim state")
 PYEOF
