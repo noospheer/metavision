@@ -27,13 +27,15 @@ deliberate.
 ## How hands-free works
 
 In hands-free (and in Auto whenever no hand is in view), metavision supplies
-the right controller:
+both controllers. The right one is the pointer; the left one is held just
+below and left of your head, facing where you face, so titles that want two
+controllers present have them:
 
-- **Pointing.** The controller is aimed by your **head**. When you make a
+- **Pointing.** The right controller is aimed by your **head**. When you make a
   system select, it snaps to **where you were looking** — visionOS reports the
   gaze direction with every select, and only then (apps never see continuous
   eye position).
-- **Selecting.** The trigger is pressed by any system select —
+- **Selecting.** The right trigger is pressed by any system select —
   **Dwell Control** (hold your gaze), **Voice Control**, or a pinch — or by
   saying **"select"**.
 - **Everything else, by voice.** Apple's speech recognition turns speech into
@@ -51,6 +53,40 @@ the right controller:
 | menu / pause | tap Menu (left controller) |
 | recenter | recenter the view, like holding the Meta button on a Quest |
 | auto mode / hands mode / hands-free mode | switch input mode |
+| **Left hand** | |
+| left select / left trigger / left click | tap the left trigger |
+| left grab / left grip | tap the left grip |
+| X button (or X) | tap X |
+| Y button (or Y) | tap Y |
+| both hold … release / drop | hold trigger and grip on both hands until released (two-handed lifting) |
+| **Moving** | |
+| forward / go / walk | walk forward (left stick) |
+| back up / backward / reverse / go back | walk backward |
+| left / right (or step left / step right) | step sideways |
+| turn left / turn right | turn: a quick flick of the right stick, as snap turning expects |
+| keep going / keep moving | keep doing the last move (or turn) until you say "stop" |
+| stop / halt | stop moving |
+
+A move lasts 1.5 seconds and a turn is a 0.25-second flick, then the stick
+lets go by itself; say it again to go further, or "keep going" to keep moving
+until "stop". You can turn while walking.
+
+**Words that sound alike are settled by the longer phrase:**
+
+- "back" alone is the B button; "back up" (or "backward", "reverse", "go
+  back") walks backward. After "back", metavision waits about half a second
+  to hear whether "up" follows.
+- "left" alone steps left; "left select", "left grab" and the like are the
+  left controller. "turn left" turns.
+- "hold" holds the right hand; "both hold" holds both. "release" lets go of
+  everything held.
+- "stop" stops moving; it does not let go of anything held ("release" does).
+- Y on its own is often heard as "why": say "Y button".
+
+**Moving and left-hand commands must be said as a short phrase of their
+own** — after a pause or another command, and followed by a pause or another
+command — so ordinary talk ("I want to go there", "that's right") does not
+move you. They count about half a second after you finish saying them.
 
 ## Setting it up
 
@@ -74,6 +110,8 @@ From the Linux machine, for a title's app (add `--launcher` for the launcher):
 ```bash
 sudo tools/metavision-device env mv_<title> MV_INPUT_MODE=handsfree   # start in a mode
 sudo tools/metavision-device env mv_<title> MV_VOICE=0               # no speech recognition
+sudo tools/metavision-device env mv_<title> MV_VOICE_MOVE=3         # each spoken move lasts 3 s (1.5)
+sudo tools/metavision-device env mv_<title> MV_VOICE_TURN=0.6       # a longer turn, for smooth turning (0.25)
 sudo tools/metavision-device env mv_<title>                           # clear: back to the remembered mode
 ```
 
@@ -82,7 +120,12 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
 
 ## What does not work yet
 
-- **Moving around with a thumbstick**, and two-handed interactions.
+- **Pointing with the left hand.** The left controller faces where your
+  head faces; only the right one follows your gaze. A two-handed action that
+  needs the hands in different places (a bow, a steering wheel) cannot be
+  done.
+- **Analog movement.** Moves are full-stick and in four directions; there is
+  no "walk slowly" or diagonal.
 - **Titles that track real hands** (hand-gesture pieces) get the Vision Pro's
   hand tracking in Auto and Hands modes, but see no hands in Hands-free mode,
   by design.
@@ -92,9 +135,11 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
 - In **Hands-free** mode, a system select made by an involuntary pinch still
   counts as a select; telling a pinch apart from a Dwell Control select needs
   testing on the headset.
-- Titles built only on **OpenXR** take controller input through a separate path
-  in the runtime; the hands-free pointer is confirmed only for OVRPlugin titles
-  (most Unity and Unreal titles).
+- Titles built only on **OpenXR** read the same controller state as OVRPlugin
+  titles (both controllers are published as tracked, so OpenXR sees them
+  present, with their buttons and sticks), but hands-free play has been
+  confirmed on the headset only for OVRPlugin titles (most Unity and Unreal
+  titles).
 
 ## Next
 
@@ -109,7 +154,11 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
 build time; `tools/metavision-overlay` wires it into `KleptonControllers.swift`
 (the merge of hands and Sense controllers into synthetic Touch controllers)
 and lets the audio session record when voice is on, the same way Klepton's own
-microphone toggle does. Nothing in `vendor/klepton` is committed changed.
+microphone toggle does. Both hands-free controllers are published through the
+same call a tracked hand uses (overlay step 125), which is the state OVRPlugin
+answers from and OpenXR's `xrSyncActions` and `xrLocateSpace` read, so every
+title sees the same two controllers. Nothing in `vendor/klepton` is committed
+changed.
 
 ## The microphone
 

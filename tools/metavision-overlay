@@ -10883,3 +10883,57 @@ static klj_val avp_open_body(void *env, void *self, const klj_val *a, int n) {
     open(p, "w").write(s)
 print("overlay: the video player's teardown: window reference first, serialised open/close/destroy")
 PYEOF
+
+# 125 — hands-free supplies both controllers, with sticks. Step 6's left
+# branch pushed only voice's Menu button and left the pose to kl_ovrp's own
+# head-relative stand-in, which never marks the hand as set: OVRPlugin titles
+# saw a left controller, but OpenXR titles (xrSyncActions and xrLocateSpace
+# take presence from the same flag kl_ovrp_set_hand_motion sets) saw no left
+# hand at all, so every left action was inactive and its space untracked. The
+# left controller now gets a pose of its own (MetavisionHandsFree.leftPose:
+# the pointer's mirror image) and goes out through the same publish as a
+# tracked hand, carrying voice's left trigger, grip, X, Y, Menu and the
+# movement stick; the right carries the turning stick. Both paths, OVRPlugin
+# and OpenXR, read the one latched controller state.
+python3 - "$K/visionos/Sources/KleptonControllers.swift" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: hands-free controllers with sticks (step 125)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "                st.handTrigger = v.grip ? 1 : 0\n"
+        "                st.buttons |= v.buttons; st.touches |= v.buttons\n"
+        "            } else if hand == 0, !st.fromController, MetavisionHandsFree.shared.enabled {\n",
+        "                st.handTrigger = v.grip ? 1 : 0\n"
+        "                st.stick = v.stick   // " + marker + "\n"
+        "                st.buttons |= v.buttons; st.touches |= v.buttons\n"
+        "            } else if hand == 0, !st.fromController, MetavisionHandsFree.shared.enabled {\n")
+    s = sub(s,
+        "            } else if hand == 0, !st.fromController, MetavisionHandsFree.shared.enabled {\n"
+        "                // metavision: hands-free left controller — voice's Menu button only;\n"
+        "                // its pose stays kl_ovrp's own synthesised one.\n"
+        "                let v = MetavisionHandsFree.shared.pressed(hand: 0)\n"
+        "                kl_ovrp_set_controller_input(0, v.buttons, v.buttons, 0, 0, 0, 0)\n"
+        "                continue\n"
+        "            } else {\n",
+        "            } else if hand == 0, !st.fromController, MetavisionHandsFree.shared.enabled,\n"
+        "                      let pose = MetavisionHandsFree.shared.leftPose() {\n"
+        "                // " + marker + ": the hands-free left controller —\n"
+        "                // a pose of its own, published as a tracked hand (OpenXR titles see it\n"
+        "                // present), and voice's left buttons and movement stick.\n"
+        "                st.position = pose.0; st.orientation = pose.1\n"
+        "                st.linearVelocity = .zero; st.angularVelocity = .zero\n"
+        "                let v = MetavisionHandsFree.shared.pressed(hand: 0)\n"
+        "                st.indexTrigger = v.trigger ? 1 : 0\n"
+        "                st.handTrigger = v.grip ? 1 : 0\n"
+        "                st.stick = v.stick\n"
+        "                st.buttons |= v.buttons; st.touches |= v.buttons\n"
+        "            } else {\n")
+    open(p, "w").write(s)
+print("overlay: hands-free supplies both controllers, with the movement and turning sticks")
+PYEOF

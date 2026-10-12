@@ -248,7 +248,7 @@ goes in through each mode's own path:
 | mode | what the script does |
 |---|---|
 | `hands` | synthetic Touch controllers *and* synthetic Meta hand skeletons: aims at what looks pressable (or across a grid), clicking/pinching at each; A, B, X, grips, Menu and both sticks on their own periods |
-| `handsfree` | no controllers or hands: a gaze ray at each target or grid point plus spoken commands (select, grab, confirm, back, menu, hold/release) fed into the hands-free layer, as Dwell Control and voice would |
+| `handsfree` | no controllers or hands: a gaze ray at each target or grid point plus spoken commands fed into the hands-free layer, as Dwell Control and voice would — select, grab, confirm, back, menu, hold/release; every third phrase a move (forward, turn left, left, back up, turn right, right, keep going, stop) and every third a left-hand command (left select, X button, left grab, Y button, both hold, release) |
 | `auto` | the two alternating (every 20 s; 5 s inside a cycle), as a hand entering and leaving view |
 
 Aiming goes for **what looks pressable**: every 1.5 s the eye the title drew
@@ -277,7 +277,9 @@ on a sharp edge: a starfield or thin grid is dim but drawn); triage reports
 but nothing in them. In hands-free the commands are **spoken** —
 synthesised speech replaces the microphone's input, so the recogniser is
 tested too (`MV_AUTOPLAY_SPEECH=0` hands them over directly); triage reports
-phrases said against commands recognised. Speech recognition must have been
+phrases said against commands recognised, and how many of those were moves
+and left-hand commands, with how many of the 8 kinds of move and 5 kinds of
+left-hand command were heard at least once. Speech recognition must have been
 allowed once (choose Hands-free in the launcher and accept the prompts).
 Real eye tracking, Dwell Control and the system pinch cannot be scripted:
 visionOS gives apps a gaze ray only with a system select, and that ray is what

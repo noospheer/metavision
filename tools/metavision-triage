@@ -158,7 +158,10 @@ def triage(d: Path):
     said = len(re.findall(r'\[mv-autoplay\][^\n]* say "', text))
     if said:
         heard = len(re.findall(r"\[mv\] voice: (?:select|grab|hold|release|confirm|back|menu|recenter)\b", text))
-        notes.append(f"speech: {said} phrase(s) said, {heard} command(s) recognised")
+        moves = re.findall(r"\[mv\] voice: (moveForward|moveBack|strafeLeft|strafeRight|turnLeft|turnRight|keepGoing|stop)\b", text)
+        left = re.findall(r"\[mv\] voice: (leftSelect|leftGrab|buttonX|buttonY|bothHold)\b", text)
+        notes.append(f"speech: {said} phrase(s) said, {heard + len(moves) + len(left)} command(s) recognised"
+                     f" ({len(moves)} moving: {len(set(moves))}/8 kinds; {len(left)} left-hand: {len(set(left))}/5 kinds)")
     cyc = re.findall(r"\[mv-autoplay\] t=\S+ mode cycle: (\w+)", text)
     if cyc:
         notes.append("mode cycle reached " + " > ".join(["auto (start)"] + cyc))

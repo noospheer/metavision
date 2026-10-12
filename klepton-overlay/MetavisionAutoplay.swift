@@ -10,8 +10,10 @@
 //              titles both get input
 //   handsfree  no controllers or hands touched: a gaze select (as visionOS
 //              reports one) plus spoken commands — select, grab, confirm, back,
-//              menu, hold/release — into MetavisionHandsFree, which turns them
-//              into the pointer and buttons as it does for a user
+//              menu, hold/release, the moves (forward, turn, strafe, back up,
+//              keep going, stop) and the left hand's (left select, X, left
+//              grab, Y, both hold) — into MetavisionHandsFree, which turns
+//              them into both controllers as it does for a user
 //   auto       the two alternating every 20 s, as a hand coming into and
 //              leaving view would
 //
@@ -373,6 +375,14 @@ enum MetavisionAutoplay {
 
     // MARK: hands-free mode — gaze selects and spoken commands
 
+    /// Spoken moves, in the order a pass says them: each kind of move, a
+    /// held one ("keep going") and "stop" to end it.
+    private static let locomotion: [MetavisionVoice.Command] =
+        [.moveForward, .turnLeft, .strafeLeft, .moveBack, .turnRight, .strafeRight, .keepGoing, .stop]
+    /// Spoken left-hand commands; "both hold" is let go by the next "release".
+    private static let leftHand: [MetavisionVoice.Command] =
+        [.leftSelect, .buttonX, .leftGrab, .buttonY, .bothHold, .release]
+
     private static func handsFree(step: Int, head: SIMD3<Float>, aim: simd_quatf) -> String {
         let hf = MetavisionHandsFree.shared
         // A look in the aim direction, refreshed every frame: visionOS reports
@@ -381,15 +391,21 @@ enum MetavisionAutoplay {
         var what = " (gaze)"
         // A spoken phrase every other aim: speech takes about as long as an aim.
         guard step != lastStep, step % 2 == 0 else { return what }
-        // Spoken commands fire once per step, at the step's start.
+        // Spoken commands fire once per phrase, at the step's start. Counted
+        // in phrases (every other step), so every period here can come round.
+        let n = step / 2
         var cmds: [MetavisionVoice.Command] = [.select]
-        if step % 8 == 5 { cmds.append(.confirm) }
-        if step % 13 == 9 { cmds.append(.back) }
-        if step % 11 == 7 { cmds.append(.grab) }
-        if step % 29 == 17 && step > 29 { cmds.append(.menu) }   // late, as with the controller's Menu
-        if step % 17 == 11 { cmds.append(.hold) }
-        if step % 17 == 13 { cmds.append(.release) }
-        let words = cmds.map { $0.rawValue }.joined(separator: ", ")
+        if n % 4 == 2 { cmds.append(.confirm) }
+        if n % 13 == 9 { cmds.append(.back) }
+        if n % 11 == 7 { cmds.append(.grab) }
+        if n % 29 == 17 && n > 14 { cmds.append(.menu) }   // late (about 30 s in), as with the controller's Menu
+        if n % 17 == 11 { cmds.append(.hold) }
+        if n % 17 == 13 { cmds.append(.release) }
+        // Every third phrase a move or turn, every third a left-hand command,
+        // each from its own rotation, so a pass says every one of them.
+        if n % 3 == 1 { cmds.append(locomotion[(n / 3) % locomotion.count]) }
+        if n % 3 == 2 { cmds.append(leftHand[(n / 3) % leftHand.count]) }
+        let words = cmds.map { $0.phrase }.joined(separator: ", ")
         if speaks && MetavisionVoice.shared.say(words) {
             what += " + say \"" + words + "\""
         } else {
