@@ -12799,3 +12799,276 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: the video player's threads: snapshots under the lock, graves wait for a context, the mixer leaves")
 PYEOF
+
+# 136 — a persistent load guard: a guest library whose load killed the app is
+# refused from then on. Some deaths cannot be caught: visionOS code signing
+# kills a process with SIGKILL the instant it executes a page it will not
+# accept, and no handler runs, so the only evidence is that the log stops.
+# That is how the global refusal list (step 135 shortened it) was built, one
+# device round trip per library and by hand. Now kl_load_recursive records
+# "<library>" in <files dir>/.klepton-dlguard, written and fsync'd before the
+# library is mapped and translated and its init_array and JNI_OnLoad run, and
+# rewritten when they return — one write each way, kept as a stack so a
+# library loaded from another's init is the one blamed. At the first load of
+# the next launch, a file that still names a library means the previous launch
+# died inside that load: the name is appended to .klepton-dlrefused beside it
+# and logged loudly, and every name in that list is refused — dlopen answers
+# NULL as for a library that is not installed (the stand-in in
+# shims/mv_shims.c answers for Meta XR Audio), and a DT_NEEDED on it fails the
+# dependent's load. The engine's own libraries (the target's entry library,
+# libmain, libunity, libil2cpp, libUE4, libUnreal, libc++_shared, mono) are
+# never refused: the title cannot run without them, so a death there is
+# reported, not acted on. A crash that IS caught (step 137) clears the record,
+# so only an uncatchable death counts. The files live in the title's own
+# files directory, so one title's refusal is not another's.
+#   KL_DLOPEN_GUARD=0        no record and no refusals
+#   KL_DLOPEN_GUARD_RESET=1  this launch forgets every refusal and retries them
+python3 - "$K/runtime/kl_dl.c" <<'PYEOF'
+import sys
+marker = "metavision: persistent load guard (step 136)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "kl_image *kl_load_recursive(const char *path) {\n"
+    s = sub(p, s, old, "// " + marker + r'''
+// What a launch that died inside a library load left behind decides what this
+// launch refuses. See tools/metavision-overlay step 136 for the whole story.
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include "kl_target.h"
+#define KL_GUARD_MAX     16
+#define KL_GUARD_REFUSED 32
+static pthread_mutex_t g_guard_lock = PTHREAD_MUTEX_INITIALIZER;
+static int   g_guard_state;                 // 0 not yet, 1 on, -1 off
+static int   g_guard_fd = -1;               // read by kl_dl_guard_fault: a plain int
+static char  g_guard_list[1024];            // the refused list's path
+static char *g_guard_refused[KL_GUARD_REFUSED];
+static unsigned g_guard_nrefused;
+static char *g_guard_stack[KL_GUARD_MAX];   // libraries loading now, innermost last
+static unsigned g_guard_depth;
+
+static const char *kl_guard_base(const char *p) {
+    const char *b = strrchr(p, '/');
+    return b ? b + 1 : p;
+}
+// "libfoo.so", "libfoo" and "foo" are one library: Unity and IL2CPP ask for
+// a plugin under each spelling.
+static size_t kl_guard_stem(const char *b, const char **out) {
+    if (!strncmp(b, "lib", 3)) b += 3;
+    size_t n = strlen(b);
+    if (n > 3 && !strcmp(b + n - 3, ".so")) n -= 3;
+    *out = b;
+    return n;
+}
+static int kl_guard_same(const char *a, const char *b) {
+    const char *sa, *sb;
+    size_t na = kl_guard_stem(kl_guard_base(a), &sa), nb = kl_guard_stem(kl_guard_base(b), &sb);
+    return na && na == nb && !strncmp(sa, sb, na);
+}
+// The engine itself: refusing it cannot help, the title does not run without it.
+static int kl_guard_essential(const char *name) {
+    static const char *const core[] = {
+        "libmain.so", "libunity.so", "libil2cpp.so", "libUE4.so", "libUnreal.so",
+        "libc++_shared.so", "libmonobdwgc-2.0.so", "libmono.so", "libmonosgen-2.0.so",
+    };
+    for (unsigned i = 0; i < sizeof core / sizeof core[0]; i++)
+        if (kl_guard_same(name, core[i])) return 1;
+    const char *t = kl_driver_target_name();
+    const kl_target *kt = t ? kl_target_lookup(t) : NULL;
+    return kt && kt->entry_lib && kl_guard_same(name, kt->entry_lib);
+}
+static int kl_guard_listed_locked(const char *name) {
+    for (unsigned i = 0; i < g_guard_nrefused; i++)
+        if (kl_guard_same(name, g_guard_refused[i])) return 1;
+    return 0;
+}
+static void kl_guard_init_locked(void) {
+    if (g_guard_state) return;
+    g_guard_state = -1;
+    if (!kl_env_on("KL_DLOPEN_GUARD", 1)) {
+        fprintf(stderr, "  [dl] load guard off (KL_DLOPEN_GUARD=0)\n");
+        return;
+    }
+    const char *dir = kl_jni_files_dir();
+    if (!dir || !*dir) return;
+    mkdir(dir, 0755);
+    char gp[1024];
+    snprintf(gp, sizeof gp, "%s/.klepton-dlguard", dir);
+    snprintf(g_guard_list, sizeof g_guard_list, "%s/.klepton-dlrefused", dir);
+    if (kl_env_on("KL_DLOPEN_GUARD_RESET", 0)) {
+        unlink(g_guard_list);
+        unlink(gp);
+        fprintf(stderr, "  [dl] load guard reset (KL_DLOPEN_GUARD_RESET=1): no library "
+                        "is refused for killing a launch\n");
+    }
+    int fd = open(gp, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "  [dl] load guard off: cannot open %s: %s\n", gp, strerror(errno));
+        return;
+    }
+    // The innermost library the previous launch was still loading, if any.
+    char buf[2048], killed[256] = "";
+    ssize_t n = pread(fd, buf, sizeof buf - 1, 0);
+    if (n > 0) {
+        buf[n] = '\0';
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = '\0';
+        const char *last = strrchr(buf, '\n');
+        snprintf(killed, sizeof killed, "%.255s", last ? last + 1 : buf);
+    }
+    FILE *f = fopen(g_guard_list, "r");
+    if (f) {
+        char line[256];
+        while (g_guard_nrefused < KL_GUARD_REFUSED && fgets(line, sizeof line, f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!*line || kl_guard_listed_locked(line)) continue;
+            g_guard_refused[g_guard_nrefused++] = strdup(line);
+            fprintf(stderr, "  [dl] %s refused: it killed an earlier launch during load "
+                            "(KL_DLOPEN_GUARD_RESET=1 retries it)\n", line);
+        }
+        fclose(f);
+    }
+    if (*killed) {
+        if (kl_guard_essential(killed)) {
+            fprintf(stderr, "  [dl] %s was loading when the previous launch died — NOT "
+                            "refused: the title cannot run without it\n", killed);
+        } else if (!kl_guard_listed_locked(killed) && g_guard_nrefused < KL_GUARD_REFUSED) {
+            g_guard_refused[g_guard_nrefused++] = strdup(killed);
+            int lf = open(g_guard_list, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+            if (lf >= 0) {
+                char l[300];
+                int ln = snprintf(l, sizeof l, "%s\n", killed);
+                if (ln > 0 && write(lf, l, (size_t)ln) == ln) fsync(lf);
+                close(lf);
+            }
+            fprintf(stderr, "  [dl] %s killed the previous launch during load — refused "
+                            "from now on (KL_DLOPEN_GUARD_RESET=1 retries it)\n", killed);
+        }
+    }
+    if (ftruncate(fd, 0) != 0) { /* the next write replaces it anyway */ }
+    g_guard_fd = fd;
+    g_guard_state = 1;
+}
+static void kl_guard_write_locked(int sync) {
+    char buf[2048];
+    size_t n = 0;
+    for (unsigned i = 0; i < g_guard_depth; i++) {
+        size_t l = strlen(g_guard_stack[i]);
+        if (n + l + 1 > sizeof buf) break;
+        memcpy(buf + n, g_guard_stack[i], l);
+        n += l;
+        buf[n++] = '\n';
+    }
+    if (n && pwrite(g_guard_fd, buf, n, 0) != (ssize_t)n) return;
+    if (ftruncate(g_guard_fd, (off_t)n) != 0) return;
+    if (sync) fsync(g_guard_fd);
+}
+static void kl_dl_guard_begin(const char *path) {
+    pthread_mutex_lock(&g_guard_lock);
+    kl_guard_init_locked();
+    if (g_guard_state == 1 && g_guard_depth < KL_GUARD_MAX) {
+        char *b = strdup(kl_guard_base(path));
+        if (b) { g_guard_stack[g_guard_depth++] = b; kl_guard_write_locked(1); }
+    }
+    pthread_mutex_unlock(&g_guard_lock);
+}
+static void kl_dl_guard_end(const char *path) {
+    pthread_mutex_lock(&g_guard_lock);
+    if (g_guard_state == 1) {
+        const char *b = kl_guard_base(path);
+        for (unsigned i = g_guard_depth; i-- > 0; )
+            if (!strcmp(g_guard_stack[i], b)) {
+                free(g_guard_stack[i]);
+                memmove(&g_guard_stack[i], &g_guard_stack[i + 1],
+                        (g_guard_depth - i - 1) * sizeof g_guard_stack[0]);
+                g_guard_depth--;
+                kl_guard_write_locked(0);
+                break;
+            }
+    }
+    pthread_mutex_unlock(&g_guard_lock);
+}
+// A death Klepton's fault handler sees is a crash with a report, not a kill:
+// forget the load in flight so it is not refused. Async-signal-safe.
+void kl_dl_guard_fault(void) {
+    int fd = g_guard_fd;
+    if (fd >= 0 && ftruncate(fd, 0) != 0) { /* nothing more to try in a handler */ }
+}
+// Refused because it killed an earlier launch.
+int kl_dl_guard_refused(const char *path) {
+    if (!path) return 0;
+    pthread_mutex_lock(&g_guard_lock);
+    kl_guard_init_locked();
+    int r = g_guard_state == 1 && kl_guard_listed_locked(path) &&
+            !kl_guard_essential(path);
+    pthread_mutex_unlock(&g_guard_lock);
+    return r;
+}
+
+''' + old +
+           "    if (kl_dl_guard_refused(path)) {   // " + marker + "\n"
+           "        fprintf(stderr, \"  [klepton] %s not loaded: REFUSED by the load guard (it killed \"\n"
+           "                        \"an earlier launch during load)\\n\", path);\n"
+           "        return NULL;\n"
+           "    }\n")
+    old = ("    kl_image *img = kl_load_auto(path);\n"
+           "    if (!img) return NULL;\n"
+           "    kl_register_image(path, img);\n"
+           "    kl_run_init(img);\n"
+           "    kl_maybe_jni_onload(path, img);\n"
+           "    return img;\n")
+    s = sub(p, s, old,
+           "    kl_dl_guard_begin(path);   // " + marker + "\n"
+           "    kl_image *img = kl_load_auto(path);\n"
+           "    if (!img) { kl_dl_guard_end(path); return NULL; }\n"
+           "    kl_register_image(path, img);\n"
+           "    kl_run_init(img);\n"
+           "    kl_maybe_jni_onload(path, img);\n"
+           "    kl_dl_guard_end(path);\n"
+           "    return img;\n")
+    old = "    if (kl_target_default_refused(path)) return 1;\n"
+    s = sub(p, s, old, old +
+           "    if (kl_dl_guard_refused(path)) {   // " + marker + "\n"
+           "        static char said[8][128]; static unsigned nsaid;\n"
+           "        const char *b = strrchr(path, '/'); b = b ? b + 1 : path;\n"
+           "        int seen = 0;\n"
+           "        for (unsigned k = 0; k < nsaid; k++) if (!strcmp(said[k], b)) { seen = 1; break; }\n"
+           "        if (!seen) {\n"
+           "            if (nsaid < 8) snprintf(said[nsaid++], sizeof said[0], \"%s\", b);\n"
+           "            fprintf(stderr, \"  [klepton] guest dlopen(\\\"%s\\\") REFUSED (load guard: it \"\n"
+           "                            \"killed an earlier launch during load) — the guest sees a \"\n"
+           "                            \"library that is not installed\\n\", path);\n"
+           "        }\n"
+           "        return 1;\n"
+           "    }\n")
+    open(p, "w").write(s)
+print("overlay: a guest library whose load killed a launch is refused from then on")
+PYEOF
+
+# 137 — the load guard counts only deaths nothing could catch. Klepton's fault
+# handler, about to die of a signal it caught (a crash with a report: SIGSEGV,
+# SIGABRT, a watchdog's SIGALRM, ...), clears the guard's record of a load in
+# flight, so a library that merely crashed in its init is reported as a crash
+# and retried next launch instead of being refused.
+python3 - "$K/runtime/kl_fault.c" <<'PYEOF'
+import sys
+marker = "metavision: a caught crash is not a kill (step 137)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "static void report_fault(int sig, siginfo_t *si, void *uctx) {\n"
+    s = sub(p, s, old, "__attribute__((weak)) void kl_dl_guard_fault(void);   // " + marker + "\n" + old)
+    old = ("    // Die of the original signal, so whoever is watching still reports it as one.\n"
+           "    signal(sig, SIG_DFL);\n")
+    s = sub(p, s, old, "    if (kl_dl_guard_fault) kl_dl_guard_fault();   // " + marker + "\n" + old)
+    open(p, "w").write(s)
+print("overlay: a crash Klepton catches clears the load guard's record")
+PYEOF

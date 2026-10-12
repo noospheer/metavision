@@ -33,6 +33,10 @@ ITERS = re.compile(r"\[cp\] alive: (\d+) iters")
 FATAL = re.compile(r"fatal: (.*)")
 FAULT = re.compile(r"fault: signal (\d+) at (0x[0-9a-f]+), pc (\S+)")
 DLFAIL = re.compile(r'guest dlopen\("([^"]+)"\) FAILED')
+# The load guard (overlay step 136): a library whose load killed a launch
+# (an uncatchable kill, e.g. code signing) is refused from then on.
+GUARDED = re.compile(r"\[dl\] (\S+) (?:killed the previous launch during load|refused: it killed an earlier launch)")
+GUARD_ESSENTIAL = re.compile(r"\[dl\] (\S+) was loading when the previous launch died")
 START = re.compile(r"^\[hb\] (\S+)")
 SHIM = re.compile(r"\[mv-shim\] (.*)")
 PLAY = re.compile(r"\[mv-autoplay\] (t=\S+ step \d+: .*)")
@@ -222,8 +226,15 @@ def load_failures(text: str, shipped):
     runtime provides them (libvulkan.so). Unity probes a plugin under several
     names, and settings can name a plugin the APK does not carry — misses a
     Quest makes too."""
-    return [n for n in sorted({m.group(1).rsplit("/", 1)[-1] for m in DLFAIL.finditer(text)})
-            if n in RUNTIME_LIBS or shipped is None or n in shipped]
+    failed = [n for n in sorted({m.group(1).rsplit("/", 1)[-1] for m in DLFAIL.finditer(text)})
+              if n in RUNTIME_LIBS or shipped is None or n in shipped]
+    # Refused by the load guard: shipped by definition (it was loading).
+    return failed + [n for n in guarded(text) if n not in failed]
+
+
+def guarded(text: str):
+    """Libraries the load guard refuses: each killed a launch while it loaded."""
+    return sorted({m.group(1) for m in GUARDED.finditer(text)})
 
 
 def unity_errors(text: str, shipped):
@@ -269,7 +280,12 @@ def triage(d: Path):
     # names, and settings can name a plugin the APK does not carry — misses a
     # Quest makes too.
     shipped = shipped_libs(d)
-    notes = [f"could not load {n}" for n in load_failures(text, shipped)]
+    killers = guarded(text)
+    notes = [f"could not load {n}" + (": refused after a killed launch (it was loading when an earlier "
+                                       "launch was killed; KL_DLOPEN_GUARD_RESET=1 retries it)" if n in killers else "")
+             for n in load_failures(text, shipped)]
+    for m in GUARD_ESSENTIAL.finditer(text):
+        notes.append(f"the previous launch was killed while loading {m.group(1)} (an engine library: not refused)")
     ending = "running when closed"
     if m := FATAL.search(text):
         ending = "stopped: " + m.group(1).strip()
