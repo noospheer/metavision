@@ -23,6 +23,7 @@ private func mv_hands_publish_xr(_ hand: Int32, _ tracked: Int32,
 
 enum MetavisionHands {
     private typealias J = HandSkeleton.JointName
+    nonisolated(unsafe) private static var loggedStandIn = false
 
     /// OVRPlugin BoneId -> ARKit joint. nil entries are synthesised.
     private static let joints: [J?] = [
@@ -57,8 +58,33 @@ enum MetavisionHands {
 
     static func publish(left: HandAnchor?, right: HandAnchor?) {
         let on = !MetavisionHandsFree.shared.ignoresHands
-        mv_hands_set_enabled(on ? 1 : 0)
         let t = CACurrentMediaTime()
+        // A hands-only title (MV_HANDS_ONLY) is shown hands, never controllers:
+        // in hands-free, with no tracked right hand to give it, it saw nothing
+        // at all — no hand and no controller reported connected — so nothing
+        // could be pointed at or selected. It gets a stand-in right hand at
+        // the hands-free pointer, aimed where the head faces, pinching on
+        // "select" (or a system select), and no left hand.
+        let hf = MetavisionHandsFree.shared
+        if getenv("MV_HANDS_ONLY").map({ String(cString: $0) == "1" }) ?? false,
+           hf.enabled, hf.ignoresHands || !(right?.isTracked ?? false),
+           let p = hf.pointerPose() {
+            mv_hands_set_enabled(1)
+            let v = hf.pressed(hand: 1)
+            // The wrist low and to the right, the hand facing where the pointer aims.
+            let wrist = p.0 + p.1.act(SIMD3<Float>(0.10, -0.10, -0.20))
+            MetavisionAutoplay.publishHand(1, at: wrist, p.1, pinch: v.trigger || hf.systemSelect ? 1 : 0,
+                                           grip: v.grip, now: t, pointer: p)
+            mv_hands_publish(0, 0, nil, nil, nil, nil, t)
+            mv_hands_publish_xr(0, 0, nil, nil, t)
+            mv_hands_publish_xr(1, 0, nil, nil, t)
+            if !loggedStandIn {
+                loggedStandIn = true
+                NSLog("[mv-hands] hands-only title in hands-free: a stand-in right hand at the pointer, pinching on select")
+            }
+            return
+        }
+        mv_hands_set_enabled(on ? 1 : 0)
         for (hand, anchor) in [(0, left), (1, right)] {
             guard on, let a = anchor, a.isTracked, let sk = a.handSkeleton else {
                 mv_hands_publish(Int32(hand), 0, nil, nil, nil, nil, t)

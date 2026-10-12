@@ -20359,3 +20359,157 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: the fatal-signal report's framebuffer census skips its pixel readback")
 PYEOF
+
+# 180 — hands-free voice keeps the microphone across a media-services reset.
+# Klepton's reset handler rebuilt the audio session from the guest microphone
+# toggle alone, so after a reset a hands-free user's session fell back to
+# .playback: no input at all, and the recogniser waited for audio that never
+# came. It now asks for the input whenever voice is wanted, as the start-up and
+# toggle paths already do (MetavisionVoice rebuilds its own engine on the same
+# notification).
+python3 - "$K" <<'PYEOF'
+import sys
+K = sys.argv[1]
+marker = "metavision: voice keeps the input after a reset (step 180)"
+def sub(s, old, new, p):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = f"{K}/visionos/Sources/KleptonAudio.swift"
+s = open(p).read()
+if marker not in s:
+    s = sub(s, "            try? Self.setCategoryForMic(session, KleptonMic.shared.settings.enabled)\n",
+        "            try? Self.setCategoryForMic(session, KleptonMic.shared.settings.enabled\n"
+        "                                        || MetavisionHandsFree.voiceWanted)   // " + marker + "\n", p)
+    open(p, "w").write(s)
+print("overlay: hands-free voice keeps the microphone across a media-services reset")
+PYEOF
+
+# 181 — the hands-free reticle. With no hands, the only pointer is the head,
+# and a title draws its laser from a controller the user cannot see the end
+# of (or not at all): a user could not tell where "select" would land. While
+# the hands-free pointer is in use (MetavisionHandsFree.pointerInUse: no
+# tracked hand drives the right controller), the compositor draws a small dot
+# 2 m along the head ray — exactly where that pointer aims — over the guest's
+# picture, through the overlay pipeline as a head-locked quad. It flashes
+# green and grows for 0.3 s when a voice command is heard. MV_RETICLE=0 hides
+# it; off by default in auto-play runs (MV_RETICLE=1 shows it there).
+python3 - "$K" <<'PYEOF'
+import sys
+K = sys.argv[1]
+marker = "metavision: hands-free reticle (step 181)"
+def sub(s, old, new, p):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = f"{K}/visionos/Sources/KleptonCompositor.swift"
+s = open(p).read()
+if marker not in s:
+    s = sub(s,
+        "            _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,\n"
+        "                               originFromHead: originFromHead, writeDepth: true)\n"
+        "            enc.endEncoding()\n",
+        "            _ = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,\n"
+        "                               originFromHead: originFromHead, writeDepth: true)\n"
+        "            encodeReticle(enc, viewIndices: viewIndices, drawable: drawable,\n"
+        "                          originFromHead: originFromHead)   // " + marker + "\n"
+        "            enc.endEncoding()\n", p)
+    s = sub(s,
+        "        let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,\n"
+        "                                    originFromHead: originFromHead,\n"
+        "                                    writeDepth: visible == 0)\n"
+        "        enc.endEncoding()\n",
+        "        let panels = encodeOverlays(enc, viewIndices: viewIndices, drawable: drawable,\n"
+        "                                    originFromHead: originFromHead,\n"
+        "                                    writeDepth: visible == 0)\n"
+        "        encodeReticle(enc, viewIndices: viewIndices, drawable: drawable,\n"
+        "                      originFromHead: originFromHead)   // " + marker + "\n"
+        "        enc.endEncoding()\n", p)
+    s = sub(s, "    /// Matches `struct KLEq` in kl_msl_equirect (kl_reproject.c) byte for byte:\n",
+'''    // ''' + marker + '''
+    private var reticleTextures: [MTLTexture] = []
+    private static let reticleOn = MetavisionHandsFree.envOn("MV_RETICLE", default: !MetavisionAutoplay.enabled)
+
+    /// A small dot MetavisionHandsFree.pointerDepth (2 m) along the head ray,
+    /// where the hands-free pointer aims, while that pointer is in use: a
+    /// white dot in a dark ring, green and larger for 0.3 s after a voice
+    /// command is heard. A head-locked quad through the overlay pipeline,
+    /// drawn last, so it sits over the guest's picture and panels.
+    private func encodeReticle(_ enc: MTLRenderCommandEncoder, viewIndices: [Int],
+                               drawable: LayerRenderer.Drawable, originFromHead: simd_float4x4) {
+        guard Self.reticleOn, !MetavisionShots.hidden, MetavisionHandsFree.pointerInUse,
+              let pipe = overlayPipeline, let sampler, let device else { return }
+        if reticleTextures.isEmpty { reticleTextures = Self.makeReticleTextures(device) }
+        guard reticleTextures.count == 2 else { return }
+        let flash = ProcessInfo.processInfo.systemUptime - MetavisionHandsFree.shared.lastHeard < 0.3
+        let d = MetavisionHandsFree.pointerDepth
+        let size = d * (flash ? 0.024 : 0.015)   // about 1.4 / 0.9 degrees across
+        var ov = kl_ovrp_overlay()
+        ov.shape = 0
+        ov.head_locked = 1
+        ov.tex_w = 64; ov.tex_h = 64
+        ov.pose = (0, 0, 0, 1, 0, 0, -d)
+        ov.size = (size, size)
+        ov.origin_top_left = 1
+        var uniforms: [kl_overlay_uniforms] = []
+        for vi in viewIndices {
+            var u = kl_overlay_build(&ov, Int32(vi), originFromHead,
+                                     Self.headFromView(drawable.views[vi].transform,
+                                                       midpoint: eyeMidpointInDevice),
+                                     drawable.computeProjection(viewIndex: vi))
+            u.srgb_decode = 0; u.opaque = 0
+            uniforms.append(u)
+        }
+        guard uniforms.contains(where: { $0.visible != 0 }) else { return }
+        enc.setRenderPipelineState(pipe)
+        enc.setFragmentTexture(reticleTextures[flash ? 1 : 0], index: 0)
+        enc.setFragmentSamplerState(sampler, index: 0)
+        uniforms.withUnsafeBytes { buf in
+            enc.setVertexBytes(buf.baseAddress!, length: buf.count, index: 0)
+            enc.setFragmentBytes(buf.baseAddress!, length: buf.count, index: 0)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+    }
+
+    /// The reticle's two looks, 64x64 RGBA: a dot in a dark ring (visible on
+    /// light and dark scenes alike), white, and green for "heard".
+    private static func makeReticleTextures(_ device: MTLDevice) -> [MTLTexture] {
+        var out: [MTLTexture] = []
+        let n = 64
+        for flash in [false, true] {
+            let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                                width: n, height: n, mipmapped: false)
+            desc.usage = .shaderRead
+            guard let t = device.makeTexture(descriptor: desc) else { return [] }
+            var px = [UInt8](repeating: 0, count: n * n * 4)
+            let dot: (Float, Float, Float) = flash ? (0.3, 1.0, 0.45) : (1, 1, 1)
+            for y in 0..<n {
+                for x in 0..<n {
+                    let dx = Float(x) + 0.5 - Float(n) / 2, dy = Float(y) + 0.5 - Float(n) / 2
+                    let r = (dx * dx + dy * dy).squareRoot()
+                    var c: (Float, Float, Float) = (0, 0, 0)
+                    var a: Float = 0
+                    if r <= 19 {
+                        c = dot; a = min(1, 19.5 - r) * 0.95
+                    } else if r <= 29 {
+                        a = min(1, 29.5 - r) * 0.6
+                    }
+                    let i = (y * n + x) * 4
+                    px[i] = UInt8(c.0 * 255); px[i + 1] = UInt8(c.1 * 255); px[i + 2] = UInt8(c.2 * 255)
+                    px[i + 3] = UInt8(max(0, min(1, a)) * 255)
+                }
+            }
+            px.withUnsafeBytes { b in
+                t.replace(region: MTLRegionMake2D(0, 0, n, n), mipmapLevel: 0,
+                          withBytes: b.baseAddress!, bytesPerRow: n * 4)
+            }
+            out.append(t)
+        }
+        return out
+    }
+
+    /// Matches `struct KLEq` in kl_msl_equirect (kl_reproject.c) byte for byte:
+''', p)
+    open(p, "w").write(s)
+print("overlay: the compositor draws the hands-free reticle where the head points")
+PYEOF

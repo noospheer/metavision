@@ -375,6 +375,33 @@ def triage(d: Path):
         left = re.findall(r"\[mv\] voice: (leftSelect|leftGrab|buttonX|buttonY|bothHold)\b", text)
         notes.append(f"speech: {said} phrase(s) said, {heard + len(moves) + len(left)} command(s) recognised"
                      f" ({len(moves)} moving: {len(set(moves))}/8 kinds; {len(left)} left-hand: {len(set(left))}/5 kinds)")
+    # The real microphone: what the loudspeaker test said and what was heard
+    # between its first phrase and the end-of-test marker (nothing else is
+    # spoken then), plus the recogniser's own health and the exit question.
+    v_aloud = [m.start() for m in re.finditer(r'\[mv-autoplay\][^\n]* say \(speaker\) "', text)]
+    if v_aloud:
+        v_end = text.find("(end of the loudspeaker test)", v_aloud[-1])
+        v_span = text[v_aloud[0]:v_end if v_end > 0 else len(text)]
+        v_got = len(re.findall(r"\[mv\] voice: (?:select|grab|confirm|back)\b", v_span))
+        notes.append(f"microphone (loudspeaker) test: {len(v_aloud)} phrase(s) said, {v_got} heard"
+                     + ("" if v_got else " — THE REAL MICROPHONE PATH HEARD NOTHING"))
+    if "[mv] voice: microphone #" in text or "[mv] voice: health" in text:   # this recogniser's log lines
+        v_heard = len(re.findall(r"\[mv\] voice: heard \"", text))
+        v_tasks = len(re.findall(r"\[mv\] voice: task \d+ \(", text))
+        v_errs = len(re.findall(r"\[mv\] voice: task \d+ ended:", text))
+        v_builds = len(re.findall(r"\[mv\] voice: microphone #\d+", text))
+        v_health = re.findall(r"\[mv\] voice: health — (microphone \S+[^;\n]*)", text)
+        notes.append(f"voice: {v_heard} transcript(s), {v_tasks} task restart(s), {v_errs} task end(s)/error(s), "
+                     f"{v_builds} microphone build(s)" + (f"; last health: {v_health[-1]}" if v_health else "")
+                     + ("; MICROPHONE PERMISSION DENIED" if "microphone permission DENIED" in text else "")
+                     + ("; DIGITAL SILENCE from the microphone" if "DIGITAL SILENCE" in text else ""))
+    if re.search(r"\[mv\] voice: exitTitle\b", text) or "command exit title" in text:
+        if "exit not confirmed" in text:
+            notes.append("exit question: asked, not confirmed, timed out — the title stayed")
+        elif "exit confirmed" in text:
+            notes.append("EXIT QUESTION WAS CONFIRMED in an auto-play run (something answered it)")
+        else:
+            notes.append("exit question: asked, no timeout logged")
     cyc = re.findall(r"\[mv-autoplay\] t=\S+ mode cycle: (\w+)", text)
     if cyc:
         notes.append("mode cycle reached " + " > ".join(["auto (start)"] + cyc))

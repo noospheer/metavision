@@ -38,9 +38,14 @@
 // where the user looks or goes. The display is not moved, so anyone wearing
 // the headset during a pass sees the picture swing.
 //
-// In hands-free mode the commands are spoken: synthesised speech replaces the
-// microphone's input (MetavisionVoice.say), so the recogniser itself is
-// tested; the log records each phrase said and each command heard. Without
+// In hands-free mode the commands are spoken. The first MV_AUTOPLAY_MIC (6)
+// phrases come out of the loudspeaker (MetavisionVoice.sayAloud), so the real
+// microphone hears them over the title's own sound — the whole path a user's
+// voice takes; the rest replace the microphone's input with synthesised
+// speech (MetavisionVoice.say), which tests the recogniser and the commands
+// at a known level. Once, "exit title" is said and deliberately not
+// confirmed: the question must time out and the title stay. The log records
+// each phrase said ("say (speaker)" / "say") and each command heard. Without
 // speech permission (or MV_AUTOPLAY_SPEECH=0) they are handed over directly.
 // Every action is logged ([mv-autoplay]) so a fault lines up with what was
 // pressed just before it.
@@ -337,8 +342,11 @@ enum MetavisionAutoplay {
     /// hand pinches, with every bone keeping roughly its length, so a skeleton
     /// of real proportions can make the same pose (mv_hands.c retargets from
     /// these positions alone; the joint orientations sent are identity).
-    private static func publishHand(_ hand: Int, at p: SIMD3<Float>, _ q: simd_quatf,
-                                    pinch: Float, grip: Bool, now: Double) {
+    /// Also MetavisionHands' stand-in hand for a hands-only title in
+    /// hands-free mode, with the hands-free pointer as its pointer pose.
+    static func publishHand(_ hand: Int, at p: SIMD3<Float>, _ q: simd_quatf,
+                            pinch: Float, grip: Bool, now: Double,
+                            pointer: (SIMD3<Float>, simd_quatf)? = nil) {
         let s: Float = hand == 1 ? 1 : -1          // left hand: mirrored across X
         func v(_ x: Float, _ y: Float, _ z: Float) -> SIMD3<Float> { SIMD3<Float>(x, y, z) }
         let pin = SIMD3<Float>(repeating: pinch)
@@ -364,12 +372,14 @@ enum MetavisionAutoplay {
         var model = [Float](); model.reserveCapacity(24 * 7)
         for b in pts { model += [0, 0, 0, 1, b.x * s, b.y, b.z] }
         let pose: [Float] = [q.imag.x, q.imag.y, q.imag.z, q.real, p.x, p.y, p.z]
+        let (pp, pq) = pointer ?? (p, q)
+        let aim: [Float] = [pq.imag.x, pq.imag.y, pq.imag.z, pq.real, pp.x, pp.y, pp.z]
         let g: Float = grip ? 1 : 0
         let strength: [Float] = [pinch, pinch, g, g, g]
         model.withUnsafeBufferPointer { m in pose.withUnsafeBufferPointer { r in
-            strength.withUnsafeBufferPointer { st in
-                mv_hands_publish_ap(Int32(hand), 1, m.baseAddress, r.baseAddress, r.baseAddress, st.baseAddress, now)
-            }
+            aim.withUnsafeBufferPointer { a in strength.withUnsafeBufferPointer { st in
+                mv_hands_publish_ap(Int32(hand), 1, m.baseAddress, r.baseAddress, a.baseAddress, st.baseAddress, now)
+            }}
         }}
     }
 
@@ -382,6 +392,12 @@ enum MetavisionAutoplay {
     /// Spoken left-hand commands; "both hold" is let go by the next "release".
     private static let leftHand: [MetavisionVoice.Command] =
         [.leftSelect, .buttonX, .leftGrab, .buttonY, .bothHold, .release]
+    /// What the loudspeaker test says, one command a phrase.
+    private static let micScript: [MetavisionVoice.Command] = [.select, .grab, .select, .confirm, .select, .back]
+    /// Hands-free phrases so far in this run.
+    nonisolated(unsafe) private static var hfPhrase = 0
+    /// How many phrases the loudspeaker test says (MV_AUTOPLAY_MIC, 6; 0 skips it).
+    private static let micPhrases: Int = getenv("MV_AUTOPLAY_MIC").flatMap { Int(String(cString: $0)) } ?? 6
 
     private static func handsFree(step: Int, head: SIMD3<Float>, aim: simd_quatf) -> String {
         let hf = MetavisionHandsFree.shared
@@ -391,6 +407,30 @@ enum MetavisionAutoplay {
         var what = " (gaze)"
         // A spoken phrase every other aim: speech takes about as long as an aim.
         guard step != lastStep, step % 2 == 0 else { return what }
+        // Nothing while our own question ("Leave this title?") is asked and
+        // waits: auto-play must never answer it.
+        if MetavisionVoice.shared.prompting || hf.exitAsked { return what + " (exit question pending: silent)" }
+        let k = hfPhrase
+        hfPhrase += 1
+        // First the real microphone: phrases spoken out of the loudspeaker,
+        // heard the way a user's voice is (with the title's own sound).
+        if speaks && k < micPhrases {
+            let c = micScript[k % micScript.count]
+            if MetavisionVoice.shared.sayAloud(c.phrase) {
+                return what + " + say (speaker) \"" + c.phrase + "\""
+            }
+        }
+        // A silent slot, so what the loudspeaker test heard is counted apart.
+        if k == micPhrases { return what + " (end of the loudspeaker test)" }
+        // Once: "exit title", never confirmed. The question must time out and
+        // the title stay ("exit not confirmed" in the log).
+        if k == micPhrases + 6 {
+            if speaks && MetavisionVoice.shared.say(MetavisionVoice.Command.exitTitle.phrase) {
+                return what + " + say \"exit title\" (not to be confirmed)"
+            }
+            hf.inject(.exitTitle)
+            return what + " + command exit title (not to be confirmed)"
+        }
         // Spoken commands fire once per phrase, at the step's start. Counted
         // in phrases (every other step), so every period here can come round.
         let n = step / 2

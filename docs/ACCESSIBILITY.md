@@ -31,13 +31,17 @@ both controllers. The right one is the pointer; the left one is held just
 below and left of your head, facing where you face, so titles that want two
 controllers present have them:
 
-- **Pointing.** The right controller is aimed by your **head**. When you make a
-  system select, it snaps to **where you were looking** — visionOS reports the
-  gaze direction with every select, and only then (apps never see continuous
-  eye position).
+- **Pointing.** The right controller is aimed by your **head**: its ray runs
+  from just below your eyes to the point 2 m straight ahead of your face, and
+  metavision draws a small **white dot** there (the *reticle*) so you can see
+  where a select will land. When you make a system select, it snaps to
+  **where you were looking** — visionOS reports the gaze direction with every
+  select, and only then (apps never see continuous eye position).
 - **Selecting.** The right trigger is pressed by any system select —
   **Dwell Control** (hold your gaze), **Voice Control**, or a pinch — or by
-  saying **"select"**.
+  saying **"select"** (or "click", "okay", "tap", "press"). When metavision
+  hears a command it plays a short **tick** and the dot **flashes green**, so
+  you know you were heard.
 - **Everything else, by voice.** Apple's speech recognition turns speech into
   words — on the headset whenever it supports the language (English does),
   over Apple's servers only if it cannot — and metavision maps a fixed set of
@@ -45,7 +49,7 @@ controllers present have them:
 
 | Say | Does |
 |---|---|
-| select / click / okay | tap the right trigger |
+| select / click / okay / tap / press | tap the right trigger |
 | grab / grip | tap the right grip |
 | hold … release / drop | hold trigger and grip until released (dragging, carrying) |
 | confirm / accept | tap A |
@@ -53,6 +57,8 @@ controllers present have them:
 | menu / pause | tap Menu (left controller) |
 | recenter | recenter the view, like holding the Meta button on a Quest |
 | auto mode / hands mode / hands-free mode | switch input mode |
+| exit title / close title / go home / quit metavision | ask to leave the title: say **confirm** (or **yes**) within 5 seconds of the question to leave; **back** or silence stays |
+| Siri | let go of the microphone for 20 seconds so Siri can hear you: say "Siri" again, then your request |
 | **Left hand** | |
 | left select / left trigger / left click | tap the left trigger |
 | left grab / left grip | tap the left grip |
@@ -88,6 +94,28 @@ own** — after a pause or another command, and followed by a pause or another
 command — so ordinary talk ("I want to go there", "that's right") does not
 move you. They count about half a second after you finish saying them.
 
+## Leaving a title, and Siri
+
+Leaving a title normally takes the Digital Crown. Hands-free, say **"exit
+title"** (or "close title", "go home", "quit metavision"). metavision plays a
+rising tone and asks *"Leave this title? Say confirm."*; say **"confirm"** (or
+**"yes"**) within 5 seconds after the question and the title closes. Saying
+"back", or nothing, keeps you in it (a falling tone). The question itself is
+not listened to, so it cannot answer itself.
+
+A metavision app runs one title per launch, so leaving closes the app. Open it
+again for the library: **"Siri, open metavision"**.
+
+**Siri while a title runs.** visionOS does not listen for "Siri" while an app
+is using the microphone, and hands-free voice uses it the whole time. So
+metavision listens for the word itself: when it hears **"Siri"** it lets go of
+the microphone for 20 seconds (a falling three-note tone) — say **"Siri"
+again** and Siri answers. Voice commands come back on their own afterwards. If
+a title uses the microphone itself (voice chat), metavision cannot let go of
+it; use "exit title" instead. *Whether visionOS then hears "Siri" without the
+app being closed still needs checking on the headset; "exit title" always
+works.*
+
 ## Setting it up
 
 1. Turn on visionOS accessibility features hands-free: say **"Siri, turn on
@@ -112,6 +140,11 @@ sudo tools/metavision-device env mv_<title> MV_INPUT_MODE=handsfree   # start in
 sudo tools/metavision-device env mv_<title> MV_VOICE=0               # no speech recognition
 sudo tools/metavision-device env mv_<title> MV_VOICE_MOVE=3         # each spoken move lasts 3 s (1.5)
 sudo tools/metavision-device env mv_<title> MV_VOICE_TURN=0.6       # a longer turn, for smooth turning (0.25)
+sudo tools/metavision-device env mv_<title> MV_RETICLE=0            # no pointer dot
+sudo tools/metavision-device env mv_<title> MV_VOICE_CUE=0          # no tick when a command is heard
+sudo tools/metavision-device env mv_<title> MV_VOICE_LM=0           # the standard speech model, not the one built for the commands
+sudo tools/metavision-device env mv_<title> MV_VOICE_HINT=dictation  # recogniser hint: confirmation (default), search, dictation, unspecified
+sudo tools/metavision-device env mv_<title> MV_SIRI_PAUSE=40        # how long "Siri" frees the microphone (20 s)
 sudo tools/metavision-device env mv_<title>                           # clear: back to the remembered mode
 ```
 
@@ -127,8 +160,11 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
 - **Analog movement.** Moves are full-stick and in four directions; there is
   no "walk slowly" or diagonal.
 - **Titles that track real hands** (hand-gesture pieces) get the Vision Pro's
-  hand tracking in Auto and Hands modes, but see no hands in Hands-free mode,
-  by design.
+  hand tracking in Auto and Hands modes. In Hands-free mode they see no real
+  hands, by design; a title that accepts **only** hands (no controllers) is
+  given one stand-in right hand at the head pointer instead, which pinches on
+  "select". Titles that read the fingers in detail (gestures, a poke) cannot be
+  played this way.
 - **Voice Control's numbers and grid** cannot reach inside a title: a Quest
   title draws its menus as pixels in a 3D scene, so visionOS cannot see its
   buttons. Aim with your head and say "select" instead.
@@ -148,10 +184,41 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
 - **Auto-start** for linear experiences, so they need no input at all.
 - **Per-title phrases** ("start experience") for titles with known menus.
 
+## When voice does not work: reading the log
+
+Every title's log (`Documents/logs/<title>/klepton-boot.log`, pulled with
+`metavision-device`) says what the microphone and the recogniser did:
+
+| Line | Means |
+|---|---|
+| `[mv] voice: microphone permission DENIED` | visionOS Settings → Privacy & Security → Microphone: allow metavision |
+| `[mv] voice: microphone #1 (start): 48000 Hz, 1 ch float -> 1 ch, route MicrophoneBuiltIn, ...` | the microphone was opened (again for #2, #3: after an interruption, a route change or the title's own audio starting) |
+| `[mv] voice: heard "select" [task 4]` | what the recogniser heard (the first 400, then every 25th) |
+| `[mv] voice: select` | a command acted on |
+| `[mv] voice: task 5 (utterance over)` | recognition restarted (after each phrase, a final result, an error, or 50 s) |
+| `[mv] voice: health — microphone on ..., 47 buffers/s, peak -31 dBFS; ...` | every 30 s: audio is arriving and how loud; `DIGITAL SILENCE` means no permission or a muted input |
+| `[mv] voice: rebuilding the microphone: ...` | the microphone stopped (the engine's configuration changed, no audio for 3 s, an interruption) and was reopened |
+
+`tools/metavision-triage` summarises these per title.
+
+Unattended test passes (auto-play) speak the first six hands-free phrases
+**out of the headset's loudspeaker**, so the real microphone hears them over
+the title's own sound — the path a user's voice takes — and triage reports
+them apart ("microphone (loudspeaker) test: 6 said, N heard"); the rest are
+fed into the recogniser directly. Each pass also says "exit title" once and
+never confirms it: the question must time out and the title stay.
+
 ## How it is built
 
 `klepton-overlay/MetavisionHandsFree.swift` is copied into Klepton's app at
-build time; `tools/metavision-overlay` wires it into `KleptonControllers.swift`
+build time. Its recogniser opens the microphone with a fresh audio engine,
+reopens it whenever the engine stops itself (another audio unit starting, a
+route change, an interruption, a media-services reset, or 3 s without audio),
+starts a new recognition task after every phrase so a transcript never grows
+or is revised under a later command, and gives the recogniser the command
+words as contextual strings, the short-command task hint and, on device, a
+language model built for them. The overlay draws the reticle in the
+compositor (step 181); `tools/metavision-overlay` wires it into `KleptonControllers.swift`
 (the merge of hands and Sense controllers into synthetic Touch controllers)
 and lets the audio session record when voice is on, the same way Klepton's own
 microphone toggle does. Both hands-free controllers are published through the
