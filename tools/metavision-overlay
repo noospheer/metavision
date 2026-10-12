@@ -8475,3 +8475,361 @@ static klj_val mv_vw_destroy(void *env, void *self, const klj_val *a, int n) {
     open(p, "w").write(s)
 print("overlay: the 3D WebView answers 'no web content' and tells C# so")
 PYEOF
+
+# 93 — a native video player plugin's Java side. The plugin's native library
+# embeds mpv and FFmpeg and decodes by itself, but its Kotlin half is what the
+# title's C# reaches first: a plugin object whose Create(activity) registers
+# battery, volume, Bluetooth and USB receivers, then answers battery, volume,
+# headset and free-space questions; a USB-storage singleton reached through its
+# INSTANCE field; a crash reporter's init. None of them had a host
+# implementation, so Create was "no host implementation" and every answer was
+# null or 0. Each now answers what an idle headset would:
+#  - Create (every spelling the guest uses) keeps nothing, as there is nothing
+#    to receive; Destroy does nothing.
+#  - getCurrentBattery 100; isBlueToothHeadsetOn false.
+#  - getVolume/setVolume on one host value on Android's music-stream scale
+#    (0..15, starting at 15, which AudioManager.getStreamVolume reports); the
+#    host device's own volume is the user's and is never changed.
+#  - getAvailableStorage(path): statvfs on the guest path as the libc maps it
+#    (kl_guest_path), -1 for a missing path, exactly as the Java answers.
+#  - the USB singleton's methods do nothing; GetPartitionInfo is "[]" (the
+#    JSON array of no partitions) and the permission action is the Java's own.
+#  - the crash reporter's init does nothing: no reports leave this host.
+#  - Settings.Global.getString answers null (no global setting is served),
+#    unless something already answers it.
+python3 - "$K/runtime/jni/kl_jni_net.c" "$K/runtime/kl_jni.c" "$K/runtime/jni/kl_jni_int.h" <<'PYEOF'
+import sys, glob, os
+marker = "metavision: a native video player plugin's Java side (step 93)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    rt = os.path.dirname(os.path.dirname(p))
+    answered = any('"android/provider/Settings$Global", "getString"' in open(f).read()
+                   for f in glob.glob(os.path.join(rt, "jni", "*.c")) + [os.path.join(rt, "kl_jni.c")])
+    global_def = "" if answered else r'''// No global setting is served; Android answers null for an unknown name.
+static klj_val mv_SettingsGlobal_getString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *key = n > 1 ? klj_str(a[1].l) : NULL;
+    KLJ_LOG("Settings.Global.getString(\"%s\") -> null (not a setting we serve)", key ? key : "(null)");
+    return (klj_val){0};
+}
+'''
+    global_row = "" if answered else (
+        "    {\"android/provider/Settings$Global\", \"getString\", "
+        "\"(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;\", mv_SettingsGlobal_getString},\n")
+    s = sub(p, s, "const klj_binding klj_bind_net[] = {\n", "// " + marker + "\n" + r'''#include <sys/statvfs.h>
+#define MV_VP_PLUGIN   "xyz/skybox/player/skyboxplugin/SkyboxPlugin"
+#define MV_VP_USB      "xyz/skybox/player/skyboxplugin/UsbPlugin"
+#define MV_VP_CRASH    "com/ninevastudios/bugsplatunitylib/BugSplatBridge"
+#define MV_VP_STR4     "Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V"
+static _Atomic int mv_vp_volume = 15;      // STREAM_MUSIC, 0..15
+static klj_val mv_VP_nothing(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};                     // void, false or null
+}
+// Create(activity): the receivers it registers would never fire here, so it
+// keeps nothing; the getters below are their steady state.
+static klj_val mv_VP_Create(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG_ONCE("video player plugin Create(activity): no receivers to register "
+                 "(battery 100, volume kept here, no Bluetooth headset, no USB storage)");
+    return (klj_val){0};
+}
+static klj_val mv_VP_getCurrentBattery(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = 100};
+}
+static klj_val mv_VP_getVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.j = (uint64_t)mv_vp_volume};
+}
+// The Java ignores a negative volume and sets STREAM_MUSIC otherwise.
+static klj_val mv_VP_setVolume(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int32_t v = n > 0 ? (int32_t)a[0].j : -1;
+    if (v < 0) return (klj_val){0};
+    if (v > 15) v = 15;
+    mv_vp_volume = v;
+    KLJ_LOG("video player plugin setVolume(%d) — kept for getVolume; the host "
+            "device's volume is the user's", v);
+    return (klj_val){0};
+}
+// new StatFs(path): available blocks x block size, or -1 when the path is
+// missing or the call fails (the Java's catch).
+static klj_val mv_VP_getAvailableStorage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *g = n > 0 ? klj_str(a[0].l) : NULL;
+    char buf[1024];
+    const char *h = g ? kl_guest_path(g, buf, sizeof buf) : NULL;
+    int64_t avail = -1;
+    struct stat st;
+    struct statvfs sv;
+    if (h && stat(h, &st) == 0 && statvfs(h, &sv) == 0)
+        avail = (int64_t)sv.f_bavail * (int64_t)sv.f_frsize;
+    static _Atomic unsigned said;
+    if (said++ < 8)
+        KLJ_LOG("video player plugin getAvailableStorage(\"%s\") -> %lld",
+                g ? g : "(null)", (long long)avail);
+    return (klj_val){.j = (uint64_t)avail};
+}
+static klj_val mv_VPUsb_GetPartitionInfo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("[]")};   // no USB storage, no partitions
+}
+static klj_val mv_VPUsb_action(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("com.example.USB_PERMISSION")};
+}
+// The Kotlin object's INSTANCE field (g_fields).
+static void *mv_vp_usb;
+klj_val mv_UsbPlugin_INSTANCE(void) { return klj_singleton(MV_VP_USB, &mv_vp_usb); }
+static klj_val mv_VPCrash_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG_ONCE("crash reporter init: nothing to set up, no reports leave this host");
+    return (klj_val){0};
+}
+''' + global_def + "\n" + "const klj_binding klj_bind_net[] = {\n"
+        "    // " + marker + "\n"
+        "    {MV_VP_PLUGIN, \"Create\", \"(Ljava/lang/Object;)V\", mv_VP_Create},\n"
+        "    {MV_VP_PLUGIN, \"Create\", \"(Landroid/app/Activity;)V\", mv_VP_Create},\n"
+        "    {MV_VP_PLUGIN, \"Create\", \"(Lcom/unity3d/player/UnityPlayerActivity;)V\", mv_VP_Create},\n"
+        "    {MV_VP_PLUGIN, \"Destroy\", \"()V\", mv_VP_nothing},\n"
+        "    {MV_VP_PLUGIN, \"getCurrentBattery\", \"()I\", mv_VP_getCurrentBattery},\n"
+        "    {MV_VP_PLUGIN, \"getVolume\", \"()I\", mv_VP_getVolume},\n"
+        "    {MV_VP_PLUGIN, \"setVolume\", \"(I)V\", mv_VP_setVolume},\n"
+        "    {MV_VP_PLUGIN, \"isBlueToothHeadsetOn\", \"()Z\", mv_VP_nothing},\n"
+        "    {MV_VP_PLUGIN, \"getAvailableStorage\", \"(Ljava/lang/String;)J\", mv_VP_getAvailableStorage},\n"
+        "    {MV_VP_USB, \"GetPartitionInfo\", \"()Ljava/lang/String;\", mv_VPUsb_GetPartitionInfo},\n"
+        "    {MV_VP_USB, \"GetUsbFileByDirectoryPath\", \"(Ljava/lang/String;I)V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"GetUsbPermission\", \"()V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"SetUsbHttpPort\", \"(Ljava/lang/String;)V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"cleanup\", \"()V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"registerReceivers\", \"()V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"unregisterReceivers\", \"()V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"releaseWorker\", \"()V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"setMUsbManager\", \"(Landroid/hardware/usb/UsbManager;)V\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"getMUsbManager\", \"()Landroid/hardware/usb/UsbManager;\", mv_VP_nothing},\n"
+        "    {MV_VP_USB, \"getACTION_USB_PERMISSION\", \"()Ljava/lang/String;\", mv_VPUsb_action},\n"
+        "    {MV_VP_CRASH, \"initBugSplat\", \"(Landroid/app/Activity;\" MV_VP_STR4, mv_VPCrash_init},\n"
+        "    {MV_VP_CRASH, \"initBugSplat\", \"(Lcom/unity3d/player/UnityPlayerActivity;\" MV_VP_STR4, mv_VPCrash_init},\n"
+        + global_row)
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "    {.cls = NULL},\n};\n\n// The Build.* String constants",
+        "    // " + marker + ": the USB-storage object's INSTANCE\n"
+        "    KLJ_FFN(\"xyz/skybox/player/skyboxplugin/UsbPlugin\", \"INSTANCE\", \"Ljava/lang/Object;\", mv_UsbPlugin_INSTANCE),\n"
+        "    KLJ_FFN(\"xyz/skybox/player/skyboxplugin/UsbPlugin\", \"INSTANCE\", \"Lxyz/skybox/player/skyboxplugin/UsbPlugin;\", mv_UsbPlugin_INSTANCE),\n"
+        "    {.cls = NULL},\n};\n\n// The Build.* String constants")
+    open(p, "w").write(s)
+p = sys.argv[3]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "klj_val     klj_porterduff_clear(void);\n",
+        "klj_val     klj_porterduff_clear(void);\n"
+        "klj_val     mv_UsbPlugin_INSTANCE(void);   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: a native video player plugin's Java side (battery, volume, storage, USB, crash reporter)")
+PYEOF
+
+# 94 — the video player plugin's frame listener. Its native library makes its
+# own SurfaceTexture through JNI (step 85) and gives it a listener of the
+# plugin's Kotlin class, whose onFrameAvailable calls the private native
+# nativeOnFrameAvailable() the library exports. It finds that class with
+# activity.getClassLoader().loadClass("<dotted name>") from its render thread,
+# and neither Context.getClassLoader nor ClassLoader.loadClass had a host
+# implementation: the lookup failed and no frame ever reached the library.
+#  - Context.getClassLoader answers the one loader (as Class.getClassLoader
+#    does), and ClassLoader.loadClass(name[, resolve]) interns the class the
+#    way findClass does (dots or slashes).
+#  - the listener's <init>()V makes a pinned instance (the library keeps it as
+#    a global reference); onFrameAvailable(st) calls the native with (env,
+#    this), as registered by the library or, failing that, by its exported name.
+#    Step 85 calls it on the frame consumer's thread through klj_call_binding,
+#    which finds it on the listener's class.
+python3 - "$K/runtime/jni/kl_jni_net.c" "$K/runtime/jni/kl_jni_lang.c" <<'PYEOF'
+import sys
+marker = "metavision: the video player plugin's frame listener (step 94)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "const klj_binding klj_bind_net[] = {\n", "// " + marker + "\n" + r'''#define MV_VP_LISTENER "xyz/skybox/player/skyboxplugin/SkyboxOnFrameAvailableListener"
+static klj_val mv_VPListener_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    void *obj = kl_jni_new_object(MV_VP_LISTENER);
+    kl_jni_pin_object(obj);
+    return (klj_val){.l = obj};
+}
+// `public void onFrameAvailable(SurfaceTexture st) { nativeOnFrameAvailable(); }`
+// — a private instance native: (env, this).
+static klj_val mv_VPListener_onFrameAvailable(void *env, void *self, const klj_val *a, int n) {
+    (void)a; (void)n;
+    static void *fn;
+    if (!fn) fn = kl_jni_native(MV_VP_LISTENER, "nativeOnFrameAvailable", NULL);
+    if (!fn) {
+        void *h = klb_dlopen("libskybox.so", 0x00002);
+        fn = h ? klb_dlsym(h, "Java_xyz_skybox_player_skyboxplugin_SkyboxOnFrameAvailableListener_nativeOnFrameAvailable") : NULL;
+    }
+    if (!fn) {
+        KLJ_LOG_ONCE("video player plugin onFrameAvailable: the library's nativeOnFrameAvailable was not found");
+        return (klj_val){0};
+    }
+    KLJ_LOG_ONCE("video player plugin onFrameAvailable -> nativeOnFrameAvailable (first frame)");
+    ((void (*)(void *, void *))fn)(env, self);
+    return (klj_val){0};
+}
+
+''' + "const klj_binding klj_bind_net[] = {\n"
+        "    {MV_VP_LISTENER, \"<init>\", \"()V\", mv_VPListener_init},   // " + marker + "\n"
+        "    {MV_VP_LISTENER, \"onFrameAvailable\", \"(Landroid/graphics/SurfaceTexture;)V\", mv_VPListener_onFrameAvailable},\n")
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    row = "    {\"java/lang/ClassLoader\", \"findClass\", \"(Ljava/lang/String;)Ljava/lang/Class;\", klj_ClassLoader_findClass},\n"
+    add = "    // " + marker + ": the loader a native library asks its Context for\n"
+    if '"android/content/Context", "getClassLoader"' not in s:
+        add += "    {\"android/content/Context\", \"getClassLoader\", \"()Ljava/lang/ClassLoader;\", klj_Class_getClassLoader},\n"
+    if '"java/lang/ClassLoader", "loadClass"' not in s:
+        add += ("    {\"java/lang/ClassLoader\", \"loadClass\", \"(Ljava/lang/String;)Ljava/lang/Class;\", klj_ClassLoader_findClass},\n"
+                "    {\"java/lang/ClassLoader\", \"loadClass\", \"(Ljava/lang/String;Z)Ljava/lang/Class;\", klj_ClassLoader_findClass},\n")
+    s = sub(p, s, row, row + add)
+    open(p, "w").write(s)
+print("overlay: the video player plugin's frame listener, Context.getClassLoader and ClassLoader.loadClass")
+PYEOF
+
+# 95 — FFmpeg's MediaCodec decoder takes the NDK path under mpv, and the app's
+# own /data/data directory is its files directory.
+#
+# The video player plugin calls av_jni_set_java_vm, and FFmpeg's mediacodec
+# decoder then defaults to the JAVA android.media.MediaCodec API (its
+# ndk_codec option defaults to "no JavaVM set"). That class has no host
+# implementation; AMediaCodec (kl_mediandk) is the decoder here. The plugin's
+# import of mpv_initialize is interposed (kl_interpose, at relocation time):
+# before calling the real one it sets mpv's vd-lavc-o to ndk_codec=1 on the
+# handle (the plugin sets no decoder options of its own), so FFmpeg uses
+# AMediaCodec, and logs that it did. KL_MPV_NDK_CODEC=0 leaves the handle
+# alone. Hooking av_jni_set_java_vm away instead would also pick the NDK, but
+# it is the less safe of the two: with no JavaVM FFmpeg cannot turn the
+# Surface jobject mpv hands it (--wid, vo=mediacodec_embed) into a window
+# (ff_mediacodec_surface_ref and the NDK configure both need a JNIEnv for
+# ANativeWindow_fromSurface), and libmpv's own Android code reads the JavaVM
+# back too — so decoding into the SurfaceTexture would fail.
+#
+# The plugin also builds paths under /data/data/<package>/ itself (Android's
+# dataDir) and every mkdir there was denied. That prefix, and
+# /data/user/0/<package>/, now resolve to the directory ApplicationInfo.dataDir
+# already answers (the app's files directory), as /sdcard resolves to
+# external storage.
+python3 - "$K/runtime/kl_dl.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: FFmpeg's NDK MediaCodec under mpv (step 95)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    old = "static void *kl_dl_interpose(const char *name, void *real) {\n"
+    s = sub(s, old, "// " + marker + r'''. kl_sym (through
+// kl_guest_sym_global) answers the definitions in libmpv, never this
+// interposer, so the call-through cannot recurse.
+#define MV_MPV_ERROR_GENERIC (-20)
+static int mv_mpv_initialize(void *mpv) {
+    static int (*real)(void *);
+    static int (*set_option)(void *, const char *, const char *);
+    if (!real) real = (int (*)(void *))kl_guest_sym_global("mpv_initialize");
+    if (!set_option)
+        set_option = (int (*)(void *, const char *, const char *))
+                     kl_guest_sym_global("mpv_set_option_string");
+    int rc = 1;
+    if (mpv && set_option && kl_env_on("KL_MPV_NDK_CODEC", 1))
+        rc = set_option(mpv, "vd-lavc-o", "ndk_codec=1");
+    static unsigned said;
+    if (said++ < 4)
+        fprintf(stderr, "  [mpv] mpv_initialize(%p): vd-lavc-o=ndk_codec=1 %s (%d) — FFmpeg's "
+                        "MediaCodec decoder takes the NDK path, not android.media.MediaCodec\n",
+                mpv, rc == 0 ? "set" : rc == 1 ? "skipped" : "FAILED", rc);
+    if (!real) {
+        fprintf(stderr, "  [mpv] mpv_initialize: libmpv's own definition was not found\n");
+        return MV_MPV_ERROR_GENERIC;
+    }
+    return real(mpv);
+}
+// Registered before any guest image relocates, so every import of the name
+// binds to it.
+__attribute__((constructor)) static void mv_mpv_interpose_install(void) {
+    kl_interpose("mpv_initialize", (void *)mv_mpv_initialize);
+}
+
+''' + old)
+    open(p, "w").write(s)
+print("overlay: mpv_initialize sets vd-lavc-o=ndk_codec=1, so FFmpeg decodes through AMediaCodec")
+PYEOF
+
+python3 - "$K/runtime/libc/kl_libc.c" "$K/runtime/klepton.h" "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+marker = "metavision: the app's own /data/data directory (step 95)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = ("void kl_guest_extstorage_map(const char *dir) {\n"
+           "    snprintf(g_ext_target, sizeof g_ext_target, \"%s\", dir);\n"
+           "}\n")
+    s = sub(p, s, old, old + "\n// " + marker + r''': Android's
+// dataDir under both of its spellings, for a guest that builds the path itself.
+static char g_data_prefix[2][256];
+static char g_data_target[1024];
+
+void kl_guest_datadir_map(const char *package, const char *dir) {
+    if (!package || !*package || !dir || !*dir) return;
+    snprintf(g_data_prefix[0], sizeof g_data_prefix[0], "/data/data/%s", package);
+    snprintf(g_data_prefix[1], sizeof g_data_prefix[1], "/data/user/0/%s", package);
+    snprintf(g_data_target, sizeof g_data_target, "%s", dir);
+}
+''')
+    old = "    if (strncmp(path, \"/proc/\", 6) != 0 &&\n"
+    s = sub(p, s, old,
+        "    if (g_data_target[0]) {   // " + marker + "\n"
+        "        for (size_t i = 0; i < sizeof g_data_prefix / sizeof *g_data_prefix; i++) {\n"
+        "            size_t n = strlen(g_data_prefix[i]);\n"
+        "            if (!n || strncmp(path, g_data_prefix[i], n) != 0) continue;\n"
+        "            if (path[n] != '/' && path[n] != '\\0') continue;   // another package's name\n"
+        "            snprintf(buf, cap, \"%s%s\", g_data_target, path + n);\n"
+        "            return buf;\n"
+        "        }\n"
+        "    }\n" + old)
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    old = "void kl_guest_extstorage_map(const char *dir);\n"
+    s = sub(p, s, old, old +
+        "// " + marker + ": /data/data/<package> and\n"
+        "// /data/user/0/<package> resolve to `dir`, which must be what\n"
+        "// ApplicationInfo.dataDir answers.\n"
+        "void kl_guest_datadir_map(const char *package, const char *dir);\n")
+    open(p, "w").write(s)
+p = sys.argv[3]
+s = open(p).read()
+if marker not in s:
+    old = "    kl_guest_extstorage_map(kl_jni_files_dir());\n"
+    s = sub(p, s, old, old +
+        "    kl_guest_datadir_map(kl_jni_guest_package(), kl_jni_files_dir());   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: /data/data/<package> resolves to the app's files directory")
+PYEOF
