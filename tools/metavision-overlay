@@ -10677,3 +10677,40 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: /data/data/<package> resolves to the app's files directory")
 PYEOF
+
+python3 - "$K/runtime/libc/kl_libc.c" "$K/runtime/libc/kl_shim.c" <<'PYEOF'
+import sys
+marker = "metavision: android_get_device_api_level (step 96)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "void klb_sysprop_read(const void *p, char *n, char *v) {\n"
+    s = sub(p, s, old, "// " + marker + r''': bionic's <android/api-level.h>
+// calls (API 29+ / 24+). A guest that imports them reaches a fatal unresolved
+// import without them. The device level is ro.build.version.sdk's answer; the
+// target level is ApplicationInfo.targetSdkVersion's.
+int klb_android_get_device_api_level(void) {
+    const char *v = sysprop_value("ro.build.version.sdk");
+    return v ? atoi(v) : 29;
+}
+int klb_android_get_application_target_sdk_version(void) { return 34; }
+
+''' + old)
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    old = "X(klb_errno) X(klb_gettid) X(klb_sysprop_find) X(klb_sysprop_get) X(klb_sysprop_read)\n"
+    s = sub(p, s, old, old +
+        "X(klb_android_get_device_api_level) X(klb_android_get_application_target_sdk_version)   // " + marker + "\n")
+    old = "    E(\"__system_property_read\", klb_sysprop_read),\n"
+    s = sub(p, s, old, old +
+        "    E(\"android_get_device_api_level\", klb_android_get_device_api_level),   // " + marker + "\n"
+        "    E(\"android_get_application_target_sdk_version\", klb_android_get_application_target_sdk_version),\n")
+    open(p, "w").write(s)
+print("overlay: android_get_device_api_level and the target SDK level are answered")
+PYEOF

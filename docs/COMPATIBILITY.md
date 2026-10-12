@@ -217,3 +217,4 @@ OVRPlugin call in order — the step where a title stops is the last one.
 - **Dwell Control inside an immersive title** is untested (see ACCESSIBILITY.md).
 - Titles whose code is 32-bit only, Flutter, Quill's own engine or Unreal 5 are
   not generated (8 of 54 in the archive).
+| 96 | `android_get_device_api_level` / `android_get_application_target_sdk_version` answered (the device level is `ro.build.version.sdk`'s) | a native plugin importing them aborted on an unresolved import |
