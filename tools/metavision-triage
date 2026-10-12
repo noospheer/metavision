@@ -69,6 +69,10 @@ GLES_COMPUTE = re.compile(r"GLSL compilation failed, no infolog provided|'std430
 # A movie the runtime could not open (the player answered setDataSource false).
 MEDIA_FAIL = re.compile(r"MediaPlayer14: could not open (\S+)|\[avdec\] (?:cannot open the container (\S+?):|(\S+) carries no video track)")
 # A Java method the title called with no host implementation: (class, method).
+# An OVRPlugin / GL / Oculus Platform / JNIEnv entry point answered with a
+# stand-in value because it is unimplemented (permissive mode).
+PERMISSIVE = re.compile(r"(?:\[(?:ovrp|egl|plat)\] (?:GL )?call \(permissive, [^)]*\)"
+                        r"|\[jni\] unimplemented \w+ slot \d+): (\w+)")
 NOHOST = re.compile(r"^\[jni\] no host implementation for ([\w/$]+)\.(\w+|<init>)\(", re.M)
 # The title asked for passthrough, which is not available: a black background is by design.
 PASSTHROUGH = re.compile(r"Failed to initialize Insight Passthrough|doesn't support XR_FB_passthrough")
@@ -334,6 +338,12 @@ def triage(d: Path):
         top = sorted(nohost.items(), key=lambda kv: -len(kv[1]))[:2]
         notes.append(f"unimplemented Java: {sum(len(v) for v in nohost.values())} method(s) in "
                      f"{len(nohost)} class(es), most in " + ", ".join(k for k, _ in top))
+    # Entry points answered with a stand-in because nothing implements them
+    # (the launcher is permissive by default): no longer a stop, still a gap.
+    stand = sorted(set(PERMISSIVE.findall(text)))
+    if stand:
+        notes.append(f"unimplemented entry points answered with a stand-in: {len(stand)} ("
+                     + ", ".join(stand[:4]) + (", ..." if len(stand) > 4 else "") + ")")
     peaks = [int(m.group(1)) for m in AUDIO.finditer(text)]
     if peaks and max(peaks) == 0:
         # Silence is a failure only when the title ships sound to play: one

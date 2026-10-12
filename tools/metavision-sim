@@ -115,6 +115,16 @@ def running(pid):
         return False
 
 
+def report_pid(p):
+    """The pid a crash report is about: an .ips is a JSON header line, then a JSON body."""
+    try:
+        text = p.read_text(errors="replace")
+        body = text.split("\n", 1)[1] if "\n" in text else text
+        return int(json.loads(body).get("pid", -1))
+    except (OSError, ValueError, AttributeError):
+        return -1
+
+
 def cmd_run(a):
     tri = triage()
     s = state()
@@ -125,6 +135,37 @@ def cmd_run(a):
     reports = Path.home() / "Library" / "Logs" / "DiagnosticReports"
     results = {"seconds": a.seconds, "items": {}}
     print(f"{out}: {len(names)} title(s), {a.seconds} s each", flush=True)
+    # The Simulator writes a crash report 15-90 s after the crash, by which time
+    # the next title is often running: "whatever appeared during this run" put
+    # most reports in the NEXT title's folder. Each report names its pid, and
+    # each launch's pid is known, so reports are filed by pid instead.
+    seen = set(reports.glob("*")) if reports.is_dir() else set()
+    by_pid = {}                                    # pid -> (title, folder, exited)
+
+    def sweep():
+        """File every new report under the run whose pid it names; the pids it touched."""
+        touched = set()
+        if not reports.is_dir():
+            return touched
+        for p in sorted(set(reports.glob("*")) - seen):
+            if p.suffix != ".ips" or not any(k in p.name.lower() for k in ("metavision", "klepton")):
+                seen.add(p)
+                continue
+            rp = report_pid(p)
+            if rp < 0:
+                continue                           # still being written: next sweep
+            seen.add(p)
+            if rp in by_pid:
+                shutil.copy(p, by_pid[rp][1] / p.name)
+                touched.add(rp)
+        return touched
+
+    def record(rp):
+        t, d, exited = by_pid[rp]
+        v = tri.verdict(d, exited=exited)
+        results["items"][f"{t}@cycle"] = {"verdict": v["verdict"], "summary": v["summary"], "exited_after": exited}
+        (out / "state.json").write_text(json.dumps(results, indent=1))
+        return v
     for i, t in enumerate(names, 1):
         for f in ("klepton-boot.log", "klepton-crash.log", "shots"):
             p = docs / f
@@ -132,7 +173,6 @@ def cmd_run(a):
                 shutil.rmtree(p, ignore_errors=True)
             elif p.exists():
                 p.unlink()
-        before = set(reports.glob("*")) if reports.is_dir() else set()
         env = {**os.environ,
                "SIMCTL_CHILD_KL_AUTOBOOT": "1",
                "SIMCTL_CHILD_MV_AUTOSTART": t,
@@ -179,14 +219,32 @@ def cmd_run(a):
         if (docs / "shots").is_dir():
             for p in sorted((docs / "shots").glob("*.png")):
                 shutil.copy(p, d / p.name)
-        if reports.is_dir():
-            for p in set(reports.glob("*")) - before:
-                if p.suffix == ".ips" and any(k in p.name.lower() for k in ("metavision", "klepton")):
-                    shutil.copy(p, d / p.name)
-        v = tri.verdict(d, exited=exited)
-        results["items"][f"{t}@cycle"] = {"verdict": v["verdict"], "summary": v["summary"], "exited_after": exited}
-        (out / "state.json").write_text(json.dumps(results, indent=1))
+        by_pid[pid] = (t, d, exited)
+        # A run that died is owed a report: wait for it (bounded) before the
+        # verdict, so the verdict reads this title's stack, not a neighbour's.
+        died = exited is not None or (d / "klepton-crash.log").exists()
+        deadline = time.time() + (120 if died else 0)
+        late = sweep()
+        while died and not any(d.glob("*.ips")) and time.time() < deadline:
+            time.sleep(3)
+            late |= sweep()
+        for rp in late - {pid}:                    # an earlier title's report, late
+            print(f"  (a late crash report for {by_pid[rp][0]} re-triaged)", flush=True)
+            record(rp)
+        v = record(pid)
         print(f"  -> {v['verdict'].upper()}: {v['summary']}", flush=True)
+    # A run that died and still has no report: one last bounded wait for it.
+    def owed():
+        return {rp for rp, (_t, d, ex) in by_pid.items()
+                if (ex is not None or (d / "klepton-crash.log").exists()) and not any(d.glob("*.ips"))}
+    late, deadline = sweep(), time.time() + 60
+    while owed() and time.time() < deadline:
+        time.sleep(5)
+        late |= sweep()
+    if late:
+        for rp in late:
+            print(f"  (a late crash report for {by_pid[rp][0]} re-triaged)", flush=True)
+            record(rp)
     counts = {}
     for r in results["items"].values():
         counts[r["verdict"]] = counts.get(r["verdict"], 0) + 1

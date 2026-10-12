@@ -19910,3 +19910,452 @@ if '@_cdecl("mv_net_fetch_headers")' not in s:
     sys.exit(f"overlay: {p} does not define mv_net_fetch_headers (step 162)")
 print("overlay: MetavisionNet.swift answers response headers too (mv_net_fetch_headers)")
 PYEOF
+
+# 170 — a user's launch never aborts a title on an unimplemented call.
+# The runtime was strict by default: an unimplemented JNI method, field or
+# JNIEnv slot, GL entry point, OVRPlugin or Oculus Platform call logged "this is
+# a work item" and aborted, unless KL_PERMISSIVE was set. The headset passes
+# only looked forgiving because the launcher's Documents/klepton.env, written by
+# hand for a scouting session and never cleared, carried KL_PERMISSIVE=1 — a
+# fresh install launched from the home screen, and the Simulator, ran strict and
+# died on the first unimplemented call. Now the visionOS app defaults to
+# permissive (kl_set_permissive_default(1) in kl_app_boot, before any guest code
+# runs) and KL_STRICT=1 (or KL_PERMISSIVE=0) restores the scouting abort. One
+# switch decides for JNI, GL, OVRPlugin and the Oculus Platform alike: kl_egl.c
+# reads kl_permissive() instead of its own copy of the variable. The host
+# harness keeps its strict default. In permissive mode an unimplemented JNI
+# method, field or JNIEnv slot is logged once per id and answers zero, so a call
+# made every frame does not write a line every frame.
+python3 - "$K" <<'PYEOF'
+import sys
+K = sys.argv[1]
+marker = "metavision: a user's launch is permissive (step 170)"
+def sub(s, old, new, p):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+def edit(rel, fn):
+    p = f"{K}/{rel}"
+    s = open(p).read()
+    if marker not in s:
+        s = fn(s, p)
+        open(p, "w").write(s)
+
+def env_c(s, p):
+    return sub(s,
+        "static int g_permissive = -1;\n"
+        "int kl_permissive(void) {\n"
+        "    if (g_permissive < 0) g_permissive = getenv(\"KL_PERMISSIVE\") != NULL;\n"
+        "    return g_permissive;\n"
+        "}",
+        "// " + marker + ": KL_STRICT=1 always wins; an explicit KL_PERMISSIVE\n"
+        "// decides next (\"0\"/\"off\" is strict); otherwise the front end's default.\n"
+        "static int g_permissive = -1;\n"
+        "static int g_permissive_default;\n"
+        "void kl_set_permissive_default(int on) {\n"
+        "    g_permissive_default = on;\n"
+        "    g_permissive = -1;\n"
+        "}\n"
+        "int kl_permissive(void) {\n"
+        "    if (g_permissive < 0) {\n"
+        "        if (kl_env_on(\"KL_STRICT\", 0)) g_permissive = 0;\n"
+        "        else if (getenv(\"KL_PERMISSIVE\")) g_permissive = kl_env_on(\"KL_PERMISSIVE\", 1);\n"
+        "        else g_permissive = g_permissive_default;\n"
+        "    }\n"
+        "    return g_permissive;\n"
+        "}", p)
+edit("runtime/kl_env.c", env_c)
+
+def env_h(s, p):
+    return sub(s,
+        "// Gets KL_PERMISSIVE\n"
+        "int kl_permissive(void);\n",
+        "// Unimplemented calls answer zero (1) or abort (0). KL_STRICT=1 forces 0,\n"
+        "// a set KL_PERMISSIVE decides next, else the default below. " + marker + "\n"
+        "int kl_permissive(void);\n"
+        "// The front end's default when neither variable is set: the visionOS app\n"
+        "// passes 1 (a user's launch must not abort), the host harness leaves 0.\n"
+        "void kl_set_permissive_default(int on);\n", p)
+edit("runtime/kl_env.h", env_h)
+
+def app_c(s, p):
+    return sub(s,
+        "    kl_jni_set_permissive(kl_env_on(\"KL_PERMISSIVE\", 0));\n",
+        "    // " + marker + ": an unimplemented call is logged once and\n"
+        "    // answers zero, so a title is never stopped for a call we lack. Scouting\n"
+        "    // runs set KL_STRICT=1 to stop at the first one instead.\n"
+        "    kl_set_permissive_default(1);\n"
+        "    kl_jni_set_permissive(kl_permissive());\n", p)
+edit("visionos/Sources/kl_app.c", app_c)
+
+def boot_c(s, p):
+    return sub(s,
+        "    kl_jni_set_permissive(getenv(\"KL_PERMISSIVE\") != NULL);\n",
+        "    kl_jni_set_permissive(kl_permissive());   // " + marker + " (host default stays strict)\n", p)
+edit("mains/m_boot.c", boot_c)
+
+def egl_c(s, p):
+    return sub(s,
+        "    if (g_permissive < 0) g_permissive = kl_env_on(\"KL_PERMISSIVE\", 0);\n",
+        "    if (g_permissive < 0) g_permissive = kl_permissive();   // " + marker + "\n", p)
+edit("runtime/gfx/kl_egl.c", egl_c)
+
+def jni_c(s, p):
+    # A JNIEnv/JavaVM slot we lack: logged once, answers zero when permissive.
+    s = sub(s,
+        "static __attribute__((noreturn)) void klj_unimpl(const char *table, int idx, const char *name) {\n"
+        "    fprintf(stderr, \"\\n[jni] UNIMPLEMENTED %s slot %d: %s\\n\", table, idx, name);\n",
+        "static void klj_unimpl(const char *table, int idx, const char *name) {\n"
+        "    if (g_permissive) {   // " + marker + "\n"
+        "        static unsigned char said[2][512];\n"
+        "        int t = table[0] == 'J' && table[1] == 'a';\n"
+        "        if (idx < 0 || idx >= 512 || !__atomic_exchange_n(&said[t][idx], 1, __ATOMIC_RELAXED))\n"
+        "            fprintf(stderr, \"[jni] unimplemented %s slot %d: %s (permissive, answering 0)\\n\",\n"
+        "                    table, idx, name);\n"
+        "        return;\n"
+        "    }\n"
+        "    fprintf(stderr, \"\\n[jni] UNIMPLEMENTED %s slot %d: %s\\n\", table, idx, name);\n", p)
+    s = sub(s,
+        "    static __attribute__((noreturn)) void klj_env_stub_##name(void) { klj_unimpl(\"JNIEnv\", idx, #name); }\n",
+        "    static uint64_t klj_env_stub_##name(void) { klj_unimpl(\"JNIEnv\", idx, #name); return 0; }\n", p)
+    s = sub(s,
+        "    static __attribute__((noreturn)) void klj_vm_stub_##name(void) { klj_unimpl(\"JavaVM\", idx, #name); }\n",
+        "    static uint64_t klj_vm_stub_##name(void) { klj_unimpl(\"JavaVM\", idx, #name); return 0; }\n", p)
+    # An unimplemented method: once per jmethodID.
+    s = sub(s,
+        "    KLJ_LOG(\"no host implementation for %s.%s%s\", w->cls, w->name, w->sig);\n"
+        "    if (g_permissive && strstr(",
+        "    {   // " + marker + ": once per id when permissive\n"
+        "        static unsigned char said[KLJ_MAX_WANTED];\n"
+        "        if (!g_permissive || !__atomic_exchange_n(&said[w - g_wanted], 1, __ATOMIC_RELAXED))\n"
+        "            KLJ_LOG(\"no host implementation for %s.%s%s%s\", w->cls, w->name, w->sig,\n"
+        "                    g_permissive ? \" (permissive, answering 0)\" : \"\");\n"
+        "    }\n"
+        "    if (g_permissive && strstr(", p)
+    # An unset field: once per jfieldID.
+    s = sub(s,
+        "    KLJ_LOG(\"no host value for field %s.%s %s\", w->cls, w->name, w->sig);\n"
+        "    if (!g_permissive) {\n",
+        "    {   // " + marker + ": once per id when permissive\n"
+        "        static unsigned char said[KLJ_MAX_WANTED];\n"
+        "        if (!g_permissive || !__atomic_exchange_n(&said[w - g_wanted], 1, __ATOMIC_RELAXED))\n"
+        "            KLJ_LOG(\"no host value for field %s.%s %s%s\", w->cls, w->name, w->sig,\n"
+        "                    g_permissive ? \" (permissive, answering 0)\" : \"\");\n"
+        "    }\n"
+        "    if (!g_permissive) {\n", p)
+    return s
+edit("runtime/kl_jni.c", jni_c)
+
+def doc(s, p):
+    return sub(s,
+        "- `KL_PERMISSIVE=1` — unimplemented JNI/GL/OVRPlugin/OVRPlatform calls return\n",
+        "- `KL_STRICT=1` — the opposite of the next entry, and it wins over it: every\n"
+        "  unimplemented call aborts by name. The visionOS app is PERMISSIVE by default\n"
+        "  (" + marker + "), so a user's launch never stops on a call we\n"
+        "  lack; set this for scouting runs. The host harness stays strict by default.\n"
+        "- `KL_PERMISSIVE=1` — unimplemented JNI/GL/OVRPlugin/OVRPlatform calls return\n", p)
+edit("DEBUG_ENV_VARS.md", doc)
+print("overlay: permissive by default in the visionOS app; KL_STRICT=1 restores the abort")
+PYEOF
+
+# 171 — OVRPlugin: an entry point we lack answers ovrpFailure_Unsupported.
+# Under step 170's permissive default an unimplemented OVRPlugin entry point no
+# longer aborts, and the old permissive answer, 0, is ovrpSuccess: "it worked"
+# with every out-parameter left as the caller's garbage (a title then read its
+# OpenXR handles as 0 and logged a failed init it was told had succeeded). The
+# answer is now -1004, ovrpFailure_Unsupported — the value the real plugin
+# returns for a feature the runtime lacks (ovrpFailure -1000, InvalidParameter
+# -1001, NotInitialized -1002, InvalidOperation -1003, Unsupported -1004,
+# NotYetImplemented -1005, OperationFailed -1006) — logged once per name, with
+# the caller. KL_STRICT=1 still aborts by name.
+# And the entry points the titles actually reach (every name the headset and
+# Simulator passes logged as unimplemented, cross-checked against the ovrp_*
+# names the guests' libraries and IL2CPP metadata resolve), answered on purpose:
+#   success, recorded: SetSimultaneousHandsAndControllersEnabled (the flag is
+#     kept, nothing else follows from it here).
+#   success, no-op (scalar-argument setters and telemetry, ovrpResult):
+#     AllowVisibilityMask, SetDeveloperMode, SetDeveloperModeStrict,
+#     SetHandSkeletonVersion, SetExternalLayerDynresEnabled,
+#     QplMarkerAnnotationVariant, QplMarkerPointData, QplMarkerStartForJoin,
+#     BeginProfilingRegion, EndProfilingRegion.
+#   Unsupported, out-parameter untouched (no boundary, no OpenXR session of
+#     ours, no hand state through OVRPlugin): GetBoundaryVisibility,
+#     RequestBoundaryVisibility, GetPassthroughCapabilities, GetAppSpace,
+#     GetNativeOpenXRHandles, GetOpenXRInstanceProcAddrFunc,
+#     GetCurrentInteractionProfileName, GetStationaryReferenceSpaceId,
+#     GetHandTrackingState, GetHandState3.
+#   NULL: GetUnityInterfaces (a pointer, so not the failure code).
+python3 - "$K/runtime/xr/kl_ovrp.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: OVRPlugin answers Unsupported for what it lacks (step 171)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "    if (kl_permissive()) {\n"
+        "        if (s >= 0 && g_ovrp[s].calls == 1)\n"
+        "            fprintf(stderr, \"  [ovrp] call (permissive, returning 0): %s\\n\", name);\n"
+        "        return 0;\n"
+        "    }\n",
+        "    if (kl_permissive()) {   // " + marker + "\n"
+        "        if (s >= 0 && g_ovrp[s].calls == 1) {\n"
+        "            size_t moff = 0;\n"
+        "            const char *mimg = kl_addr_image(__builtin_return_address(0), &moff);\n"
+        "            fprintf(stderr, \"  [ovrp] call (permissive, returning ovrpFailure_Unsupported -1004): \"\n"
+        "                            \"%s, from %s+0x%zx\\n\", name, mimg ? mimg : \"?\", moff);\n"
+        "        }\n"
+        "        return (uint64_t)(int64_t)-1004;   /* ovrpFailure_Unsupported */\n"
+        "    }\n")
+    s = sub(s,
+        "static const struct { const char *name; void *fn; } g_ovrp_impl[] = {\n",
+        "// " + marker + "\n"
+        "static int g_mv_simultaneous_hands_controllers;\n"
+        "static uint64_t klovrp_SetSimultaneousHandsAndControllersEnabled(int32_t enabled) {\n"
+        "    ovrp_hit(\"ovrp_SetSimultaneousHandsAndControllersEnabled\");\n"
+        "    g_mv_simultaneous_hands_controllers = enabled != 0;\n"
+        "    return OVRP_SUCCESS;\n"
+        "}\n"
+        "static uint64_t klovrp_GetUnityInterfaces(void) {\n"
+        "    ovrp_hit(\"ovrp_GetUnityInterfaces\");\n"
+        "    return 0;   /* a pointer: no interfaces table to hand out */\n"
+        "}\n"
+        "static const struct { const char *name; void *fn; } g_ovrp_impl[] = {\n"
+        "    {\"ovrp_SetSimultaneousHandsAndControllersEnabled\", (void *)klovrp_SetSimultaneousHandsAndControllersEnabled},\n"
+        "    {\"ovrp_GetUnityInterfaces\", (void *)klovrp_GetUnityInterfaces},\n")
+    s = sub(s,
+        "static const char *const g_ovrp_result_ok[] = {\n",
+        "static const char *const g_ovrp_result_ok[] = {\n"
+        "    // " + marker + ": scalar setters and telemetry\n"
+        "    \"ovrp_AllowVisibilityMask\", \"ovrp_SetDeveloperMode\", \"ovrp_SetDeveloperModeStrict\",\n"
+        "    \"ovrp_SetHandSkeletonVersion\", \"ovrp_SetExternalLayerDynresEnabled\",\n"
+        "    \"ovrp_QplMarkerAnnotationVariant\", \"ovrp_QplMarkerPointData\", \"ovrp_QplMarkerStartForJoin\",\n"
+        "    \"ovrp_BeginProfilingRegion\", \"ovrp_EndProfilingRegion\",\n")
+    s = sub(s,
+        "static const char *const g_ovrp_result_unsupported[] = {\n",
+        "static const char *const g_ovrp_result_unsupported[] = {\n"
+        "    // " + marker + ": out-parameter queries with nothing true to write\n"
+        "    \"ovrp_GetBoundaryVisibility\", \"ovrp_RequestBoundaryVisibility\",\n"
+        "    \"ovrp_GetPassthroughCapabilities\", \"ovrp_GetAppSpace\", \"ovrp_GetNativeOpenXRHandles\",\n"
+        "    \"ovrp_GetOpenXRInstanceProcAddrFunc\", \"ovrp_GetCurrentInteractionProfileName\",\n"
+        "    \"ovrp_GetStationaryReferenceSpaceId\", \"ovrp_GetHandTrackingState\", \"ovrp_GetHandState3\",\n")
+    open(p, "w").write(s)
+print("overlay: OVRPlugin answers ovrpFailure_Unsupported for an entry point it lacks; 22 more named")
+PYEOF
+
+# 172 — Oculus Platform: a refused content call ends the request, not the app.
+# The entitlement / purchase / content-delivery calls (plat_is_drm: IAP
+# ownership, purchases, ovr_AssetFile_Download*) aborted the process whatever
+# KL_PERMISSIVE said. The line itself does not move: such a call is still never
+# ANSWERED — nothing is reported owned and nothing is delivered. Under step
+# 170's permissive default it now answers 0, which on this surface is "the
+# request could not be made" (ovrRequest 0, the same answer the platform's
+# absent init gives, and a NULL for an accessor that only reads a message that
+# never arrives), logged once per name — so a title that probes its DLC or a
+# purchase on the way to its menu takes its own no-platform path instead of
+# being killed. KL_STRICT=1 restores the abort, and the host harness's guard
+# accepts either refusal.
+python3 - "$K" <<'PYEOF'
+import sys
+K = sys.argv[1]
+marker = "metavision: a refused content call returns 0 when permissive (step 172)"
+def sub(s, old, new, p):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = f"{K}/runtime/xr/kl_ovrplat.c"
+s = open(p).read()
+if marker not in s:
+    s = sub(s,
+        "    g_drm_calls++;\n"
+        "    fprintf(stderr,\n"
+        "            \"\\n[klepton] REFUSED: the guest called '%s'.\\n\"\n",
+        "    g_drm_calls++;\n"
+        "    if (kl_permissive()) {   // " + marker + "\n"
+        "        if (s < 0 || g_plat[s].calls == 1)\n"
+        "            fprintf(stderr, \"  [plat] REFUSED '%s': an entitlement / purchase / content \"\n"
+        "                            \"call, answered 0 (no request made, nothing granted)\\n\", name);\n"
+        "        return 0;\n"
+        "    }\n"
+        "    fprintf(stderr,\n"
+        "            \"\\n[klepton] REFUSED: the guest called '%s'.\\n\"\n", p)
+    open(p, "w").write(s)
+p = f"{K}/mains/m_boot.c"
+s = open(p).read()
+if marker not in s:
+    s = sub(s,
+        "    if (r != KLDRM_ABORTED)\n"
+        "        return fail(\"DRM guard did NOT abort on ovr_AssetFile_DownloadById",
+        "    if (r != KLDRM_ABORTED && !(kl_permissive() && r == KLDRM_ZERO))   // " + marker + "\n"
+        "        return fail(\"DRM guard did NOT abort on ovr_AssetFile_DownloadById", p)
+    open(p, "w").write(s)
+print("overlay: a refused Oculus Platform content call answers 0 instead of aborting (KL_STRICT=1 aborts)")
+PYEOF
+
+# 173 — the Simulator's ANGLE over-reads a compressed upload: pad it there.
+# Two titles died in the Simulator in _platform_memmove under
+# glCompressedTexSubImage2D (ETC2 RGBA8 at 2048 wide, 0 frames), with our
+# forwarding's size check silent — the guest's imageSize matched the block
+# arithmetic. ANGLE's Metal backend (mtl_utils.mm, PreferStagedTextureUploads)
+# stages EVERY upload when TARGET_OS_SIMULATOR, ahead of the check that keeps
+# block formats off that path, and CopyTextureData then copies one row per PIXEL
+# row at the BLOCK-row pitch: block-height times imageSize is read from the
+# guest's buffer (registers in the reports: 0x2000-byte rows, 2048 of them, off
+# the end of a 4 MB mapping). The headset never takes that path — compressed
+# formats go straight to replaceRegion — so this is Simulator-only, and only the
+# Simulator build pays for the fix: there, a client-memory compressed upload is
+# handed a zero-padded copy as long as ANGLE will read. The staged rows land at
+# the staging pitch the blit then reads, so the first ceil(h/bh) rows — the real
+# data — are exactly what reaches the texture; the picture is right, not just
+# the crash gone. An unpack buffer (a GL offset, not memory) is passed through.
+python3 - "$K/runtime/gfx/kl_glfb.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the Simulator's compressed uploads are padded (step 173)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "#include \"kl_glfb.h\"\n",
+        "#ifdef __APPLE__\n#include <TargetConditionals.h>   // " + marker + "\n#endif\n"
+        "#include \"kl_glfb.h\"\n")
+    s = sub(s,
+        "static void (*g_real_CompressedTexSubImage2D)(uint32_t, int32_t, int32_t, int32_t,\n",
+        "// " + marker + ": NULL off the Simulator, for an unpack-buffer\n"
+        "// upload, an unknown format or a failed allocation (the caller then passes\n"
+        "// the guest's pointer through); else a copy padded to what ANGLE reads —\n"
+        "// h pixel rows of block-row pitch per slice. The caller frees it.\n"
+        "static void *mv_sim_ctex_pad(uint32_t fmt, int32_t w, int32_t h, int32_t d,\n"
+        "                             int32_t sz, const void *data) {\n"
+        "#if defined(TARGET_OS_SIMULATOR) && TARGET_OS_SIMULATOR\n"
+        "    int bw, bh, bpb;\n"
+        "    if (!data || sz <= 0 || w <= 0 || h <= 0 || d <= 0 || !klfb_block_geom(fmt, &bw, &bh, &bpb))\n"
+        "        return NULL;\n"
+        "    int32_t pbo = 0;\n"
+        "    if (a_glGetIntegerv) a_glGetIntegerv(0x88EF /* PIXEL_UNPACK_BUFFER_BINDING */, &pbo);\n"
+        "    if (pbo) return NULL;\n"
+        "    size_t pitch = (size_t)((w + bw - 1) / bw) * (size_t)bpb;\n"
+        "    size_t slice = (size_t)((h + bh - 1) / bh) * pitch;\n"
+        "    size_t need  = (size_t)(d - 1) * slice + (size_t)h * pitch;\n"
+        "    if (need <= (size_t)sz) return NULL;\n"
+        "    uint8_t *pad = calloc(1, need);\n"
+        "    if (pad) memcpy(pad, data, (size_t)sz);\n"
+        "    return pad;\n"
+        "#else\n"
+        "    (void)fmt; (void)w; (void)h; (void)d; (void)sz; (void)data;\n"
+        "    return NULL;\n"
+        "#endif\n"
+        "}\n\n"
+        "static void (*g_real_CompressedTexSubImage2D)(uint32_t, int32_t, int32_t, int32_t,\n")
+    s = sub(s,
+        "    if (g_real_CompressedTexSubImage2D)\n"
+        "        g_real_CompressedTexSubImage2D(target, level, xoff, yoff, w, h, fmt, sz, data);\n"
+        "}\n",
+        "    void *mv_pad = known ? mv_sim_ctex_pad(fmt, w, h, 1, sz, data) : NULL;   // " + marker + "\n"
+        "    if (g_real_CompressedTexSubImage2D)\n"
+        "        g_real_CompressedTexSubImage2D(target, level, xoff, yoff, w, h, fmt, sz,\n"
+        "                                       mv_pad ? mv_pad : data);\n"
+        "    free(mv_pad);\n"
+        "}\n")
+    s = sub(s,
+        "    if (g_real_CompressedTexSubImage3D)\n"
+        "        g_real_CompressedTexSubImage3D(target, level, xoff, yoff, zoff, w, h, d,\n"
+        "                                       (uint32_t)format, (int32_t)imageSize, data);\n",
+        "    void *mv_pad = mv_sim_ctex_pad((uint32_t)format, w, h, d, (int32_t)imageSize, data);   // " + marker + "\n"
+        "    if (g_real_CompressedTexSubImage3D)\n"
+        "        g_real_CompressedTexSubImage3D(target, level, xoff, yoff, zoff, w, h, d,\n"
+        "                                       (uint32_t)format, (int32_t)imageSize,\n"
+        "                                       mv_pad ? mv_pad : data);\n"
+        "    free(mv_pad);\n")
+    open(p, "w").write(s)
+print("overlay: kl_glfb.c pads a compressed upload to what the Simulator's ANGLE reads")
+PYEOF
+
+# 174 — a generated-JNI library's init gets its two empty collections.
+# A WebRTC-based native library's JNI_OnLoad asks its generated Java side,
+# JniInit.init(), for the empty-collection singletons its native code hands back
+# for empty containers — Object[]{Collections.EMPTY_LIST, Collections.EMPTY_MAP},
+# kept as global references — and then WebRtcClassLoader.getClassLoader() for a
+# loader. Neither had a binding: in the Simulator (strict) the first aborted the
+# boot inside JNI_OnLoad; on the headset (permissive) both answered null and the
+# library kept two null references it may later hand out as "empty". Now init
+# answers a two-element array of a pinned empty List and an empty Map (the Map
+# bindings read a dataless Map as empty), and getClassLoader answers the one
+# loader Context.getClassLoader already hands out.
+python3 - "$K/runtime/jni/kl_jni_lang.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a generated-JNI library's init (step 174)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_lang[] = {\n",
+        "// " + marker + ": Object[]{EMPTY_LIST, EMPTY_MAP}, the\n"
+        "// singletons the native side keeps as global references.\n"
+        "static klj_val klj_JniInit_init(void *env, void *clazz, const klj_val *a, int n) {\n"
+        "    (void)env; (void)clazz; (void)a; (void)n;\n"
+        "    static void *list, *map;\n"
+        "    if (!list) { void *l = klj_new_list(NULL, 0); klj_as_object(l)->pinned = 1; list = l; }\n"
+        "    if (!map)  { void *m = kl_jni_new_object(\"java/util/Map\"); klj_as_object(m)->pinned = 1; map = m; }\n"
+        "    void *arr = klj_new_array('L', \"java/lang/Object\", 2);\n"
+        "    ((void **)klj_arr(arr)->data)[0] = list;\n"
+        "    ((void **)klj_arr(arr)->data)[1] = map;\n"
+        "    return (klj_val){.l = arr};\n"
+        "}\n\n"
+        "const klj_binding klj_bind_lang[] = {\n")
+    old = "    {\"java/lang/ClassLoader\", \"loadClass\", \"(Ljava/lang/String;)Ljava/lang/Class;\", klj_ClassLoader_findClass},\n"
+    s = sub(s, old,
+        "    {\"org/jni_zero/JniInit\", \"init\", \"()[Ljava/lang/Object;\", klj_JniInit_init},   // " + marker + "\n"
+        "    {\"org/webrtc/WebRtcClassLoader\", \"getClassLoader\", \"()Ljava/lang/Object;\", klj_Class_getClassLoader},\n"
+        + old)
+    open(p, "w").write(s)
+print("overlay: kl_jni_lang.c answers a generated-JNI library's init and its class loader")
+PYEOF
+
+# 175 — the crash report no longer reads pixels from inside the crash.
+# The fatal-signal reporter prints the graphics surface report, and its
+# per-framebuffer census did a centre-pixel glReadPixels for each eye target —
+# from a signal handler, on whatever thread faulted, which for an engine's
+# render thread is mid-call into ANGLE. In the Simulator that readback itself
+# died (MTLSimTexture getBytes over XPC), so the crash report showed the
+# reporter's stack instead of the title's fault; on the headset it is the same
+# re-entrancy, just luckier. The fault handler now sets kl_glfb_no_readback
+# before the surface report; the census still lists every framebuffer, without
+# the pixel.
+python3 - "$K" <<'PYEOF'
+import sys
+K = sys.argv[1]
+marker = "metavision: no GL readback inside the crash report (step 175)"
+def sub(s, old, new, p):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = f"{K}/runtime/gfx/kl_glfb.c"
+s = open(p).read()
+if marker not in s:
+    s = sub(s, "void kl_glfb_draw_census(FILE *f) {\n",
+        "extern volatile int kl_glfb_no_readback;   // " + marker + " (kl_fault.c)\n"
+        "void kl_glfb_draw_census(FILE *f) {\n", p)
+    s = sub(s, "                if (a_glReadPixels && r_BindFramebuffer && a_glGetIntegerv &&\n",
+        "                if (!kl_glfb_no_readback && a_glReadPixels && r_BindFramebuffer && a_glGetIntegerv &&\n", p)
+    open(p, "w").write(s)
+p = f"{K}/runtime/kl_fault.c"
+s = open(p).read()
+if marker not in s:
+    s = sub(s, "static void report_fault(", "// " + marker + ": read by kl_glfb.c's census\n"
+        "volatile int kl_glfb_no_readback;\n\nstatic void report_fault(", p)
+    s = sub(s, "        kl_pthread_report(stderr);\n        kl_egl_report(stderr);\n",
+        "        kl_pthread_report(stderr);\n"
+        "        kl_glfb_no_readback = 1;   // " + marker + "\n"
+        "        kl_egl_report(stderr);\n", p)
+    open(p, "w").write(s)
+print("overlay: the fatal-signal report's framebuffer census skips its pixel readback")
+PYEOF

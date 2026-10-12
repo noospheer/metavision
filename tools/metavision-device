@@ -843,6 +843,17 @@ async def cmd_test(a):
     async def fn(rsd):
         print(await mount_ddi(rsd, a.ddi), flush=True)
         afc = await HouseArrestService.create(rsd, bundle)
+        # Documents/klepton.env (written by `env`) overrides the launch
+        # environment on every run, and a user's install has none: a leftover
+        # scouting switch silently makes the pass test something no user runs.
+        try:
+            left = (await afc.get_file_contents("Documents/klepton.env")).decode(errors="replace").split()
+        except Exception:
+            left = []
+        if left:
+            print(f"  !! Documents/klepton.env is set on the device ({' '.join(left)}): every run "
+                  f"uses it and a user's launch does not. Clear it with `env <title> --launcher` (no "
+                  f"switches) unless the pass is meant to test it.", flush=True)
         try:
             async with DvtProvider(rsd) as dvt, ProcessControl(dvt) as pc:
                 good, dark = None, []
