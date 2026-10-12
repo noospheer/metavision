@@ -2709,7 +2709,7 @@ A = f"{d}/kl_jni_android.c"
 patch(A,
       "        list     = klj_new_list(items, 1);\n",
       "        list     = klj_new_list(items, 1);\n"
-      "        klj_as_object(ri)->pinned = 1;     // metavision: cached, so pinned (step 46)\n"
+      "        klj_as_object(ri)->pinned = 1;     // metavision: cached, so pinned (step 46) list\n"
       "        klj_as_object(list)->pinned = 1;\n",
       "metavision: cached, so pinned (step 46) list")
 patch(A,
@@ -7276,14 +7276,849 @@ if marker not in s:
 print("overlay: auto-play guards controls that leave the title")
 PYEOF
 
-# 90 — a library that is not 64-bit ARM is left out, not the whole title. A
+# 80 — the volumetric-video plugin's Java object is an instance of its class.
+# Step 71's constructor called the native onCreated(env, NULL, self, ...) and
+# returned `self` — which, for a constructor, is the Class object. onCreated
+# is a static native: its second argument is the declaring class, and the
+# plugin builds its method IDs from it. With NULL every lookup landed on
+# "<unknown-jclass>", so no binding keyed on the plugin's class could ever
+# answer (its createSurfaceTexture was "no host implementation" and its mesh
+# thread waited for a window forever). The constructor now makes a real,
+# pinned instance (the plugin and Unity both keep it as a global reference)
+# and passes the interned jclass, as a JVM would.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the plugin's object is an instance of its class (step 80)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "    if (on_created) on_created(env, NULL, self, assets, 0);\n",
+        "    // " + marker + "\n"
+        "    void *cls = klj_class_object(MV_SVF_CLASS);\n"
+        "    void *obj = kl_jni_new_object(MV_SVF_CLASS);\n"
+        "    kl_jni_pin_object(obj);\n"
+        "    (void)self;   // the Class object NewObject was called on\n"
+        "    if (on_created) on_created(env, cls, obj, assets, 0);\n")
+    s = sub(s,
+        "                                                   : \"the plugin's onCreated was not found\");\n"
+        "    return (klj_val){.l = self};\n",
+        "                                                   : \"the plugin's onCreated was not found\");\n"
+        "    return (klj_val){.l = obj};\n")
+    open(p, "w").write(s)
+print("overlay: the volumetric-video plugin's object is an instance, and onCreated gets its class")
+PYEOF
+
+# 81 — the host calls a bound method by name. Java calls between host-side
+# objects — a SurfaceTexture telling its listener a frame arrived, a plugin's
+# Java method constructing a SurfaceTexture — have no jmethodID: no guest
+# asked for one. klj_call_binding(obj, name, sig, argv, argc) resolves the
+# binding the way a guest call does (the object's class, then its supers, then
+# Object; a Class object means its static/constructor surface) and calls it.
+python3 - "$K/runtime/kl_jni.c" "$K/runtime/jni/kl_jni_int.h" <<'PYEOF'
+import sys
+marker = "metavision: a bound method called from the host (step 81)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "// Exactly one of `va` / `args` is non-NULL; everything else about a call is\n",
+        "// " + marker + "\n" + r'''klj_val klj_call_binding(void *obj, const char *name, const char *sig,
+                         const klj_val *argv, int argc) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || !name || !sig) return (klj_val){0};
+    const char *cls = strcmp(o->cls, KLJ_CLASS_CLASS) == 0 ? ((klj_class *)o->data)->name : o->cls;
+    const klj_binding *b = klj_resolve_binding(cls, name, sig);
+    if (!b) {
+        static _Atomic unsigned said;
+        if (said++ < 16) KLJ_LOG("host call: no host implementation for %s.%s%s", cls, name, sig);
+        return (klj_val){0};
+    }
+    return b->fn(kl_jni_env(), obj, argv, argc);
+}
+
+''' + "// Exactly one of `va` / `args` is non-NULL; everything else about a call is\n")
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "int          klj_permission_state(const char *p, const char **why);\n",
+        "int          klj_permission_state(const char *p, const char **why);\n"
+        "// " + marker + "\n"
+        "klj_val      klj_call_binding(void *obj, const char *name, const char *sig,\n"
+        "                              const klj_val *argv, int argc);\n")
+    open(p, "w").write(s)
+print("overlay: klj_call_binding calls a bound method on a host object")
+PYEOF
+
+# 82 — a frame consumer for SurfaceTexture, and the media calls a native
+# plugin imports beside it. A SurfaceTexture is a BufferQueue consumer: a codec
+# configured with its Surface renders into it, and each frame wakes a listener.
+# The AImageReader here is already that consumer (a window whose owner is the
+# reader, a queue of CVPixelBuffers, a dispatch thread that is not the
+# releasing one), so the consumer IS one, with a host callback for a listener:
+#  - kl_mediandk_consumer_new/_window/_take/_set_size/_free, and
+#    kl_mediandk_pixels_release for callers without CoreVideo. Frames are taken
+#    oldest first (updateTexImage latches the next queued buffer; it does not
+#    skip to the newest as acquireLatestImage does).
+#  - back-pressure: a codec rendering into a consumer whose queue is full
+#    (4 frames) answers dequeueOutputBuffer with TRY_AGAIN, as a BufferQueue
+#    with no free slot holds the producer back, instead of dropping the oldest.
+#  - lifetime: the consumer is referenced by its owner and by every codec
+#    configured with it, and is deleted with the last reference, so a codec
+#    released after its SurfaceTexture never renders into freed memory.
+#  - each queued frame carries its timestamp in nanoseconds, and
+#    AMediaCodec_releaseOutputBufferAtTime sets it (it becomes
+#    SurfaceTexture.getTimestamp), exactly as on Android.
+#  - AMediaFormat_setFloat (read back by getFloat), setBuffer (a blob, as the
+#    codec-specific data step 58 carries) and toString.
+python3 - "$K/runtime/media/kl_mediandk.c" "$K/runtime/media/kl_mediandk.h" <<'PYEOF'
+import sys
+marker = "metavision: the SurfaceTexture frame consumer (step 82)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "    struct { void *pb; int64_t pts_us; } q[KLM_READER_MAX];\n",
+        "    struct { void *pb; int64_t pts_us; int64_t mv_ns; } q[KLM_READER_MAX];   // " + marker + "\n")
+    s = sub(p, s, "    int       pending;          // listener calls owed to the guest\n",
+        "    int       pending;          // listener calls owed to the guest\n"
+        "    int       mv_consumer;      // 1: a SurfaceTexture's consumer, 2: its owner let go\n"
+        "    int       mv_refs;          // the owner, plus each codec configured with it\n")
+    # publish carries a nanosecond timestamp
+    s = sub(p, s, "static void klm_reader_publish(klm_reader *r, CVPixelBufferRef pb, int64_t pts_us) {\n"
+                  "    if (!r || r->magic != KLM_READER_MAGIC) return;\n",
+        "static void mv_reader_publish_ns(klm_reader *r, CVPixelBufferRef pb, int64_t pts_us, int64_t ns);\n"
+        "static void klm_reader_publish(klm_reader *r, CVPixelBufferRef pb, int64_t pts_us) {\n"
+        "    mv_reader_publish_ns(r, pb, pts_us, pts_us * 1000);\n"
+        "}\n"
+        "static void mv_reader_publish_ns(klm_reader *r, CVPixelBufferRef pb, int64_t pts_us, int64_t ns) {\n"
+        "    if (!r || r->magic != KLM_READER_MAGIC) return;\n")
+    s = sub(p, s, "    r->q[slot].pts_us = pts_us;\n",
+        "    r->q[slot].pts_us = pts_us;\n"
+        "    r->q[slot].mv_ns = ns;\n")
+    # the consumer API, after the reader
+    s = sub(p, s, "// ---------------------------------------------------------------------------\n// AMediaCodec\n",
+        "// " + marker + "\n" + r'''static int mv_is_consumer(klm_reader *r) {
+    return r && r->magic == KLM_READER_MAGIC && r->mv_consumer;
+}
+static void mv_reader_ref(klm_reader *r) {
+    if (mv_is_consumer(r)) __atomic_add_fetch(&r->mv_refs, 1, __ATOMIC_RELAXED);
+}
+static void mv_reader_unref(klm_reader *r) {
+    if (!mv_is_consumer(r)) return;
+    if (__atomic_sub_fetch(&r->mv_refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (pthread_equal(pthread_self(), r->dispatch)) {
+        // Let go from inside its own listener: deleting would join this very
+        // thread. Left alive, unreferenced and silent.
+        fprintf(stderr, "  [media] SurfaceTexture consumer %p released from its own "
+                        "listener; kept\n", (void *)r);
+        return;
+    }
+    klm_AImageReader_delete(r);
+}
+// A full consumer queue is the producer's cue to wait (see dequeueOutputBuffer).
+static int mv_consumer_full(klm_reader *r) {
+    if (!mv_is_consumer(r) || r->mv_consumer != 1) return 0;
+    pthread_mutex_lock(&r->lock);
+    int full = r->count >= r->max_images;
+    pthread_mutex_unlock(&r->lock);
+    return full;
+}
+void *kl_mediandk_consumer_new(int max_frames, kl_mediandk_frame_cb on_frame, void *ctx) {
+    void *out = NULL;
+    if (max_frames < 1) max_frames = 1;
+    if (klm_AImageReader_newWithUsage(1, 1, 0x22 /* AIMAGE_FORMAT_PRIVATE */, 0,
+                                      max_frames, &out) != AMEDIA_OK || !out)
+        return NULL;
+    klm_reader *r = out;
+    r->mv_consumer = 1;
+    r->mv_refs = 1;
+    klm_listener l = { ctx, (klm_image_cb)on_frame };
+    klm_AImageReader_setImageListener(r, on_frame ? &l : NULL);
+    return r;
+}
+void *kl_mediandk_consumer_window(void *consumer) {
+    klm_reader *r = consumer;
+    return mv_is_consumer(r) ? r->window : NULL;
+}
+// The oldest queued frame, retained for the caller (kl_mediandk_pixels_release).
+void *kl_mediandk_consumer_take(void *consumer, int64_t *ts_ns) {
+    klm_reader *r = consumer;
+    if (!mv_is_consumer(r)) return NULL;
+    pthread_mutex_lock(&r->lock);
+    if (!r->count) { pthread_mutex_unlock(&r->lock); return NULL; }
+    void *pb = r->q[r->head].pb;
+    if (ts_ns) *ts_ns = r->q[r->head].mv_ns;
+    r->q[r->head].pb = NULL;
+    r->head = (r->head + 1) % KLM_READER_MAX;
+    r->count--;
+    r->n_acquired++;
+    pthread_mutex_unlock(&r->lock);
+    KLM_FIRST(said_take, "first SurfaceTexture frame latched\n");
+    return pb;
+}
+void kl_mediandk_consumer_set_size(void *consumer, int32_t w, int32_t h) {
+    klm_reader *r = consumer;
+    if (mv_is_consumer(r) && w > 0 && h > 0) kl_ndk_window_set_size(r->window, w, h);
+}
+// The owner lets go: no more listener calls, queued frames dropped; the
+// consumer itself goes with its last codec.
+void kl_mediandk_consumer_free(void *consumer) {
+    klm_reader *r = consumer;
+    if (!mv_is_consumer(r)) return;
+    pthread_mutex_lock(&r->lock);
+    r->have_listener = 0;
+    r->mv_consumer = 2;
+    while (r->count) {
+        CVPixelBufferRelease((CVPixelBufferRef)r->q[r->head].pb);
+        r->head = (r->head + 1) % KLM_READER_MAX;
+        r->count--;
+    }
+    pthread_mutex_unlock(&r->lock);
+    mv_reader_unref(r);
+}
+void kl_mediandk_pixels_release(void *pixels) {
+    if (pixels) CVPixelBufferRelease((CVPixelBufferRef)pixels);
+}
+
+''' + "// ---------------------------------------------------------------------------\n// AMediaCodec\n")
+    # configure: the codec holds its consumer
+    s = sub(p, s, "    c->surface = r;\n",
+        "    if (r != c->surface) {   // " + marker + "\n"
+        "        mv_reader_unref(c->surface);\n"
+        "        mv_reader_ref(r);\n"
+        "    }\n"
+        "    c->surface = r;\n")
+    s = sub(p, s, "    kl_vtdec_destroy(c->dec);\n",
+        "    mv_reader_unref(c->surface);   // " + marker + "\n"
+        "    c->surface = NULL;\n"
+        "    kl_vtdec_destroy(c->dec);\n")
+    # back-pressure
+    s = sub(p, s, "        CVPixelBufferRef pb = kl_vtdec_pull(c->dec, &pts);\n",
+        "        if (mv_consumer_full(c->surface)) {   // " + marker + ": the consumer has no free slot\n"
+        "            KLM_FIRST(said_full, \"SurfaceTexture queue full: the codec waits for updateTexImage\\n\");\n"
+        "            if (timeoutUs == 0 || (timeoutUs > 0 && waited >= timeoutUs))\n"
+        "                return AMEDIACODEC_INFO_TRY_AGAIN_LATER;\n"
+        "            usleep(1000);\n"
+        "            waited += 1000;\n"
+        "            continue;\n"
+        "        }\n"
+        "        CVPixelBufferRef pb = kl_vtdec_pull(c->dec, &pts);\n")
+    # releaseOutputBufferAtTime
+    s = sub(p, s, "// ---------------------------------------------------------------------------\n// ATrace.",
+        "// " + marker + r''': render with an explicit timestamp (nanoseconds),
+// which is what the consumer reports for the frame.
+static int mv_AMediaCodec_releaseOutputBufferAtTime(void *codec, size_t idx, int64_t ts_ns) {
+    klm_codec *c = codec;
+    if (!c || c->magic != KLM_CODEC_MAGIC || idx >= KLM_OUT_SLOTS)
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    if (c->mv_aac) return mv_aac_release(c, idx);
+    pthread_mutex_lock(&c->lock);
+    if (!c->out[idx].in_use) { pthread_mutex_unlock(&c->lock); return AMEDIA_ERROR_INVALID_PARAMETER; }
+    CVPixelBufferRef pb = (CVPixelBufferRef)c->out[idx].pb;
+    int64_t pts = c->out[idx].pts_us;
+    klm_reader *r = c->surface;
+    c->out[idx].in_use = 0;
+    c->out[idx].pb = NULL;
+    c->n_rendered++;
+    pthread_mutex_unlock(&c->lock);
+    KLM_FIRST(said_rel_at, "first releaseOutputBufferAtTime (%lld ns)%s\n", (long long)ts_ns,
+              r ? "" : " — but the codec has no output surface");
+    if (r) mv_reader_publish_ns(r, pb, pts, ts_ns);
+    CVPixelBufferRelease(pb);
+    return AMEDIA_OK;
+}
+
+''' + "// ---------------------------------------------------------------------------\n// ATrace.")
+    # AMediaFormat: setFloat / setBuffer / toString
+    s = sub(p, s, "static bool klm_AMediaFormat_getFloat(void *fmt, const char *key, float *out) {\n"
+                  "    int32_t v;\n",
+        "static bool klm_AMediaFormat_getFloat(void *fmt, const char *key, float *out) {\n"
+        "    klm_format *mv_f = fmt;   // " + marker + ": a float set as one\n"
+        "    for (int i = 0; mv_f && key && out && i < mv_f->n; i++)\n"
+        "        if (!strcmp(mv_f->kv[i].key, key) && mv_f->kv[i].is_str == 3) {\n"
+        "            memcpy(out, &mv_f->kv[i].ival, sizeof *out);\n"
+        "            return true;\n"
+        "        }\n"
+        "    int32_t v;\n")
+    s = sub(p, s, "// ---------------------------------------------------------------------------\n// AHardwareBuffer — a refcounted handle on one CVPixelBuffer.\n",
+        "// " + marker + r''': the format calls a native plugin imports.
+static void mv_AMediaFormat_setFloat(void *fmt, const char *key, float v) {
+    klm_format *f = fmt;
+    if (!f || !key) return;
+    int i = klm_fmt_slot(f, key);
+    if (i < 0) return;
+    free(f->kv[i].sval);
+    f->kv[i].sval = NULL;
+    memcpy(&f->kv[i].ival, &v, sizeof v);
+    f->kv[i].is_str = 3;
+}
+static void mv_AMediaFormat_setBuffer(void *fmt, const char *key, const void *data, size_t size) {
+    mv_fmt_set_blob(fmt, key, data, size);
+}
+// Android's spelling ("mime: string(video/avc), width: int32(1920)"). The
+// string lives until this thread's next call, not the format's next change.
+static const char *mv_AMediaFormat_toString(void *fmt) {
+    static __thread char buf[2048];
+    klm_format *f = fmt;
+    size_t o = 0;
+    buf[0] = 0;
+    for (int i = 0; f && i < f->n && o < sizeof buf; i++) {
+        int k = snprintf(buf + o, sizeof buf - o, "%s%s: ", i ? ", " : "", f->kv[i].key);
+        if (k < 0) break;
+        o += (size_t)k;
+        if (o >= sizeof buf) break;
+        float fv;
+        switch (f->kv[i].is_str) {
+        case 1:  k = snprintf(buf + o, sizeof buf - o, "string(%s)", f->kv[i].sval ? f->kv[i].sval : ""); break;
+        case 2:  k = snprintf(buf + o, sizeof buf - o, "data(%d bytes)", f->kv[i].ival); break;
+        case 3:  memcpy(&fv, &f->kv[i].ival, sizeof fv);
+                 k = snprintf(buf + o, sizeof buf - o, "float(%g)", (double)fv); break;
+        default: k = snprintf(buf + o, sizeof buf - o, "int32(%d)", f->kv[i].ival); break;
+        }
+        if (k < 0) break;
+        o += (size_t)k;
+    }
+    return buf;
+}
+
+''' + "// ---------------------------------------------------------------------------\n// AHardwareBuffer — a refcounted handle on one CVPixelBuffer.\n")
+    s = sub(p, s, "    M(\"AMediaFormat_getString\", klm_AMediaFormat_getString),\n",
+        "    M(\"AMediaFormat_getString\", klm_AMediaFormat_getString),\n"
+        "    M(\"AMediaFormat_setFloat\",  mv_AMediaFormat_setFloat),    // " + marker + "\n"
+        "    M(\"AMediaFormat_setBuffer\", mv_AMediaFormat_setBuffer),\n"
+        "    M(\"AMediaFormat_toString\",  mv_AMediaFormat_toString),\n")
+    s = sub(p, s, "    M(\"AMediaCodec_releaseOutputBuffer\",  klm_AMediaCodec_releaseOutputBuffer),\n",
+        "    M(\"AMediaCodec_releaseOutputBuffer\",  klm_AMediaCodec_releaseOutputBuffer),\n"
+        "    M(\"AMediaCodec_releaseOutputBufferAtTime\", mv_AMediaCodec_releaseOutputBufferAtTime),   // " + marker + "\n")
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "void kl_mediandk_report(FILE *f);\n",
+        "void kl_mediandk_report(FILE *f);\n\n"
+        "// " + marker + r'''. A consumer is a codec output surface
+// whose frames a host object takes (a SurfaceTexture), not the guest through
+// AImage. on_frame runs on the consumer's own thread, once per frame queued.
+#include <stdint.h>
+typedef void (*kl_mediandk_frame_cb)(void *ctx, void *consumer);
+void *kl_mediandk_consumer_new(int max_frames, kl_mediandk_frame_cb on_frame, void *ctx);
+void *kl_mediandk_consumer_window(void *consumer);          // its ANativeWindow
+void *kl_mediandk_consumer_take(void *consumer, int64_t *ts_ns);   // CVPixelBufferRef, retained; NULL if none
+void  kl_mediandk_consumer_set_size(void *consumer, int32_t w, int32_t h);
+void  kl_mediandk_consumer_free(void *consumer);
+void  kl_mediandk_pixels_release(void *pixels);
+''')
+    open(p, "w").write(s)
+print("overlay: a frame consumer for SurfaceTexture, releaseOutputBufferAtTime, AMediaFormat setFloat/setBuffer/toString")
+PYEOF
+
+# 83 — a decoded-video image bound into a texture the guest named. The guest's
+# own eglCreateImageKHR + glEGLImageTargetTexture2DOES path binds an image to
+# whatever is bound to GL_TEXTURE_2D, because the guest bound it a moment
+# before. A SurfaceTexture is told its texture once, at construction, and
+# updateTexImage must put each frame there without disturbing the caller's
+# bindings: kl_glfb_image_bind_texture(img, tex) saves the binding of the
+# active unit, binds `tex`, binds the image (kl_glfb_image_bind — the YCbCr
+# EGLImage or the BGRA IOSurface pbuffer, as for the guest's own images) and
+# restores the binding. kl_glfb_current_context() says whether the calling
+# thread has a context at all (updateTexImage without one is an error).
+python3 - "$K/runtime/gfx/kl_glfb.c" "$K/runtime/gfx/kl_glfb.h" <<'PYEOF'
+import sys
+marker = "metavision: an image bound into a named texture (step 83)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "static void (*g_real_BlitFramebuffer)(int32_t, int32_t, int32_t, int32_t, int32_t,\n"
+    s = sub(p, s, old, "// " + marker + "\n" + r'''int kl_glfb_current_context(void) {
+    static void *(*cur)(void);
+    if (!cur && g_ready) cur = (void *(*)(void))asym("eglGetCurrentContext");
+    return cur && cur() != NULL;
+}
+
+int kl_glfb_image_bind_texture(void *image, uint32_t tex) {
+    static void (*bind)(uint32_t, uint32_t);
+    if (!tex || !kl_glfb_is_image(image) || !img_resolve() || !a_glGetIntegerv) return 0;
+    if (!kl_glfb_current_context()) return -1;
+    if (!bind) bind = (void (*)(uint32_t, uint32_t))asym("glBindTexture");
+    if (!bind) return 0;
+    int32_t prev = 0;
+    a_glGetIntegerv(GL_TEXTURE_BINDING_2D_, &prev);
+    bind(GL_TEXTURE_2D_IMG_, tex);
+    int ok = kl_glfb_image_bind(image);
+    bind(GL_TEXTURE_2D_IMG_, (uint32_t)prev);
+    return ok;
+}
+
+''' + old)
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "int   kl_glfb_is_image(const void *h);\n",
+        "int   kl_glfb_is_image(const void *h);\n\n"
+        "// " + marker + ": bind `image` into texture `tex`\n"
+        "// on the calling thread's context, leaving the active unit's GL_TEXTURE_2D\n"
+        "// binding as it was. 1 bound, 0 failed, -1 no current context.\n"
+        "int   kl_glfb_image_bind_texture(void *image, uint32_t tex);\n"
+        "int   kl_glfb_current_context(void);\n")
+    open(p, "w").write(s)
+print("overlay: kl_glfb_image_bind_texture binds a video image into a named texture")
+PYEOF
+
+# 84 — ANativeWindow_fromSurface asks first whether the Surface is a
+# SurfaceTexture's. A Surface made from a SurfaceTexture is the producer end
+# of that texture's frame consumer; handing back the activity's window sent a
+# codec configured with it nowhere ("that window is not an AImageReader's").
+# A hook, set by whoever makes such Surfaces (the SurfaceTexture bindings),
+# answers the consumer's window; any other Surface resolves as before.
+python3 - "$K/runtime/guest/kl_ndk.c" "$K/runtime/guest/kl_ndk.h" <<'PYEOF'
+import sys
+marker = "metavision: a SurfaceTexture's Surface has its own window (step 84)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "static void *kl_ANativeWindow_fromSurface(void *env, void *surface) {\n    (void)env;\n",
+        "// " + marker + "\n"
+        "void *(*kl_ndk_surface_window_hook)(void *surface);\n"
+        "static void *kl_ANativeWindow_fromSurface(void *env, void *surface) {\n"
+        "    (void)env;\n"
+        "    if (surface && kl_ndk_surface_window_hook) {\n"
+        "        void *win = kl_ndk_surface_window_hook(surface);\n"
+        "        if (win) {\n"
+        "            kl_ANativeWindow_acquire(win);\n"
+        "            static unsigned said;\n"
+        "            if (said++ < 8)\n"
+        "                fprintf(stderr, \"  [ndk] ANativeWindow_fromSurface(%p) -> SurfaceTexture \"\n"
+        "                                \"window %p\\n\", surface, win);\n"
+        "            return win;\n"
+        "        }\n"
+        "    }\n")
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "void kl_ndk_window_set_size(void *win, int32_t w, int32_t h);\n",
+        "void kl_ndk_window_set_size(void *win, int32_t w, int32_t h);\n\n"
+        "// " + marker + ": asked first by\n"
+        "// ANativeWindow_fromSurface; answers a window for a Surface it made, else NULL.\n"
+        "extern void *(*kl_ndk_surface_window_hook)(void *surface);\n")
+    open(p, "w").write(s)
+print("overlay: ANativeWindow_fromSurface answers a SurfaceTexture's window")
+PYEOF
+
+# 85 — android.graphics.SurfaceTexture. Unity's VideoPlayer on Android makes
+# one (new SurfaceTexture(tex), a JNIBridge proxy as its frame listener, new
+# Surface(st) for the codec), and native plugins make them through their own
+# Java; nothing implemented the class, so a codec configured with that Surface
+# rendered nowhere and a plugin waiting for its window waited forever.
+#  - SurfaceTexture is a pinned host object whose payload holds the guest's
+#    texture name, a frame consumer (step 82), the listener, the latched image
+#    and its timestamp; Surface(SurfaceTexture) is a pinned Surface pointing at
+#    it, and ANativeWindow_fromSurface (step 84) answers the consumer's window,
+#    so AMediaCodec_configure and releaseOutputBuffer(render) work unchanged.
+#  - each rendered frame calls the listener on the consumer's thread (not the
+#    releasing one, as on Android): a JNIBridge proxy through the proxy invoke
+#    path, any other object through its class's binding (klj_call_binding).
+#  - updateTexImage, on the caller's GL thread, latches the next queued frame:
+#    an image over the CVPixelBuffer (step 83 — the YCbCr Metal texture or the
+#    BGRA IOSurface) bound into the texture; the image it replaces is destroyed
+#    then, so the last frame stays alive until the next one. No new frame
+#    leaves the texture as it was; no current context logs once and returns.
+#    samplerExternalOES is already sampler2D here, so the guest's shader reads
+#    it as is.
+#  - getTimestamp (the frame's, in ns), getTransformMatrix (the y-flip a
+#    decoder's buffers get on Android), setDefaultBufferSize, releaseTexImage,
+#    release/isReleased, attach/detachFromGLContext, setOnFrameAvailableListener
+#    (with or without a Handler), and Surface.release/isValid.
+python3 - "$K/runtime/jni/kl_jni_window.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: android.graphics.SurfaceTexture (step 85)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_window[] = {\n", "// " + marker + "\n" + r'''#include "kl_mediandk.h"
+#include "kl_glfb.h"
+#define MV_ST_CLASS    "android/graphics/SurfaceTexture"
+#define MV_ST_LISTENER "android/graphics/SurfaceTexture$OnFrameAvailableListener"
+#define MV_ST_SURFACE  "android/view/Surface"
+#define MV_ST_QUEUE    4          // frames the consumer holds before the codec waits
+
+typedef struct mv_st {
+    uint32_t tex;                 // the guest's GL texture name
+    void    *self;                // the SurfaceTexture jobject
+    void    *consumer;            // kl_mediandk consumer: window + frame queue
+    void    *listener;            // OnFrameAvailableListener, or NULL
+    void    *img, *pix;           // the latched frame: kl_glfb image and its CVPixelBuffer
+    int64_t  ts_ns;               // ...and its timestamp
+    int      released, attached, frames;
+    pthread_mutex_t lock;
+    struct mv_st *next;
+} mv_st;
+
+static mv_st          *mv_st_list;
+static pthread_mutex_t mv_st_list_lk = PTHREAD_MUTEX_INITIALIZER;
+
+// A SurfaceTexture or a Surface made from one -> its payload. A registry
+// lookup: other Surfaces carry no payload, or one that is not ours.
+static mv_st *mv_st_of(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || !o->data) return NULL;
+    if (strcmp(o->cls, MV_ST_CLASS) != 0 && strcmp(o->cls, MV_ST_SURFACE) != 0) return NULL;
+    mv_st *found = NULL;
+    pthread_mutex_lock(&mv_st_list_lk);
+    for (mv_st *t = mv_st_list; t; t = t->next)
+        if (t == o->data) { found = t; break; }
+    pthread_mutex_unlock(&mv_st_list_lk);
+    return found;
+}
+
+static void *mv_st_surface_window(void *surface) {
+    mv_st *st = mv_st_of(surface);
+    return st && !st->released ? kl_mediandk_consumer_window(st->consumer) : NULL;
+}
+
+// A frame was queued: tell the listener, on the consumer's thread.
+static void mv_st_on_frame(void *ctx, void *consumer) {
+    (void)consumer;
+    mv_st *st = ctx;
+    pthread_mutex_lock(&st->lock);
+    void *l = st->released ? NULL : st->listener;
+    int first = !st->frames++;
+    pthread_mutex_unlock(&st->lock);
+    if (!l) return;
+    klj_object *lo = klj_as_object(l);
+    if (first) KLJ_LOG("SurfaceTexture %p: first frame -> %s.onFrameAvailable", st->self,
+                       lo ? lo->cls : "?");
+    klj_PushLocalFrame(NULL, 0);   // what the listener allocates dies with the call
+    if (lo && strcmp(lo->cls, KLJ_CLASS_PROXY) == 0) {
+        void *args = klj_new_array('L', "java/lang/Object", 1);
+        ((void **)klj_arr(args)->data)[0] = st->self;
+        klj_proxy_invoke(l, MV_ST_LISTENER, "onFrameAvailable",
+                         "(Landroid/graphics/SurfaceTexture;)V", args);
+    } else if (lo) {
+        klj_val a = { .l = st->self };
+        klj_call_binding(l, "onFrameAvailable", "(Landroid/graphics/SurfaceTexture;)V", &a, 1);
+    }
+    klj_PopLocalFrame(NULL, NULL);
+}
+
+static klj_val mv_st_new(uint32_t tex, int attached) {
+    mv_st *st = calloc(1, sizeof *st);
+    if (!st) return (klj_val){0};
+    st->tex = tex;
+    st->attached = attached;
+    pthread_mutex_init(&st->lock, NULL);
+    st->consumer = kl_mediandk_consumer_new(MV_ST_QUEUE, mv_st_on_frame, st);
+    void *obj = klj_new_object_data(MV_ST_CLASS, st);
+    kl_jni_pin_object(obj);       // the guest keeps it across frames, as a global ref
+    st->self = obj;
+    pthread_mutex_lock(&mv_st_list_lk);
+    st->next = mv_st_list;
+    mv_st_list = st;
+    pthread_mutex_unlock(&mv_st_list_lk);
+    kl_ndk_surface_window_hook = mv_st_surface_window;
+    KLJ_LOG("new SurfaceTexture(%u)%s -> %p%s", tex, attached ? "" : " (detached)", obj,
+            st->consumer ? "" : " — no frame consumer, nothing will arrive");
+    return (klj_val){.l = obj};
+}
+static klj_val mv_ST_init_i(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return mv_st_new(n > 0 ? (uint32_t)a[0].j : 0, 1);
+}
+static klj_val mv_ST_init_z(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return mv_st_new(0, 0);       // new SurfaceTexture(singleBufferMode): detached
+}
+
+static klj_val mv_ST_setListener(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    mv_st *st = mv_st_of(self);
+    if (!st) return (klj_val){0};
+    void *l = n > 0 ? a[0].l : NULL;
+    if (l) kl_jni_pin_object(l);  // called later, from another thread
+    pthread_mutex_lock(&st->lock);
+    st->listener = l;
+    pthread_mutex_unlock(&st->lock);
+    klj_object *lo = klj_as_object(l);
+    KLJ_LOG("SurfaceTexture %p: listener %s", self, lo ? lo->cls : "cleared");
+    return (klj_val){0};
+}
+
+static klj_val mv_ST_updateTexImage(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_st *st = mv_st_of(self);
+    if (!st || st->released || !st->consumer) return (klj_val){0};
+    if (!kl_glfb_current_context()) {
+        KLJ_LOG_ONCE("SurfaceTexture.updateTexImage with no current EGL context — "
+                     "nothing latched (Android throws here)");
+        return (klj_val){0};
+    }
+    int64_t ns = 0;
+    void *pix = kl_mediandk_consumer_take(st->consumer, &ns);
+    if (!pix) return (klj_val){0};          // no new frame: the texture keeps the last
+    void *img = kl_glfb_image_from_pixels(pix, NULL, NULL);
+    int ok = img ? kl_glfb_image_bind_texture(img, st->tex) : 0;
+    if (ok != 1) {
+        static unsigned said;
+        if (said++ < 8)
+            KLJ_LOG("SurfaceTexture %p: frame not latched into texture %u (%s)", self, st->tex,
+                    !img ? "no image of it" : ok < 0 ? "no current context" : "bind failed");
+        if (img) kl_glfb_image_destroy(img);
+        kl_mediandk_pixels_release(pix);
+        return (klj_val){0};
+    }
+    pthread_mutex_lock(&st->lock);
+    void *old_img = st->img, *old_pix = st->pix;
+    st->img = img;
+    st->pix = pix;
+    st->ts_ns = ns;
+    pthread_mutex_unlock(&st->lock);
+    if (old_img) kl_glfb_image_destroy(old_img);
+    kl_mediandk_pixels_release(old_pix);
+    static int first = 1;
+    if (first) { first = 0; KLJ_LOG("SurfaceTexture %p: first frame latched into texture %u (%lld ns)",
+                                    self, st->tex, (long long)ns); }
+    return (klj_val){0};
+}
+
+static klj_val mv_ST_getTimestamp(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_st *st = mv_st_of(self);
+    if (!st) return (klj_val){.j = 0};
+    pthread_mutex_lock(&st->lock);
+    int64_t ns = st->ts_ns;
+    pthread_mutex_unlock(&st->lock);
+    return (klj_val){.j = (uint64_t)ns};
+}
+
+// Column-major, as android.opengl.Matrix: t' = 1 - t. A decoder's buffers
+// are top row first, and this is the matrix Android hands back for them.
+static klj_val mv_ST_getTransformMatrix(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    static const float m[16] = { 1, 0, 0, 0,   0, -1, 0, 0,   0, 0, 1, 0,   0, 1, 0, 1 };
+    klj_array *arr = n > 0 ? klj_arr(a[0].l) : NULL;
+    if (arr && arr->kind == 'F' && arr->len >= 16 && arr->data)
+        memcpy(arr->data, m, sizeof m);
+    return (klj_val){0};
+}
+
+static klj_val mv_ST_setDefaultBufferSize(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    mv_st *st = mv_st_of(self);
+    if (st && n > 1) kl_mediandk_consumer_set_size(st->consumer, (int32_t)a[0].j, (int32_t)a[1].j);
+    return (klj_val){0};
+}
+
+static klj_val mv_ST_release(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_st *st = mv_st_of(self);
+    if (!st) return (klj_val){0};
+    pthread_mutex_lock(&st->lock);
+    int was = st->released;
+    st->released = 1;
+    st->listener = NULL;
+    void *consumer = st->consumer, *img = st->img, *pix = st->pix;
+    st->consumer = NULL;
+    // The latched image goes only where a context can release it; otherwise
+    // it stays with the payload (one frame).
+    int drop = img && kl_glfb_current_context();
+    if (drop) { st->img = NULL; st->pix = NULL; }
+    pthread_mutex_unlock(&st->lock);
+    if (was) return (klj_val){0};
+    kl_mediandk_consumer_free(consumer);
+    if (drop) { kl_glfb_image_destroy(img); kl_mediandk_pixels_release(pix); }
+    KLJ_LOG("SurfaceTexture %p released (%d frames)", self, st->frames);
+    return (klj_val){0};
+}
+
+static klj_val mv_ST_isReleased(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_st *st = mv_st_of(self);
+    return (klj_val){.j = (!st || st->released) ? 1u : 0u};
+}
+
+static klj_val mv_ST_attach(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    mv_st *st = mv_st_of(self);
+    if (!st || n < 1) return (klj_val){0};
+    pthread_mutex_lock(&st->lock);
+    st->tex = (uint32_t)a[0].j;
+    st->attached = 1;
+    pthread_mutex_unlock(&st->lock);
+    return (klj_val){0};
+}
+static klj_val mv_ST_detach(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_st *st = mv_st_of(self);
+    if (!st) return (klj_val){0};
+    pthread_mutex_lock(&st->lock);
+    st->attached = 0;             // Android deletes the texture; the guest's name stays its own here
+    pthread_mutex_unlock(&st->lock);
+    return (klj_val){0};
+}
+
+static klj_val mv_ST_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+
+static klj_val mv_Surface_init_st(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    mv_st *st = n > 0 ? mv_st_of(a[0].l) : NULL;
+    void *obj = klj_new_object_data(MV_ST_SURFACE, st);
+    kl_jni_pin_object(obj);
+    KLJ_LOG("new Surface(SurfaceTexture %p) -> %p", n > 0 ? a[0].l : NULL, obj);
+    return (klj_val){.l = obj};
+}
+static klj_val mv_Surface_isValid(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    mv_st *st = mv_st_of(self);
+    if (st) return (klj_val){.j = st->released ? 0u : 1u};
+    return (klj_val){.j = o ? 1u : 0u};
+}
+
+''' + "const klj_binding klj_bind_window[] = {\n"
+        "    // " + marker + "\n"
+        "    {MV_ST_CLASS, \"<init>\", \"(I)V\", mv_ST_init_i},\n"
+        "    {MV_ST_CLASS, \"<init>\", \"(IZ)V\", mv_ST_init_i},\n"
+        "    {MV_ST_CLASS, \"<init>\", \"(Z)V\", mv_ST_init_z},\n"
+        "    {MV_ST_CLASS, \"setOnFrameAvailableListener\", \"(L" + "android/graphics/SurfaceTexture$OnFrameAvailableListener;)V\", mv_ST_setListener},\n"
+        "    {MV_ST_CLASS, \"setOnFrameAvailableListener\", \"(L" + "android/graphics/SurfaceTexture$OnFrameAvailableListener;Landroid/os/Handler;)V\", mv_ST_setListener},\n"
+        "    {MV_ST_CLASS, \"updateTexImage\", \"()V\", mv_ST_updateTexImage},\n"
+        "    {MV_ST_CLASS, \"getTimestamp\", \"()J\", mv_ST_getTimestamp},\n"
+        "    {MV_ST_CLASS, \"getTransformMatrix\", \"([F)V\", mv_ST_getTransformMatrix},\n"
+        "    {MV_ST_CLASS, \"setDefaultBufferSize\", \"(II)V\", mv_ST_setDefaultBufferSize},\n"
+        "    {MV_ST_CLASS, \"releaseTexImage\", \"()V\", mv_ST_noop},\n"
+        "    {MV_ST_CLASS, \"release\", \"()V\", mv_ST_release},\n"
+        "    {MV_ST_CLASS, \"isReleased\", \"()Z\", mv_ST_isReleased},\n"
+        "    {MV_ST_CLASS, \"attachToGLContext\", \"(I)V\", mv_ST_attach},\n"
+        "    {MV_ST_CLASS, \"detachFromGLContext\", \"()V\", mv_ST_detach},\n"
+        "    {MV_ST_SURFACE, \"<init>\", \"(Landroid/graphics/SurfaceTexture;)V\", mv_Surface_init_st},\n"
+        "    {MV_ST_SURFACE, \"release\", \"()V\", mv_ST_noop},\n"
+        "    {MV_ST_SURFACE, \"isValid\", \"()Z\", mv_Surface_isValid},\n")
+    open(p, "w").write(s)
+print("overlay: android.graphics.SurfaceTexture and Surface(SurfaceTexture) feed codec frames to a GL texture")
+PYEOF
+
+# 86 — the volumetric-video plugin's SurfaceTexture methods. Its Java class
+# implements SurfaceTexture.OnFrameAvailableListener, and its native side calls
+# four of its Java methods through JNI to get a texture-backed decoder surface:
+#   createSurfaceTexture(int)            new SurfaceTexture(tex), listener = this
+#   createSurfaceTextureSurface(ST)      new Surface(st)
+#   releaseSurfaceTexture(ST)            listener = null, st.release()
+#   releaseSurfaceTextureSurface(Surface) s.release()
+# and onFrameAvailable(ST) is `synchronized` and calls the static native
+# onFrameAvailableNative(st). Each is bound on the class and does what the
+# Java does, through the SurfaceTexture bindings (step 85) by klj_call_binding;
+# onFrameAvailable holds one lock per process (one plugin object) and calls
+# the native the library registered or exports.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the volumetric-video plugin's SurfaceTexture methods (step 86)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_net[] = {\n", "// " + marker + "\n" + r'''#define MV_SVF_ST      "android/graphics/SurfaceTexture"
+#define MV_SVF_ST_SIG  "Landroid/graphics/SurfaceTexture;"
+#define MV_SVF_ST_LSIG "(Landroid/graphics/SurfaceTexture$OnFrameAvailableListener;)V"
+static klj_val mv_SVF_createSurfaceTexture(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_val tex = { .j = n > 0 ? a[0].j : 0 };
+    void *st = klj_call_binding(klj_class_object(MV_SVF_ST), "<init>", "(I)V", &tex, 1).l;
+    if (st) {
+        klj_val l = { .l = self };
+        klj_call_binding(st, "setOnFrameAvailableListener", MV_SVF_ST_LSIG, &l, 1);
+    }
+    return (klj_val){.l = st};
+}
+static klj_val mv_SVF_createSurfaceTextureSurface(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return klj_call_binding(klj_class_object("android/view/Surface"), "<init>",
+                            "(" MV_SVF_ST_SIG ")V", a, n);
+}
+static klj_val mv_SVF_releaseSurfaceTexture(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n < 1 || !a[0].l) return (klj_val){0};
+    klj_val none = { .l = NULL };
+    klj_call_binding(a[0].l, "setOnFrameAvailableListener", MV_SVF_ST_LSIG, &none, 1);
+    klj_call_binding(a[0].l, "release", "()V", NULL, 0);
+    return (klj_val){0};
+}
+static klj_val mv_SVF_releaseSurfaceTextureSurface(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n > 0 && a[0].l) klj_call_binding(a[0].l, "release", "()V", NULL, 0);
+    return (klj_val){0};
+}
+// `public synchronized void onFrameAvailable(SurfaceTexture st)
+//      { onFrameAvailableNative(st); }` — a static native.
+static klj_val mv_SVF_onFrameAvailable(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    static void *fn;
+    if (!fn) fn = kl_jni_native(MV_SVF_CLASS, "onFrameAvailableNative", NULL);
+    if (!fn) {
+        void *h = klb_dlopen("libSVFUnityPlugin.so", 0x00002);
+        fn = h ? klb_dlsym(h, "Java_com_microsoft_mixedreality_mrcs_svf_JavaPlugin_onFrameAvailableNative") : NULL;
+    }
+    if (!fn) {
+        KLJ_LOG_ONCE("SVF JavaPlugin.onFrameAvailable: the plugin's onFrameAvailableNative was not found");
+        return (klj_val){0};
+    }
+    pthread_mutex_lock(&lk);
+    ((void (*)(void *, void *, void *))fn)(env, klj_class_object(MV_SVF_CLASS), n > 0 ? a[0].l : NULL);
+    pthread_mutex_unlock(&lk);
+    return (klj_val){0};
+}
+
+''' + "const klj_binding klj_bind_net[] = {\n")
+    s = sub(s, "    {MV_SVF_CLASS, \"<init>\", \"(Landroid/app/Activity;Ljava/lang/String;)V\", mv_SVFJavaPlugin_init},\n",
+        "    {MV_SVF_CLASS, \"<init>\", \"(Landroid/app/Activity;Ljava/lang/String;)V\", mv_SVFJavaPlugin_init},\n"
+        "    {MV_SVF_CLASS, \"createSurfaceTexture\", \"(I)\" MV_SVF_ST_SIG, mv_SVF_createSurfaceTexture},   // " + marker + "\n"
+        "    {MV_SVF_CLASS, \"createSurfaceTextureSurface\", \"(\" MV_SVF_ST_SIG \")Landroid/view/Surface;\", mv_SVF_createSurfaceTextureSurface},\n"
+        "    {MV_SVF_CLASS, \"releaseSurfaceTexture\", \"(\" MV_SVF_ST_SIG \")V\", mv_SVF_releaseSurfaceTexture},\n"
+        "    {MV_SVF_CLASS, \"releaseSurfaceTextureSurface\", \"(Landroid/view/Surface;)V\", mv_SVF_releaseSurfaceTextureSurface},\n"
+        "    {MV_SVF_CLASS, \"onFrameAvailable\", \"(\" MV_SVF_ST_SIG \")V\", mv_SVF_onFrameAvailable},\n")
+    open(p, "w").write(s)
+print("overlay: the volumetric-video plugin's SurfaceTexture methods and its frame listener")
+PYEOF
+
+# 87 — a library that is not 64-bit ARM is left out, not the whole title. A
 # title can ship a stray 32-bit library in its arm64-v8a folder; Android's
 # loader refuses it ("wrong ELF class") and the title runs without it, but the
 # translator stopped on it and the launcher left the whole title out of every
 # build. Such a library is now skipped with a note, so the guest's dlopen of
 # it fails exactly as it does on a Quest.
 M="$K/visionos/mkguest.sh"
-grep -q 'metavision: non-arm64 libraries skipped (step 90)' "$M" || {
+grep -q 'metavision: non-arm64 libraries skipped (step 87)' "$M" || {
     [ "$(grep -c '  \[ -f "\$SRC/\$NAME.so" \] || { echo "!! \$SRC/\$NAME.so missing"; exit 1; }' "$M")" = 1 ] ||
         die "mkguest.sh library-loop anchor not found"
     python3 - "$M" <<'PYEOF'
@@ -7292,7 +8127,7 @@ p = sys.argv[1]
 s = open(p).read()
 old = '  [ -f "$SRC/$NAME.so" ] || { echo "!! $SRC/$NAME.so missing"; exit 1; }\n'
 new = old + (
-    '  # metavision: non-arm64 libraries skipped (step 90) — ELFCLASS64 and EM_AARCH64,\n'
+    '  # metavision: non-arm64 libraries skipped (step 87) — ELFCLASS64 and EM_AARCH64,\n'
     '  # or Android\'s loader would refuse it too.\n'
     '  if [ "$(od -An -tu1 -j4 -N1 "$SRC/$NAME.so" | tr -d \' \')" != 2 ] ||\n'
     '     [ "$(od -An -tu1 -j18 -N1 "$SRC/$NAME.so" | tr -d \' \')" != 183 ]; then\n'
