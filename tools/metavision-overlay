@@ -12354,3 +12354,448 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: Meta XR Audio's Unity plugin loads as a translated guest library")
 PYEOF
+
+# 150 — AMediaCodec_setOutputSurface (API 23) was not in the media layer. A
+# decoder running into one SurfaceTexture's window could not be moved to
+# another: the only way out was to delete it and decode again from a keyframe.
+# The codec now takes a window this layer delivers to (an AImageReader's, or a
+# SurfaceTexture's frame consumer), holds that consumer and lets go of the old
+# one; frames released from then on go to the new window. A window nothing
+# here delivers to is refused, as Android refuses an invalid Surface.
+python3 - "$K/runtime/media/kl_mediandk.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: AMediaCodec_setOutputSurface (step 150)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "// ---------------------------------------------------------------------------\n// ATrace. Two calls",
+        "// " + marker + r'''
+// A surface-configured decoder moves to another output surface while it runs.
+// Called from the thread that releases the codec's buffers, as Android's
+// decoder loops do: a release in flight on another thread could still hold
+// the consumer this lets go of.
+static int mv_AMediaCodec_setOutputSurface(void *codec, void *window) {
+    klm_codec *c = codec;
+    if (!c || c->magic != KLM_CODEC_MAGIC || c->mv_aac || !window)
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    klm_reader *r = kl_ndk_window_owner(window);
+    if (!r || r->magic != KLM_READER_MAGIC) {
+        fprintf(stderr, "  [media] AMediaCodec_setOutputSurface(%p): not a window this "
+                        "layer delivers to — refused\n", window);
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+    pthread_mutex_lock(&c->lock);
+    klm_reader *old = c->surface;
+    if (old != r) {
+        mv_reader_ref(r);
+        c->surface = r;
+    }
+    pthread_mutex_unlock(&c->lock);
+    if (old == r) return AMEDIA_OK;
+    mv_reader_unref(old);
+    static unsigned said;
+    if (said++ < 8)
+        fprintf(stderr, "  [media] AMediaCodec_setOutputSurface: codec %p now renders into "
+                        "window %p\n", codec, window);
+    return AMEDIA_OK;
+}
+
+// ---------------------------------------------------------------------------
+// ATrace. Two calls''')
+    s = sub(s, '    M("AMediaCodec_releaseOutputBufferAtTime", mv_AMediaCodec_releaseOutputBufferAtTime),   // metavision: the SurfaceTexture frame consumer (step 82)\n',
+        '    M("AMediaCodec_releaseOutputBufferAtTime", mv_AMediaCodec_releaseOutputBufferAtTime),   // metavision: the SurfaceTexture frame consumer (step 82)\n'
+        '    M("AMediaCodec_setOutputSurface",     mv_AMediaCodec_setOutputSurface),   // ' + marker + '\n')
+    open(p, "w").write(s)
+print("overlay: AMediaCodec_setOutputSurface moves a running decoder to another window")
+PYEOF
+
+# 151 — a producer's mixer source could never leave the device. kl_audio keeps
+# a source slot per producer key (four, then everything folds into slot 0 and
+# two producers append to one cursor), and a key was registered for the life
+# of the process. kl_audio_src_release(key) gives the slot back; the
+# producer's next write registers it again. What it already mixed ahead plays
+# out.
+python3 - "$K/runtime/media/kl_audio.c" "$K/runtime/media/kl_audio.h" <<'PYEOF'
+import sys
+marker = "metavision: a mixer source leaves the device (step 151)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = ("    if (g_src_n < KL_AU_MAX_SRC) { g_src_key[g_src_n] = key; g_src_pos[g_src_n] = 0; return g_src_n++; }\n"
+           "    return 0;\n}\n")
+    s = sub(p, s, old, old + "\n// " + marker + r'''
+void kl_audio_src_release(const void *key) {
+    if (!key) return;
+    pthread_mutex_lock(&g_wlock);
+    for (int i = 0; i < g_src_n; i++) {
+        if (g_src_key[i] != key) continue;
+        for (int j = i; j + 1 < g_src_n; j++) {
+            g_src_key[j] = g_src_key[j + 1];
+            g_src_pos[j] = g_src_pos[j + 1];
+        }
+        g_src_n--;
+        g_src_key[g_src_n] = NULL;
+        g_src_pos[g_src_n] = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_wlock);
+}
+''')
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    old = "size_t kl_audio_write_src(const void *src, const void *pcm, size_t bytes);\n"
+    s = sub(p, s, old, old +
+        "// " + marker + ": the key's slot is free again; its next write\n"
+        "// registers it anew. For a producer that has stopped for good.\n"
+        "void kl_audio_src_release(const void *key);\n")
+    open(p, "w").write(s)
+print("overlay: a mixer source can leave the device")
+PYEOF
+
+# 152 — the video-player plugin host's RendererReset made a new texture,
+# SurfaceTexture, Surface and window for every player and dropped the old ones
+# on the floor: the old SurfaceTexture, its frame consumer and its window
+# reference leaked, the live texture and FBO names leaked, and the decoder
+# went on rendering into the old window, so the new texture never received a
+# frame (a black video after the engine's graphics-device "after reset").
+# The plugin's own Java does neither: RendererReset calls RendererSetup for
+# each player, a no-op for one that is set up, and its RenderPlayer, after a
+# frame with no current EGL context, calls RendererReset on the next frame
+# that has one.
+#  - every guest EGL context is backed by one GL context here, so a reset
+#    normally leaves a player's names alive: it is then kept whole (texture,
+#    SurfaceTexture, window, decoder), as the Java keeps it; an RGBA target
+#    whose names did not survive is made again.
+#  - names that died with their context are not deleted (in this context they
+#    may be someone else's); the old SurfaceTexture, Surface and window go
+#    through the reaper (window reference first), and the new window gets a
+#    generation number.
+#  - the decode thread sees the new generation, moves the running decoder
+#    onto the new window (AMediaCodec_setOutputSurface, step 150; on refusal
+#    it makes a decoder configured with it) and decodes again from the
+#    current position, so a paused or finished player shows its frame too.
+#    The window is read and the codec configured under the player's lock, so
+#    a reset cannot free a window between the two.
+#  - RenderPlayer without a context remembers it and resets on the next
+#    frame with one, with the device index RendererSetupPlayer last gave; a
+#    reset without a context waits for the next RenderPlayer.
+python3 - "$K/runtime/jni/kl_jni_videoplugin.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: RendererReset keeps or retires, the decoder follows (step 152)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    pthread_mutex_t mv_op;             // metavision: the video player's lifecycle (step 101): open/close/destroy, recursive\n} avp;\n",
+               "    pthread_mutex_t mv_op;             // metavision: the video player's lifecycle (step 101): open/close/destroy, recursive\n"
+               "    unsigned  mv_win_gen;              // " + marker + ": a new window\n"
+               "} avp;\n")
+    s = sub(s, "static pthread_once_t avp_media_once = PTHREAD_ONCE_INIT;\n",
+               "static int (*mv_codec_set_surface)(void *, void *);   // " + marker + "\n"
+               "static pthread_once_t avp_media_once = PTHREAD_ONCE_INIT;\n")
+    s = sub(s, '    MR(codec_release_at, "AMediaCodec_releaseOutputBufferAtTime");\n#undef MR\n',
+               '    MR(codec_release_at, "AMediaCodec_releaseOutputBufferAtTime");\n#undef MR\n'
+               '    *(void **)&mv_codec_set_surface = kl_mediandk_lookup("AMediaCodec_setOutputSurface");   // ' + marker + '\n')
+    s = sub(s, "    p->window = win;\n    p->mtx = mtx;\n",
+               "    p->window = win;\n    p->mv_win_gen++;                   // " + marker + "\n    p->mtx = mtx;\n")
+    # the decode thread: the window and its generation, read together
+    s = sub(s, "    void *win = NULL;\n    while (!atomic_load(&p->quit)) {   // RendererSetupPlayer makes the window\n",
+               "    unsigned mv_wgen = 0;              // " + marker + "\n"
+               "    void *win = NULL;\n    while (!atomic_load(&p->quit)) {   // RendererSetupPlayer makes the window\n")
+    s = sub(s, "        win = p->window;\n        pthread_mutex_unlock(&p->lk);\n        if (win) break;\n",
+               "        win = p->window;\n        mv_wgen = p->mv_win_gen;\n        pthread_mutex_unlock(&p->lk);\n        if (win) break;\n")
+    s = sub(s, "        if (!codec || M.codec_configure(codec, vfmt, win, NULL, 0) != 0 || M.codec_start(codec) != 0) {\n",
+               "        int mv_cfg = -1;               // " + marker + ": the window as it is now\n"
+               "        if (codec) {\n"
+               "            pthread_mutex_lock(&p->lk);\n"
+               "            win = p->window;\n"
+               "            mv_wgen = p->mv_win_gen;\n"
+               "            mv_cfg = M.codec_configure(codec, vfmt, win, NULL, 0);\n"
+               "            pthread_mutex_unlock(&p->lk);\n"
+               "        }\n"
+               "        if (!codec || mv_cfg != 0 || M.codec_start(codec) != 0) {\n")
+    s = sub(s, "        int fast = p->seek_fast, loop = p->looping, done = p->video_done;\n"
+               "        pthread_mutex_unlock(&p->lk);\n"
+               "        if (g != gen) {                // seek: drop what is held, flush, start over\n",
+               "        int fast = p->seek_fast, loop = p->looping, done = p->video_done;\n"
+               "        // " + marker + ":\n"
+               "        // a new window: the decoder moves onto it (or one is made for it)\n"
+               "        // under the lock, so the window cannot be retired in between.\n"
+               "        int mv_moved = 0;\n"
+               "        int64_t dur_now = (int64_t)p->dur_ms * 1000;\n"
+               "        if (p->mv_win_gen != mv_wgen && p->window) {\n"
+               "            void *nw = p->window;\n"
+               "            mv_wgen = p->mv_win_gen;\n"
+               "            mv_moved = 1;\n"
+               "            if (!mv_codec_set_surface || mv_codec_set_surface(codec, nw) != 0) {\n"
+               "                for (int i = 0; i < np; i++) M.codec_release(codec, pend[i].idx, false);\n"
+               "                np = 0;\n"
+               "                M.codec_stop(codec);\n"
+               "                M.codec_delete(codec);\n"
+               "                codec = M.codec_new(mime);\n"
+               "                if (!codec || M.codec_configure(codec, vfmt, nw, NULL, 0) != 0 || M.codec_start(codec) != 0) {\n"
+               "                    if (codec) { M.codec_delete(codec); codec = NULL; }\n"
+               "                    p->last_error = ERR_DECODE;\n"
+               "                }\n"
+               "            }\n"
+               "        }\n"
+               "        pthread_mutex_unlock(&p->lk);\n"
+               "        if (mv_moved) {\n"
+               "            KLJ_LOG(\"video plugin player %d: decoder %s the new window; again from %lld ms\",\n"
+               "                    p->index, codec ? \"moved onto\" : \"lost with\", (long long)(clk / 1000));\n"
+               "            if (!codec) break;\n"
+               "            // What went into the old window is gone: decode again from the\n"
+               "            // current position, so a paused or finished player shows its frame.\n"
+               "            for (int i = 0; i < np; i++) M.codec_release(codec, pend[i].idx, false);\n"
+               "            np = 0;\n"
+               "            M.codec_flush(codec);\n"
+               "            M.ex_seek(vex, clk, 0 /* PREVIOUS_SYNC */);\n"
+               "            in_eos = 0;\n"
+               "            in_flight = 0;\n"
+               "            drop_until = (done || (dur_now > 0 && clk > dur_now - 200000)) ? -1 : clk;\n"
+               "            first = 1;\n"
+               "            anchor = 0;\n"
+               "            last_out = avp_now_ns();\n"
+               "            continue;\n"
+               "        }\n"
+               "        if (g != gen) {                // seek: drop what is held, flush, start over\n")
+    # RendererSetupPlayer's device index; RenderPlayer's context check
+    s = sub(s, "// ---- the static surface the native library calls\n",
+               "// " + marker + r'''
+static int     mv_device = -1;         // the Java's s_PreviousDeviceIndex (render thread)
+static int     mv_ctx_fail;            // the Java's s_PreviousContextFail (render thread)
+static int     mv_reset_pending;       // a reset that came with no current context
+static uint8_t (*mv_IsTexture)(uint32_t);
+static uint8_t (*mv_IsFramebuffer)(uint32_t);
+static void    mv_reset_all(void);
+
+''' + "// ---- the static surface the native library calls\n")
+    s = sub(s, "    avp_gl_reap();\n    if (n > 0) avp_render_setup(avp_at((int)(int32_t)a[0].j));\n",
+               "    if (n > 1) mv_device = (int)(int32_t)a[1].j;   // " + marker + "\n"
+               "    avp_gl_reap();\n    if (n > 0) avp_render_setup(avp_at((int)(int32_t)a[0].j));\n")
+    s = sub(s, "static klj_val avp_s_render(void *env, void *self, const klj_val *a, int n) {\n"
+               "    (void)env; (void)self;\n"
+               "    avp_gl_reap();\n",
+               "static klj_val avp_s_render(void *env, void *self, const klj_val *a, int n) {\n"
+               "    (void)env; (void)self;\n"
+               "    // " + marker + ": as the Java's RenderPlayer\n"
+               "    if (!kl_glfb_current_context()) { mv_ctx_fail = 1; return (klj_val){0}; }\n"
+               "    if ((mv_ctx_fail && mv_device >= 0) || mv_reset_pending) {\n"
+               "        mv_ctx_fail = 0;\n"
+               "        mv_reset_pending = 0;\n"
+               "        mv_reset_all();\n"
+               "    }\n"
+               "    avp_gl_reap();\n")
+    old = '''static klj_val avp_s_reset(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // A new context: every player's GL objects again (the old names died with it).
+    for (int i = 0; i < AVP_MAX; i++) {
+        avp *p = avp_at(i);
+        if (!p) continue;
+        pthread_mutex_lock(&p->lk);
+        p->oes_tex = p->rgba_tex = p->fbo = 0;
+        p->rgba_w = p->rgba_h = 0;
+        p->gl_setup = 0;
+        p->want_target = p->has_video;
+        pthread_mutex_unlock(&p->lk);
+        avp_render_setup(p);
+    }
+    return (klj_val){0};
+}
+'''
+    s = sub(s, old, "// " + marker + r'''
+// Render thread, a context current.
+static void mv_reset_player(avp *p) {
+    if (!p) return;
+    pthread_mutex_lock(&p->lk);
+    int setup = p->gl_setup, live = p->alive && !p->deinit_flagged;
+    uint32_t oes = p->oes_tex, rgba = p->rgba_tex, fbo = p->fbo;
+    pthread_mutex_unlock(&p->lk);
+    if (!live) return;
+    if (!setup) { avp_render_setup(p); return; }
+    if (!mv_IsTexture) *(void **)&mv_IsTexture = kl_egl_sym("glIsTexture");
+    if (!mv_IsFramebuffer) *(void **)&mv_IsFramebuffer = kl_egl_sym("glIsFramebuffer");
+    if (mv_IsTexture && mv_IsFramebuffer && oes && mv_IsTexture(oes)) {
+        // The names outlived the reset: keep the player whole, as the Java does.
+        if (rgba && !(mv_IsTexture(rgba) && fbo && mv_IsFramebuffer(fbo))) {
+            pthread_mutex_lock(&p->lk);    // the target did not: made again, not deleted
+            p->rgba_tex = p->fbo = 0;
+            p->rgba_w = p->rgba_h = 0;
+            p->want_target = p->has_video;
+            pthread_mutex_unlock(&p->lk);
+        }
+        static unsigned said;
+        if (said++ < 4) KLJ_LOG("video plugin player %d: RendererReset — its GL names live on; kept", p->index);
+        return;
+    }
+    // The names died with their context: the objects over them are retired (not
+    // the names, which may be someone else's here) and made again.
+    avp_grave *g = calloc(1, sizeof *g);
+    pthread_mutex_lock(&p->lk);
+    if (g) {
+        g->st = p->st;
+        g->surface = p->surface;
+        g->window = p->window;
+    }
+    p->st = p->surface = p->window = NULL;
+    p->oes_tex = p->rgba_tex = p->fbo = 0;
+    p->rgba_w = p->rgba_h = 0;
+    p->gl_setup = 0;
+    p->latched = 0;
+    p->want_target = p->has_video;
+    pthread_mutex_unlock(&p->lk);
+    if (g) {
+        pthread_mutex_lock(&g_tab_lk);
+        g->next = g_graves;
+        g_graves = g;
+        pthread_mutex_unlock(&g_tab_lk);
+    }
+    avp_gl_reap();                     // the old listener goes before the new frames are counted
+    atomic_store(&p->frames_avail, 0);
+    avp_render_setup(p);               // the decode thread moves onto the new window
+    KLJ_LOG("video plugin player %d: RendererReset — its GL names died with their context; "
+            "SurfaceTexture and window made again", p->index);
+}
+static void mv_reset_all(void) {
+    for (int i = 0; i < AVP_MAX; i++) mv_reset_player(avp_at(i));
+}
+static klj_val avp_s_reset(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    if (!kl_glfb_current_context()) {
+        mv_reset_pending = 1;
+        KLJ_LOG_ONCE("video plugin: RendererReset with no current GL context — on the next RenderPlayer");
+        return (klj_val){0};
+    }
+    mv_reset_pending = 0;
+    mv_reset_all();
+    return (klj_val){0};
+}
+''')
+    open(p, "w").write(s)
+print("overlay: the video player's RendererReset keeps live players and retires dead ones; the decoder follows its window")
+PYEOF
+
+# 153 — the video-player plugin host near the end of a file:
+#  - a seek (or a loop back to 0) left the sound already decoded for the old
+#    position in the player's ring: the mixer played it, and since a loop
+#    clears `seeking` at once, it set the clock back to the end of the file
+#    from that stale sound; the picture then dropped frames as "late" until
+#    the new sound arrived. A seek now empties the ring as it moves the clock.
+#  - a seek past the last frame dropped every frame (all before the target),
+#    so nothing was shown for it and `IsSeeking` stayed true for good once the
+#    player finished there. At the end of the stream the last frame is shown
+#    rather than dropped, and finishing clears `seeking` (picture and
+#    sound-only paths).
+python3 - "$K/runtime/jni/kl_jni_videoplugin.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the video player near the end of a file (step 153)"
+def sub(s, old, new, n=1):
+    if s.count(old) != n:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    p->seeking = 1;\n    p->video_done = 0;\n    clk_set_locked(p, us);\n",
+               "    p->seeking = 1;\n    p->video_done = 0;\n    clk_set_locked(p, us);\n"
+               "    p->ring_r = p->ring_n = 0;         // " + marker + ": no sound from before\n")
+    s = sub(s, "                    p->video_done = 1;\n"
+               "                    if (p->state == ST_PLAYING) p->state = ST_FINISHED;\n",
+               "                    p->video_done = 1;\n"
+               "                    p->seeking = 0;    // " + marker + "\n"
+               "                    if (p->state == ST_PLAYING) p->state = ST_FINISHED;\n", 2)
+    s = sub(s, "            if (drop_until >= 0 && pts < drop_until) drop = 1;\n",
+               "            // " + marker + ": the last frame of the stream is shown, not dropped\n"
+               "            if (drop_until >= 0 && pts < drop_until && !(in_eos && np == 1 && !in_flight)) drop = 1;\n")
+    open(p, "w").write(s)
+print("overlay: the video player's seeks and loops near the end of a file")
+PYEOF
+
+# 154 — the video-player plugin host's threads, from an audit of every field
+# two threads touch:
+#  - SetPlayerOptions (the engine's main thread) writes `fast_oes`, which
+#    RenderPlayer read unlocked, twice per frame; GetTextureTransform read the
+#    SurfaceTexture pointer unlocked while a reset or DestroyPlayer replaces
+#    it. Both now take one snapshot under the player's lock.
+#  - the RGBA target was made outside the lock DestroyPlayer buries under: a
+#    destroy racing the first frame left the new target unburied (leaked) or
+#    buried a name already deleted. It is made under the lock, and only for a
+#    player still alive.
+#  - the reaper deleted GL names and released SurfaceTextures whether or not
+#    a context was current (RendererDestroyPlayers can come without one): the
+#    deletes went nowhere. Graves now wait for a frame with a context.
+#  - the sound mixer held its device source for the life of the process; once
+#    no player is left it gives the source back (step 151), and takes one
+#    again with the next player's first sound.
+python3 - "$K/runtime/jni/kl_jni_videoplugin.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the video player's threads (step 154)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "static void avp_gl_reap(void) {\n",
+               "static void avp_gl_reap(void) {\n"
+               "    if (!kl_glfb_current_context()) return;   // " + marker + ": graves wait for a context\n")
+    s = sub(s, "    int hv = p->has_video, ha = p->has_audio;\n",
+               "    int hv = p->has_video, ha = p->has_audio;\n"
+               "    int mv_fast = p->fast_oes;         // " + marker + "\n")
+    s = sub(s, "    if (want && !p->fast_oes && (w != p->rgba_w || h != p->rgba_h || !p->fbo)) avp_target(p, w, h);\n",
+               "    if (want && !mv_fast && (w != p->rgba_w || h != p->rgba_h || !p->fbo)) {\n"
+               "        pthread_mutex_lock(&p->lk);    // " + marker + ": as DestroyPlayer buries\n"
+               "        if (p->alive) avp_target(p, w, h);\n"
+               "        pthread_mutex_unlock(&p->lk);\n"
+               "    }\n")
+    s = sub(s, "    if (!p->fast_oes) avp_blit(p);\n",
+               "    if (!mv_fast) avp_blit(p);\n")
+    s = sub(s, "    if (!p || !p->fast_oes || !p->st || !p->mtx) return (klj_val){0};\n"
+               "    klj_val m = { .l = p->mtx };\n"
+               "    klj_call_binding(p->st, \"getTransformMatrix\", \"([F)V\", &m, 1);\n"
+               "    klj_array *src = klj_arr(p->mtx);\n",
+               "    if (!p) return (klj_val){0};\n"
+               "    pthread_mutex_lock(&p->lk);        // " + marker + "\n"
+               "    void *mv_st = p->fast_oes ? p->st : NULL, *mv_mtx = p->mtx;\n"
+               "    pthread_mutex_unlock(&p->lk);\n"
+               "    if (!mv_st || !mv_mtx) return (klj_val){0};\n"
+               "    klj_val m = { .l = mv_mtx };\n"
+               "    klj_call_binding(mv_st, \"getTransformMatrix\", \"([F)V\", &m, 1);\n"
+               "    klj_array *src = klj_arr(mv_mtx);\n")
+    # the mixer gives its source back once no player is left
+    s = sub(s, "    static int32_t acc[AVP_MIX * 2];\n",
+               "    static int32_t acc[AVP_MIX * 2];\n"
+               "    int mv_src_on = 0;                 // " + marker + "\n")
+    s = sub(s, "        int any = 0;\n        memset(acc, 0, sizeof acc);\n",
+               "        int any = 0, mv_live = 0;\n        memset(acc, 0, sizeof acc);\n")
+    s = sub(s, "            if (!p || !p->ring) continue;\n            pthread_mutex_lock(&p->lk);\n",
+               "            if (!p || !p->ring) continue;\n            mv_live = 1;\n            pthread_mutex_lock(&p->lk);\n")
+    s = sub(s, "        if (!any) { usleep(10000); continue; }\n",
+               "        if (!any) {\n"
+               "            if (mv_src_on && !mv_live) {   // " + marker + "\n"
+               "                kl_audio_src_release(&g_mix_key);\n"
+               "                mv_src_on = 0;\n"
+               "            }\n"
+               "            usleep(10000);\n"
+               "            continue;\n"
+               "        }\n")
+    s = sub(s, "        size_t want = sizeof out, put = dev ? kl_audio_write_src(&g_mix_key, out, want) : 0;\n",
+               "        size_t want = sizeof out, put = dev ? kl_audio_write_src(&g_mix_key, out, want) : 0;\n"
+               "        if (put) mv_src_on = 1;\n")
+    open(p, "w").write(s)
+print("overlay: the video player's threads: snapshots under the lock, graves wait for a context, the mixer leaves")
+PYEOF
