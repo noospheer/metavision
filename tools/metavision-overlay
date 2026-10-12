@@ -8139,3 +8139,339 @@ open(p, "w").write(s.replace(old, new))
 PYEOF
 }
 echo "overlay: a library that is not 64-bit ARM is left out, not the whole title"
+
+# 88 — UnityPlayer.UnitySendMessage(gameObject, method, message). Native
+# plugins and Java-side SDKs message a GameObject through this static: on
+# Android it encodes the message as UTF-8 and calls the private static native
+# nativeUnitySendMessage(String, String, byte[]) — (String, String, String) in
+# older players — which libunity registers on UnityPlayer. Nothing bound the
+# Java half, so every such message (a plugin's "done" callback, a web view's
+# "initialised") had no host implementation and C# waited for it forever.
+#  - the binding finds the registered native (its registered signature picks
+#    byte[] or String), converts the message and calls it with UnityPlayer's
+#    jclass, in a local frame of its own. Before libunity has registered it the
+#    message is dropped with a note, as Android's wrapper does ("native
+#    libraries not loaded").
+#  - Unity queues the message for its main thread, so any thread may call it,
+#    as on Android; a native caller reaches it by CallStaticVoidMethod.
+#  - mv_usm_send / mv_unity_send_message are the same path for host code.
+#  - logged once per (GameObject, method) pair; the payload never.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: UnityPlayer.UnitySendMessage (step 88)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_net[] = {\n", "// " + marker + "\n" + r'''#define MV_USM_PLAYER "com/unity3d/player/UnityPlayer"
+#define MV_USM_NATIVE "nativeUnitySendMessage"
+
+// Once per (GameObject, method): a small table of name hashes.
+static int mv_usm_first(const char *go, const char *method) {
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t seen[128];
+    static unsigned nseen;
+    uint64_t h = 1469598103934665603ull;
+    for (const char *c = go; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    h = (h ^ 0xff) * 1099511628211ull;
+    for (const char *c = method; *c; c++) h = (h ^ (uint8_t)*c) * 1099511628211ull;
+    int first = 1;
+    pthread_mutex_lock(&lk);
+    for (unsigned i = 0; i < nseen; i++)
+        if (seen[i] == h) { first = 0; break; }
+    if (first && nseen < sizeof seen / sizeof *seen) seen[nseen++] = h;
+    pthread_mutex_unlock(&lk);
+    return first;
+}
+
+// go_s / method_s: the caller's jstrings, or NULL to make them from go / method.
+// env NULL: the calling thread's.
+static void mv_usm_send(void *env, void *go_s, void *method_s,
+                        const char *go, const char *method, const char *msg) {
+    if (!go) go = "";
+    if (!method) method = "";
+    if (!msg) msg = "";
+    // Not cached while NULL: libunity registers it only once it is loaded.
+    static void *_Atomic fn;
+    static _Atomic int bytes;
+    void *f = fn;
+    if (!f) {
+        f = kl_jni_native(MV_USM_PLAYER, MV_USM_NATIVE, NULL);
+        if (f) {
+            const char *sig = kl_jni_native_sig(MV_USM_PLAYER, MV_USM_NATIVE);
+            bytes = sig && strstr(sig, "[B") != NULL;
+            fn = f;
+        }
+    }
+    if (!f) {
+        KLJ_LOG("UnitySendMessage %s.%s: nativeUnitySendMessage not registered yet — "
+                "dropped (Android: \"native libraries not loaded\")", go, method);
+        return;
+    }
+    if (mv_usm_first(go, method))
+        KLJ_LOG("UnitySendMessage -> %s.%s (first; later ones not logged)", go, method);
+    if (!env) env = kl_jni_env();
+    kl_jni_local_frame_push();        // a JVM gives every native call its own frame
+    void *g = go_s ? go_s : kl_jni_new_string(go);
+    void *m = method_s ? method_s : kl_jni_new_string(method);
+    void *payload;
+    if (bytes) {                      // msg.getBytes("UTF-8"); our strings are UTF-8
+        size_t len = strlen(msg);
+        payload = klj_new_array('B', NULL, (int)len);
+        klj_array *arr = klj_arr(payload);
+        if (arr && arr->data && len) memcpy(arr->data, msg, len);
+    } else {
+        payload = kl_jni_new_string(msg);
+    }
+    ((void (*)(void *, void *, void *, void *, void *))f)(env, klj_class_object(MV_USM_PLAYER),
+                                                        g, m, payload);
+    kl_jni_local_frame_pop();
+}
+
+void mv_unity_send_message(const char *go, const char *method, const char *msg);
+void mv_unity_send_message(const char *go, const char *method, const char *msg) {
+    mv_usm_send(NULL, NULL, NULL, go, method, msg);
+}
+
+static klj_val mv_UnityPlayer_UnitySendMessage(void *env, void *self, const klj_val *a, int n) {
+    (void)self;
+    void *go_s = n > 0 ? a[0].l : NULL, *method_s = n > 1 ? a[1].l : NULL;
+    const char *go = go_s ? klj_str(go_s) : NULL;
+    const char *method = method_s ? klj_str(method_s) : NULL;
+    const char *msg = n > 2 && a[2].l ? klj_str(a[2].l) : NULL;
+    mv_usm_send(env, go ? go_s : NULL, method ? method_s : NULL, go, method, msg);
+    return (klj_val){0};
+}
+
+''' + "const klj_binding klj_bind_net[] = {\n"
+        "    {MV_USM_PLAYER, \"UnitySendMessage\", \"(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V\",\n"
+        "     mv_UnityPlayer_UnitySendMessage},   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: UnityPlayer.UnitySendMessage reaches the player's registered native")
+PYEOF
+
+# 89 — the Vuplex 3D WebView answers "no web content here". Titles embedding
+# it construct com.vuplex.webview.WebView3D from C# and drive it through JNI;
+# its Java half is an android.webkit.WebView, which this host does not have,
+# so every call had no host implementation. The contract C# relies on, read
+# from the plugin's Java: statics on WebView (WebView3D inherits them), the
+# constructors WebView3D(String gameObject, int texture, int w, int h,
+# boolean vulkan, boolean, [boolean,] BiConsumer, Message) and WebView(String,
+# int, int, int, int, BiConsumer, Message), instance calls, and events sent
+# back by UnitySendMessage(gameObject, "Handle<Event>", payload).
+#  - isWebViewAvailable() is false; the other statics (pause/resumeAll,
+#    timers, cookies — getCookies answers "" —, user agent, the permission and
+#    input-system switches, remote debugging, setForceDrawEnabled) are no-ops.
+#  - a constructor makes a pinned object; for a GL texture (not the Vulkan
+#    path) it makes a SurfaceTexture over it (step 85) so the texture has an
+#    owner, though no frame ever arrives. It then sends HandleInitFinished ("")
+#    and HandleLoadFailed ("net::ERR_NOT_IMPLEMENTED,<url>", the plugin's
+#    "<error>,<url>" form) through step 88, and each loadUrl / loadHtml /
+#    postUrl sends HandleLoadFailed again, so nothing waits for a page.
+#  - executeJavaScript answers its Consumer with "", canGoBack/Forward with
+#    false (a JNIBridge proxy through the proxy path); destroy releases the
+#    SurfaceTexture; every other instance call is a no-op (getNativeWebView
+#    null). Logged once.
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the 3D WebView answers 'unavailable' (step 89)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if "metavision: UnityPlayer.UnitySendMessage (step 88)" not in s:
+    sys.exit(f"overlay: step 89 needs step 88 in {p}")
+B = "com/vuplex/webview/WebView"
+D = "com/vuplex/webview/WebView3D"
+S, C, BC = "Ljava/lang/String;", "Lcom/vuplex/webview/Consumer;", "Lcom/vuplex/webview/BiConsumer;"
+noop = [
+    # statics
+    "clearAllData()V", f"deleteCookies({S}{S})V", "flushCookies()V",
+    f"globallySetUserAgent({S})V", "globallySetUserAgent(Z)V",
+    "pauseAll()V", "resumeAll()V", "pauseTimers()V", "resumeTimers()V",
+    "setAlternativeKeyboardInputSystemEnabled(Z)V", "setAlternativePointerInputSystemEnabled(Z)V",
+    "setAutoplayEnabled(Z)V", "setCameraAndMicrophoneEnabled(Z)V", "setCameraEnabled(Z)V",
+    f"setCookie({S})V", "setDrmEnabled(Z)V", "setGeolocationEnabled(Z)V",
+    "setIgnoreCertificateErrors(Z)V", "setMicrophoneEnabled(Z)V", "setMidiSysexEnabled(Z)V",
+    "setNativeParentView(Landroid/view/ViewGroup;)V", "setRemoteDebuggingEnabled(Z)V",
+    "setStorageEnabled(Z)V", "setForceDrawEnabled(Z)V",
+    # instance
+    "bringToFront()V", "clearFindMatches()V", "clearHistory()V", "click(IIZ)V",
+    f"captureScreenshot({C})V", f"getRawTextureData({C})V", f"createPdf({C})V",
+    f"find({S}Z)V", "flingScroll(FF)V", "goBack()V", "goForward()V",
+    f"handleBridgeMessage({S})V", "movePointer(IIZ)V", "pause()V", "resume()V",
+    "pointerDown(IIIIZ)V", "pointerUp(IIII)V", "reload()V", "resize(II)V",
+    "scroll(II)V", "scroll(IIII)V", f"sendKey({S})V",
+    f"setAuthRequestedHandler({BC})V", f"setClientCertificateRequestedHandler({C})V",
+    "setConsoleMessageEventsEnabled(Z)V", "setDeepLinkingEnabled(Z)V",
+    "setDefaultBackgroundEnabled(Z)V", "setDownloadsEnabled(Z)V",
+    f"setFileSelectionHandler({C})V", "setFocused(Z)V", "setFocusedInputFieldEventsEnabled(Z)V",
+    "setForceDark(I)V", "setFullscreenEnabled(Z)V", "setInitialScale(F)V",
+    "setMediaPlaybackRequiresUserGesture(Z)V", "setMixedContentMode(I)V",
+    "setNativeFileSelectionEnabled(Z)V", "setNativeJavaScriptDialogsEnabled(Z)V",
+    "setNativeOnScreenKeyboardEnabled(Z)V", "setNativeZoomEnabled(Z)V", "setPopupMode(I)V",
+    "setRect(IIII)V", "setRenderingEnabled(Z)V", f"setScriptAlertHandler({BC})V",
+    f"setScriptConfirmHandler({BC})V", "setScrollbarsEnabled(Z)V", "setTextZoom(I)V",
+    f"setUserAgent({S})V", "setUserAgent(Z)V", "setVisible(Z)V", "stopLoad()V",
+    "zoomBy(F)V", "zoomIn()V", "zoomOut()V", "render()V",
+    f"setOnAfterDrawCallback({C})V", "setSurface(Landroid/view/Surface;)V",
+]
+special = [
+    ("isWebViewAvailable()Z", "mv_vw_false"),
+    (f"getCookies({S}{S}){S}", "mv_vw_empty_string"),
+    ("getNativeWebView()Landroid/webkit/WebView;", "mv_vw_noop"),
+    (f"executeJavaScript({S}{C})V", "mv_vw_executeJavaScript"),
+    (f"canGoBack({C})V", "mv_vw_answer_false"),
+    (f"canGoForward({C})V", "mv_vw_answer_false"),
+    (f"loadUrl({S})V", "mv_vw_load_url"),
+    (f"loadUrl({S}Ljava/util/Map;)V", "mv_vw_load_url"),
+    (f"postUrl({S}[B)V", "mv_vw_load_url"),
+    (f"loadHtml({S})V", "mv_vw_load_html"),
+    (f"loadHtml({S}{S})V", "mv_vw_load_html"),
+    ("destroy()V", "mv_vw_destroy"),
+]
+rows = "    // " + marker + "\n"
+rows += f'    {{MV_VW_3D, "<init>", "({S}IIIZZ{BC}Landroid/os/Message;)V", mv_vw_init_3d}},\n'
+rows += f'    {{MV_VW_3D, "<init>", "({S}IIIZZZ{BC}Landroid/os/Message;)V", mv_vw_init_3d}},\n'
+rows += f'    {{MV_VW_BASE, "<init>", "({S}IIII{BC}Landroid/os/Message;)V", mv_vw_init_2d}},\n'
+for cls in ("MV_VW_BASE", "MV_VW_3D"):
+    for m, fn in [(m, "mv_vw_noop") for m in noop] + special:
+        name, sig = m.split("(", 1)
+        rows += f'    {{{cls}, "{name}", "({sig}", {fn}}},\n'
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_net[] = {\n", "// " + marker + "\n" + r'''#define MV_VW_BASE     "com/vuplex/webview/WebView"
+#define MV_VW_3D       "com/vuplex/webview/WebView3D"
+#define MV_VW_CONSUMER "com/vuplex/webview/Consumer"
+#define MV_VW_ERROR    "net::ERR_NOT_IMPLEMENTED"
+
+typedef struct mv_vw {
+    char     go[192];             // the C# GameObject: UnitySendMessage's target
+    void    *st;                  // SurfaceTexture over the guest's texture, or NULL
+    int      destroyed;
+} mv_vw;
+
+static void mv_vw_unavailable(void) {
+    KLJ_LOG_ONCE("3D WebView: no web content on this host — views report initialised, "
+                 "then a failed load (" MV_VW_ERROR "); isWebViewAvailable() is false");
+}
+
+static mv_vw *mv_vw_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    if (!o || !o->data) return NULL;
+    if (strcmp(o->cls, MV_VW_3D) != 0 && strcmp(o->cls, MV_VW_BASE) != 0) return NULL;
+    return o->data;
+}
+
+static void mv_vw_load_failed(mv_vw *v, const char *url) {
+    if (!v || v->destroyed) return;
+    char msg[1024];
+    snprintf(msg, sizeof msg, MV_VW_ERROR ",%s", url && *url ? url : "about:blank");
+    mv_usm_send(NULL, NULL, NULL, v->go, "HandleLoadFailed", msg);
+}
+
+static klj_val mv_vw_new(const char *cls, const klj_val *a, int n, int textured) {
+    mv_vw_unavailable();
+    mv_vw *v = calloc(1, sizeof *v);
+    if (!v) return (klj_val){0};
+    const char *go = n > 0 && a[0].l ? klj_str(a[0].l) : NULL;
+    snprintf(v->go, sizeof v->go, "%s", go ? go : "");
+    // WebView3D(gameObject, texture, width, height, vulkan, ...): a GL texture
+    // gets a SurfaceTexture, as the plugin's own GL path makes one.
+    uint32_t tex = n > 1 ? (uint32_t)a[1].j : 0;
+    int vulkan = n > 4 && (a[4].j & 0xff) != 0;
+    if (textured && tex && !vulkan) {
+        klj_val t = { .j = tex };
+        v->st = klj_call_binding(klj_class_object("android/graphics/SurfaceTexture"),
+                                 "<init>", "(I)V", &t, 1).l;
+        if (v->st && n > 3) {
+            klj_val wh[2] = { { .j = (uint32_t)a[2].j }, { .j = (uint32_t)a[3].j } };
+            klj_call_binding(v->st, "setDefaultBufferSize", "(II)V", wh, 2);
+        }
+    }
+    void *obj = klj_new_object_data(cls, v);
+    kl_jni_pin_object(obj);       // C# keeps it across frames, as a global ref
+    KLJ_LOG("new %s(\"%s\")%s -> %p: no web content, init finished + load failed sent",
+            cls, v->go, v->st ? " with a SurfaceTexture" : "", obj);
+    mv_usm_send(NULL, NULL, NULL, v->go, "HandleInitFinished", "");
+    mv_vw_load_failed(v, NULL);
+    return (klj_val){.l = obj};
+}
+static klj_val mv_vw_init_3d(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return mv_vw_new(MV_VW_3D, a, n, 1);
+}
+static klj_val mv_vw_init_2d(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return mv_vw_new(MV_VW_BASE, a, n, 0);
+}
+
+static klj_val mv_vw_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+static klj_val mv_vw_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    mv_vw_unavailable();
+    return (klj_val){.j = 0};
+}
+static klj_val mv_vw_empty_string(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("")};
+}
+
+// Consumer.accept(value): a JNIBridge proxy (C#) through the proxy path, any
+// other object through its class's binding.
+static void mv_vw_answer(void *consumer, void *value) {
+    klj_object *co = klj_as_object(consumer);
+    if (!co) return;
+    if (strcmp(co->cls, KLJ_CLASS_PROXY) == 0) {
+        void *args = klj_new_array('L', "java/lang/Object", 1);
+        ((void **)klj_arr(args)->data)[0] = value;
+        klj_proxy_invoke(consumer, MV_VW_CONSUMER, "accept", "(Ljava/lang/Object;)V", args);
+    } else {
+        klj_val v = { .l = value };
+        klj_call_binding(consumer, "accept", "(Ljava/lang/Object;)V", &v, 1);
+    }
+}
+static klj_val mv_vw_executeJavaScript(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n > 1 && a[1].l) mv_vw_answer(a[1].l, kl_jni_new_string(""));
+    return (klj_val){0};
+}
+static klj_val mv_vw_answer_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    if (n < 1 || !a[0].l) return (klj_val){0};
+    klj_val no = { .j = 0 };
+    void *b = klj_call_binding(klj_class_object("java/lang/Boolean"), "<init>", "(Z)V", &no, 1).l;
+    mv_vw_answer(a[0].l, b);
+    return (klj_val){0};
+}
+
+static klj_val mv_vw_load_url(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    mv_vw_load_failed(mv_vw_of(self), n > 0 && a[0].l ? klj_str(a[0].l) : NULL);
+    return (klj_val){0};
+}
+static klj_val mv_vw_load_html(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    mv_vw_load_failed(mv_vw_of(self), n > 1 && a[1].l ? klj_str(a[1].l) : NULL);
+    return (klj_val){0};
+}
+static klj_val mv_vw_destroy(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    mv_vw *v = mv_vw_of(self);
+    if (!v || v->destroyed) return (klj_val){0};
+    v->destroyed = 1;
+    if (v->st) klj_call_binding(v->st, "release", "()V", NULL, 0);
+    return (klj_val){0};
+}
+
+''' + "const klj_binding klj_bind_net[] = {\n" + rows)
+    open(p, "w").write(s)
+print("overlay: the 3D WebView answers 'no web content' and tells C# so")
+PYEOF
