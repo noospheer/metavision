@@ -17384,3 +17384,2529 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: close/open/restart exclude writes; 16 OpenSL players, a full table refuses")
 PYEOF
+
+# 160 — the Realtime Database's Java side, as runtime/jni/kl_jni_database.c. A
+# Unity title using Firebase Realtime Database runs the Firebase C++ SDK, which
+# on Android drives the Java SDK over JNI: FirebaseDatabase.getInstance(app[,
+# url]), DatabaseReference (child / push / setValue / updateChildren /
+# removeValue / setPriority / onDisconnect / runTransaction), Query (orderBy* /
+# startAt / endAt / equalTo / limitTo* and the listener calls), DataSnapshot,
+# MutableData, DatabaseError; writes answer a gms Task watched through
+# JniResultCallback; listeners are the SDK's CppValueEventListener /
+# CppChildEventListener with the natives it registered, a transaction its
+# CppTransactionHandler. None of it had a host implementation. The file is that
+# Java on the Realtime Database REST API (<database URL>/<path>.json): GET with
+# the query's orderBy/startAt/endAt/limit where the server can apply them, the
+# answer ordered, ranged and limited here as the Android SDK orders a query
+# (an unindexed query is read whole and filtered here, as on Android); PUT /
+# PATCH / DELETE for the writes (ServerValue.TIMESTAMP crosses as the
+# {".sv": "timestamp"} map the REST API resolves); push ids in the Android
+# format; a transaction reads with its ETag and writes if-match, retrying a
+# conflict as the SDK does. Value listeners get the value once and again after
+# this client's writes change what they watch; child listeners get added /
+# changed / moved / removed. No live stream: the REST EventSource endpoint
+# needs a streaming request the host's facility does not offer, so other
+# clients' changes arrive with the next read. onDisconnect operations are
+# acknowledged and never run (a REST client holds no connection to lose). The
+# URL is getInstance's, else the app's FirebaseOptions (step 74, the title's
+# firebase_database_url resource string); no token is sent. Failures complete
+# as Android reports them: onCancelled with a DatabaseError (DISCONNECTED
+# without a response, PERMISSION_DENIED for 401/403, UNAVAILABLE for 5xx, else
+# OPERATION_FAILED), a write's Task with a DatabaseException, a transaction's
+# onComplete with the error — never a crash. Requests go through
+# mv_net_fetch_headers (step 162) over mv_net_fetch (step 147).
+python3 - "$K/runtime/jni/kl_jni_database.c" <<'PYEOF'
+import os, sys
+p = sys.argv[1]
+src = r'''// metavision: Realtime Database's Java side (step 160)
+//
+// A Unity title using Firebase Realtime Database runs the Firebase C++ SDK,
+// which on Android is a thin layer over the Java SDK: FirebaseDatabase.
+// getInstance(app[, url]), DatabaseReference (child / push / setValue /
+// updateChildren / removeValue / setPriority / onDisconnect / runTransaction),
+// Query (orderBy* / startAt / endAt / equalTo / limitTo* and the listener
+// calls), DataSnapshot, MutableData and DatabaseError. Writes answer a gms
+// Task the SDK watches through JniResultCallback (nativeOnResult); listeners
+// are the SDK's own CppValueEventListener / CppChildEventListener with the
+// natives it registered (nativeOnDataChange, nativeOnCancelled,
+// nativeOnChildAdded/Changed/Moved/Removed); a transaction is its
+// CppTransactionHandler (nativeDoTransaction, nativeOnComplete). Values cross
+// as the plain Java objects the SDK unboxes into a Variant (String, Long,
+// Double, Boolean, Map, List), and ServerValue.TIMESTAMP arrives as the map
+// {".sv": "timestamp"} the REST API resolves itself.
+//
+// None of that Java exists here, so this file is it, on the Realtime Database
+// REST API (<database URL>/<path>.json):
+//  - reads are GET, with orderBy / startAt / endAt / equalTo / limitToFirst /
+//    limitToLast where the server can apply them; the answer is then ordered,
+//    ranged and limited here exactly as the Android SDK orders a query's
+//    children (the REST answer is an unordered object), and a server without
+//    the index the query needs ("Index not defined") is read whole and
+//    filtered here, as the Android SDK does for an unindexed query;
+//  - setValue is PUT, updateChildren PATCH (multi-path keys included),
+//    removeValue DELETE, setPriority PUT of .priority, push() a client push id
+//    in the Android SDK's format;
+//  - a transaction reads the location with its ETag and writes with if-match,
+//    retrying on a conflict (412) as the SDK retries (25 times);
+//  - value listeners get the location's value once, and again after this
+//    client's own writes touch what they watch, when it changed; child
+//    listeners get onChildAdded for each child in order, then added / changed
+//    / moved / removed as later reads differ. There is no live stream: the
+//    REST API's EventSource endpoint needs a streaming request, which the
+//    host's request facility does not offer, so changes made by other clients
+//    arrive with the next read (a new listener, or a write of this client);
+//  - onDisconnect operations are acknowledged and never run: a REST client
+//    holds no connection whose loss could trigger them;
+//  - keepSynced, setPersistenceEnabled, purgeOutstandingWrites and the log
+//    level are accepted and change nothing; goOffline makes every request fail
+//    as DISCONNECTED until goOnline.
+// The database URL is the one getInstance was given, else the app's
+// FirebaseOptions (step 74: the title's firebase_database_url resource
+// string). No auth token is sent, so access is what the database's rules give
+// an unauthenticated client. Every failure completes as Android would report
+// it: a listener's onCancelled with a DatabaseError (DISCONNECTED without a
+// response, PERMISSION_DENIED for 401/403, UNAVAILABLE for 5xx, otherwise
+// OPERATION_FAILED with the server's message), a write's Task with a
+// DatabaseException, a transaction's onComplete with the error — never a
+// crash. Outcomes reach the guest on the UI drain (step 78), the main thread
+// of the Android SDK's callbacks.
+//
+// The gms Task and JniResultCallback classes are shared with step 145's
+// Firestore file: this table is walked first, answers for the tasks this file
+// made and hands every other one to the Firestore table.
+//
+// Lifetimes: a host object that keeps another holds it (klj_hold) and lets go
+// when it is itself retired (step 146's walk, which step 161 extends here). Values, keys,
+// paths and the database URL are never logged.
+
+#if defined(__linux__)
+#define _GNU_SOURCE   // strndup (syntax checks off the target)
+#endif
+#include <errno.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <time.h>
+#include "kl_jni.h"
+#include "kl_env.h"
+#include "kl_jni_int.h"
+
+void kl_jni_throw(const char *cls);                          // kl_jni.c
+void kl_mv_ui_later(void (*fn)(void *), void *arg);          // step 78
+void  klj_hold(void *obj);                                   // step 146
+void  klj_release(void *obj);
+void  klj_release_locked(void *obj);
+void *mv_hashmap_new(void);                                  // step 146
+int   mv_is_hashmap(void *obj);
+void  mv_hashmap_put(void *map, void *k, void *v);
+int   mv_hashmap_at(void *map, unsigned i, void **k, void **v);
+
+// The app layer's HTTP request (step 147; step 145 carries the weak default
+// that fails every request as offline). `done` runs once, on any thread.
+typedef void (*mv_net_done_fn)(void *ctx, int status, const char *body, long len, const char *err);
+void mv_net_fetch(const char *method, const char *url, const char *headers,
+                  const char *body, long body_len, double timeout_s,
+                  mv_net_done_fn done, void *ctx);
+// ...and the same request answering the response headers too ("Name: value"
+// lines), which a transaction's ETag needs (step 162). Without it the request
+// goes through mv_net_fetch with no headers, and a transaction writes without
+// a precondition.
+typedef void (*mv_net_hdone_fn)(void *ctx, int status, const char *body, long len,
+                                const char *err, const char *headers);
+typedef struct { mv_net_hdone_fn done; void *ctx; } db_hshim;
+static void db_hshim_done(void *ctx, int status, const char *body, long len, const char *err) {
+    db_hshim *h = ctx;
+    mv_net_hdone_fn done = h->done;
+    void *c = h->ctx;
+    free(h);
+    done(c, status, body, len, err, NULL);
+}
+__attribute__((weak))
+void mv_net_fetch_headers(const char *method, const char *url, const char *headers,
+                          const char *body, long body_len, double timeout_s,
+                          mv_net_hdone_fn done, void *ctx) {
+    db_hshim *h = malloc(sizeof *h);
+    h->done = done;
+    h->ctx = ctx;
+    mv_net_fetch(method, url, headers, body, body_len, timeout_s, db_hshim_done, h);
+}
+
+#define DB_PKG   "com/google/firebase/database/"
+#define C_DB     DB_PKG "FirebaseDatabase"
+#define C_REF    DB_PKG "DatabaseReference"
+#define C_Q      DB_PKG "Query"
+#define C_SNAP   DB_PKG "DataSnapshot"
+#define C_ERR    DB_PKG "DatabaseError"
+#define C_EXC    DB_PKG "DatabaseException"
+#define C_MD     DB_PKG "MutableData"
+#define C_OD     DB_PKG "OnDisconnect"
+#define C_LVL    DB_PKG "Logger$Level"
+#define C_CPP    DB_PKG "internal/cpp/"
+#define C_VL     C_CPP "CppValueEventListener"
+#define C_CL     C_CPP "CppChildEventListener"
+#define C_EL     C_CPP "CppEventListener"
+#define C_TH     C_CPP "CppTransactionHandler"
+#define C_APP    "com/google/firebase/FirebaseApp"
+#define C_TASK   "com/google/android/gms/tasks/Task"
+#define C_CB     "com/google/firebase/app/internal/cpp/JniResultCallback"
+#define C_LIST   "java/util/ArrayList"
+#define C_DOUBLE "java/lang/Double"
+#define SIG_TASK "Lcom/google/android/gms/tasks/Task;"
+#define SIG_SNAP "Lcom/google/firebase/database/DataSnapshot;"
+#define SIG_ERR  "Lcom/google/firebase/database/DatabaseError;"
+
+// DatabaseError's codes, as the Android SDK defines them.
+enum { DE_DATA_STALE = -1, DE_OPERATION_FAILED = -2, DE_PERMISSION_DENIED = -3,
+       DE_DISCONNECTED = -4, DE_EXPIRED_TOKEN = -6, DE_INVALID_TOKEN = -7,
+       DE_MAX_RETRIES = -8, DE_OVERRIDDEN_BY_SET = -9, DE_UNAVAILABLE = -10,
+       DE_USER_CODE_EXCEPTION = -11, DE_NETWORK_ERROR = -24, DE_WRITE_CANCELED = -25,
+       DE_UNKNOWN_ERROR = -999 };
+static const struct { const char *name; int code; const char *msg; } db_codes[] = {
+    {"DATA_STALE", DE_DATA_STALE, "The transaction needs to be run again with current data"},
+    {"OPERATION_FAILED", DE_OPERATION_FAILED, "The server indicated that this operation failed"},
+    {"PERMISSION_DENIED", DE_PERMISSION_DENIED, "This client does not have permission to perform this operation"},
+    {"DISCONNECTED", DE_DISCONNECTED, "The operation had to be aborted due to a network disconnect"},
+    {"EXPIRED_TOKEN", DE_EXPIRED_TOKEN, "The supplied auth token has expired"},
+    {"INVALID_TOKEN", DE_INVALID_TOKEN, "The supplied auth token was invalid"},
+    {"MAX_RETRIES", DE_MAX_RETRIES, "The transaction had too many retries"},
+    {"OVERRIDDEN_BY_SET", DE_OVERRIDDEN_BY_SET, "The transaction was overridden by a subsequent set"},
+    {"UNAVAILABLE", DE_UNAVAILABLE, "The service is unavailable"},
+    {"USER_CODE_EXCEPTION", DE_USER_CODE_EXCEPTION, "User code called from the Firebase Database runloop threw an exception:\n"},
+    {"NETWORK_ERROR", DE_NETWORK_ERROR, "The operation could not be performed due to a network error"},
+    {"WRITE_CANCELED", DE_WRITE_CANCELED, "The write was canceled by the user."},
+    {"UNKNOWN_ERROR", DE_UNKNOWN_ERROR, "An unknown error occurred"},
+    {NULL, 0, NULL},
+};
+static const char *db_code_msg(int code) {
+    for (int i = 0; db_codes[i].name; i++) if (db_codes[i].code == code) return db_codes[i].msg;
+    return "An unknown error occurred";
+}
+#define DB_MAX_TX_RETRIES 25   // the Android SDK's TRANSACTION_MAX_RETRIES
+
+// ------------------------------------------------------------- small pieces
+typedef struct { char *p; size_t n, cap; } sb;
+static void sb_put(sb *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t c = b->cap ? b->cap : 256;
+        while (c < b->n + n + 1) c *= 2;
+        b->p = realloc(b->p, c);
+        b->cap = c;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+static void sb_add(sb *b, const char *s) { sb_put(b, s, strlen(s)); }
+static void sb_addf(sb *b, const char *fmt, ...) {
+    char t[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(t, sizeof t, fmt, ap);
+    va_end(ap);
+    if (k < 0) return;
+    if ((size_t)k < sizeof t) { sb_put(b, t, (size_t)k); return; }
+    char *h = malloc((size_t)k + 1);
+    va_start(ap, fmt);
+    vsnprintf(h, (size_t)k + 1, fmt, ap);
+    va_end(ap);
+    sb_put(b, h, (size_t)k);
+    free(h);
+}
+static void sb_jstr(sb *b, const char *s) {
+    sb_put(b, "\"", 1);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if (*p == '"' || *p == '\\') { char e[2] = {'\\', (char)*p}; sb_put(b, e, 2); }
+        else if (*p < 0x20) sb_addf(b, "\\u%04x", *p);
+        else sb_put(b, (const char *)p, 1);
+    }
+    sb_put(b, "\"", 1);
+}
+static char *sb_take(sb *b) {
+    char *r = b->p ? b->p : strdup("");
+    b->p = NULL; b->n = b->cap = 0;
+    return r;
+}
+static char *db_strdup(const char *s) { return s ? strdup(s) : NULL; }
+// Percent-encoding: everything but the unreserved characters (and '/', when a path).
+static void sb_pct(sb *b, const char *s, int keep_slash) {
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == '-' || *p == '.' || *p == '_' || *p == '~' || (keep_slash && *p == '/'))
+            sb_put(b, (const char *)p, 1);
+        else
+            sb_addf(b, "%%%02X", *p);
+    }
+}
+
+// ------------------------------------------------------------- JSON
+typedef struct jv { char t; char *s; double n; int len; struct jv **v; char **k; } jv;
+// t: 'o' object, 'a' array, 's' string, 'n' number (s holds its text), 'b' bool, 'z' null
+static jv *jnew(char t) { jv *v = calloc(1, sizeof *v); v->t = t; return v; }
+static void jfree(jv *v) {
+    if (!v) return;
+    for (int i = 0; i < v->len; i++) { jfree(v->v[i]); if (v->k) free(v->k[i]); }
+    free(v->v); free(v->k); free(v->s); free(v);
+}
+static void jws(const char **p) { while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++; }
+static int jhex4(const char **p, unsigned *out) {
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = (*p)[i];
+        if (c >= '0' && c <= '9') v = v * 16 + (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') v = v * 16 + (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v = v * 16 + (unsigned)(c - 'A' + 10);
+        else return 0;
+    }
+    *p += 4; *out = v;
+    return 1;
+}
+static void jutf8(sb *b, unsigned cp) {
+    char t[4]; size_t n;
+    if (cp < 0x80) { t[0] = (char)cp; n = 1; }
+    else if (cp < 0x800) { t[0] = (char)(0xC0 | cp >> 6); t[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) { t[0] = (char)(0xE0 | cp >> 12); t[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); t[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
+    else { t[0] = (char)(0xF0 | cp >> 18); t[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); t[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); t[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
+    sb_put(b, t, n);
+}
+static char *jparse_str(const char **p) {
+    if (**p != '"') return NULL;
+    (*p)++;
+    sb b = {0};
+    sb_put(&b, "", 0);
+    while (**p && **p != '"') {
+        char c = *(*p)++;
+        if (c != '\\') { sb_put(&b, &c, 1); continue; }
+        char e = *(*p)++;
+        unsigned cp;
+        switch (e) {
+        case 'n': sb_put(&b, "\n", 1); break;
+        case 't': sb_put(&b, "\t", 1); break;
+        case 'r': sb_put(&b, "\r", 1); break;
+        case 'b': sb_put(&b, "\b", 1); break;
+        case 'f': sb_put(&b, "\f", 1); break;
+        case 'u':
+            if (!jhex4(p, &cp)) { free(b.p); return NULL; }
+            if (cp >= 0xD800 && cp < 0xDC00 && (*p)[0] == '\\' && (*p)[1] == 'u') {
+                const char *q = *p + 2;
+                unsigned lo;
+                if (jhex4(&q, &lo) && lo >= 0xDC00 && lo < 0xE000) {
+                    *p = q;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+            }
+            jutf8(&b, cp);
+            break;
+        case 0: free(b.p); return NULL;
+        default: sb_put(&b, &e, 1); break;
+        }
+    }
+    if (**p != '"') { free(b.p); return NULL; }
+    (*p)++;
+    return sb_take(&b);
+}
+static jv *jparse(const char **p, int depth) {
+    if (depth > 100) return NULL;
+    jws(p);
+    char c = **p;
+    if (c == '{' || c == '[') {
+        char close = c == '{' ? '}' : ']';
+        jv *v = jnew(c == '{' ? 'o' : 'a');
+        (*p)++;
+        jws(p);
+        if (**p == close) { (*p)++; return v; }
+        for (;;) {
+            char *key = NULL;
+            if (c == '{') {
+                jws(p);
+                key = jparse_str(p);
+                jws(p);
+                if (!key || **p != ':') { free(key); jfree(v); return NULL; }
+                (*p)++;
+            }
+            jv *e = jparse(p, depth + 1);
+            if (!e) { free(key); jfree(v); return NULL; }
+            v->v = realloc(v->v, (size_t)(v->len + 1) * sizeof *v->v);
+            v->v[v->len] = e;
+            if (c == '{') {
+                v->k = realloc(v->k, (size_t)(v->len + 1) * sizeof *v->k);
+                v->k[v->len] = key;
+            }
+            v->len++;
+            jws(p);
+            if (**p == ',') { (*p)++; continue; }
+            if (**p == close) { (*p)++; return v; }
+            jfree(v);
+            return NULL;
+        }
+    }
+    if (c == '"') {
+        char *s = jparse_str(p);
+        if (!s) return NULL;
+        jv *v = jnew('s');
+        v->s = s;
+        return v;
+    }
+    if (!strncmp(*p, "true", 4))  { *p += 4; jv *v = jnew('b'); v->n = 1; return v; }
+    if (!strncmp(*p, "false", 5)) { *p += 5; return jnew('b'); }
+    if (!strncmp(*p, "null", 4))  { *p += 4; return jnew('z'); }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        char *end;
+        double d = strtod(*p, &end);
+        if (end == *p) return NULL;
+        jv *v = jnew('n');
+        v->n = d;
+        v->s = strndup(*p, (size_t)(end - *p));
+        *p = end;
+        return v;
+    }
+    return NULL;
+}
+// The whole text, or NULL (with *bad set) when it is not one JSON value.
+static jv *jparse_all(const char *text, int *bad) {
+    *bad = 0;
+    if (!text) { *bad = 1; return NULL; }
+    const char *p = text;
+    jv *v = jparse(&p, 0);
+    if (v) { jws(&p); if (*p) { jfree(v); v = NULL; } }
+    if (!v) *bad = 1;
+    return v;
+}
+static jv *jget(const jv *o, const char *k) {
+    if (!o || o->t != 'o') return NULL;
+    for (int i = 0; i < o->len; i++) if (!strcmp(o->k[i], k)) return o->v[i];
+    return NULL;
+}
+static jv *jcopy(const jv *v) {
+    if (!v) return NULL;
+    jv *c = jnew(v->t);
+    c->n = v->n;
+    c->s = db_strdup(v->s);
+    c->len = v->len;
+    if (v->len) {
+        c->v = calloc((size_t)v->len, sizeof *c->v);
+        if (v->k) c->k = calloc((size_t)v->len, sizeof *c->k);
+        for (int i = 0; i < v->len; i++) {
+            c->v[i] = jcopy(v->v[i]);
+            if (v->k) c->k[i] = strdup(v->k[i]);
+        }
+    }
+    return c;
+}
+static void jobj_remove(jv *o, int i) {
+    jfree(o->v[i]);
+    free(o->k[i]);
+    memmove(&o->v[i], &o->v[i + 1], (size_t)(o->len - i - 1) * sizeof *o->v);
+    memmove(&o->k[i], &o->k[i + 1], (size_t)(o->len - i - 1) * sizeof *o->k);
+    o->len--;
+}
+static void jobj_add(jv *o, const char *k, jv *v) {
+    o->v = realloc(o->v, (size_t)(o->len + 1) * sizeof *o->v);
+    o->k = realloc(o->k, (size_t)(o->len + 1) * sizeof *o->k);
+    o->v[o->len] = v;
+    o->k[o->len] = strdup(k);
+    o->len++;
+}
+// The database's own shape: no nulls, no empty objects, arrays as objects
+// keyed "0", "1", ... (what the server stores). Consumes v; NULL for nothing.
+static jv *jnorm(jv *v) {
+    if (!v) return NULL;
+    if (v->t == 'z') { jfree(v); return NULL; }
+    if (v->t == 'a') {
+        v->t = 'o';
+        v->k = calloc((size_t)(v->len ? v->len : 1), sizeof *v->k);
+        for (int i = 0; i < v->len; i++) { char t[16]; snprintf(t, sizeof t, "%d", i); v->k[i] = strdup(t); }
+    }
+    if (v->t == 'o') {
+        for (int i = 0; i < v->len; ) {
+            v->v[i] = jnorm(v->v[i]);
+            if (!v->v[i]) {
+                free(v->k[i]);
+                memmove(&v->v[i], &v->v[i + 1], (size_t)(v->len - i - 1) * sizeof *v->v);
+                memmove(&v->k[i], &v->k[i + 1], (size_t)(v->len - i - 1) * sizeof *v->k);
+                v->len--;
+                continue;
+            }
+            i++;
+        }
+        if (!v->len) { jfree(v); return NULL; }
+    }
+    return v;
+}
+// Canonical text: object keys in byte order, so equal values compare equal.
+static int jkey_sort_cmp(const void *a, const void *b) {
+    return strcmp(**(char *const *const *)a, **(char *const *const *)b);
+}
+static void jcanon(sb *b, const jv *v) {
+    if (!v || v->t == 'z') { sb_add(b, "null"); return; }
+    switch (v->t) {
+    case 'b': sb_add(b, v->n != 0 ? "true" : "false"); return;
+    case 'n': if (v->s) sb_add(b, v->s); else sb_addf(b, "%.17g", v->n); return;
+    case 's': sb_jstr(b, v->s); return;
+    case 'a':
+        sb_put(b, "[", 1);
+        for (int i = 0; i < v->len; i++) { if (i) sb_put(b, ",", 1); jcanon(b, v->v[i]); }
+        sb_put(b, "]", 1);
+        return;
+    case 'o': {
+        char **ks[v->len ? v->len : 1];
+        int ix[v->len ? v->len : 1];
+        for (int i = 0; i < v->len; i++) ks[i] = &v->k[i];
+        qsort(ks, (size_t)v->len, sizeof ks[0], jkey_sort_cmp);
+        for (int i = 0; i < v->len; i++) ix[i] = (int)(ks[i] - v->k);
+        sb_put(b, "{", 1);
+        for (int i = 0; i < v->len; i++) {
+            if (i) sb_put(b, ",", 1);
+            sb_jstr(b, v->k[ix[i]]);
+            sb_put(b, ":", 1);
+            jcanon(b, v->v[ix[i]]);
+        }
+        sb_put(b, "}", 1);
+        return;
+    }
+    }
+}
+static char *jtext(const jv *v) { sb b = {0}; jcanon(&b, v); return sb_take(&b); }
+
+// ------------------------------------------------------------- paths
+// A path's segments may not hold . # $ [ ] or control characters (".info" at
+// the root, and ".priority" / ".value" as a last segment, excepted).
+static int db_seg_ok(const char *s, size_t n, int first) {
+    if (!n) return 0;
+    if (first && n == 5 && !strncmp(s, ".info", 5)) return 1;
+    if ((n == 9 && !strncmp(s, ".priority", 9)) || (n == 6 && !strncmp(s, ".value", 6))) return 1;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7f || c == '.' || c == '#' || c == '$' || c == '[' || c == ']') return 0;
+    }
+    return 1;
+}
+// "a//b/" -> "a/b"; NULL when a segment is not valid.
+static char *db_norm_path(const char *in) {
+    sb b = {0};
+    sb_put(&b, "", 0);
+    int first = 1;
+    for (const char *p = in ? in : ""; *p; ) {
+        const char *e = strchr(p, '/');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n) {
+            if (!db_seg_ok(p, n, first)) { free(b.p); return NULL; }
+            if (!first) sb_put(&b, "/", 1);
+            sb_put(&b, p, n);
+            first = 0;
+        }
+        p += n;
+        if (*p == '/') p++;
+    }
+    return sb_take(&b);
+}
+static char *db_join(const char *a, const char *b) {
+    if (!a || !*a) return strdup(b ? b : "");
+    if (!b || !*b) return strdup(a);
+    size_t la = strlen(a), lb = strlen(b);
+    char *r = malloc(la + lb + 2);
+    memcpy(r, a, la); r[la] = '/'; memcpy(r + la + 1, b, lb + 1);
+    return r;
+}
+static const char *db_last(const char *path) {   // NULL at the root
+    if (!path || !*path) return NULL;
+    const char *s = strrchr(path, '/');
+    return s ? s + 1 : path;
+}
+static char *db_parent(const char *path) {   // NULL at the root
+    if (!path || !*path) return NULL;
+    const char *s = strrchr(path, '/');
+    return s ? strndup(path, (size_t)(s - path)) : strdup("");
+}
+// One path contains the other (or they are the same).
+static int db_overlap(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    if (!la || !lb) return 1;
+    size_t n = la < lb ? la : lb;
+    if (strncmp(a, b, n)) return 0;
+    return la == lb || (la < lb ? b[la] == '/' : a[lb] == '/');
+}
+// The value at a sub-path of v (not a copy), or NULL.
+static jv *db_at(jv *v, const char *path) {
+    for (const char *p = path ? path : ""; v && *p; ) {
+        const char *e = strchr(p, '/');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        jv *next = NULL;
+        for (int i = 0; v->t == 'o' && i < v->len; i++)
+            if (strlen(v->k[i]) == n && !strncmp(v->k[i], p, n)) { next = v->v[i]; break; }
+        v = next;
+        p += n;
+        if (*p == '/') p++;
+    }
+    return v;
+}
+// Replace the value at a sub-path of *root with val (consumed; NULL removes).
+static void db_put_at(jv **root, const char *path, jv *val) {
+    if (!path || !*path) { jfree(*root); *root = val; return; }
+    const char *e = strchr(path, '/');
+    size_t n = e ? (size_t)(e - path) : strlen(path);
+    char *key = strndup(path, n);
+    if (!*root || (*root)->t != 'o') {
+        if (!val) { free(key); return; }
+        jfree(*root);
+        *root = jnew('o');
+    }
+    jv *o = *root;
+    int i = 0;
+    for (; i < o->len; i++) if (!strcmp(o->k[i], key)) break;
+    if (i == o->len) {
+        if (!val) { free(key); return; }
+        jobj_add(o, key, NULL);
+    }
+    db_put_at(&o->v[i], e ? e + 1 : "", val);
+    if (!o->v[i]) { o->v[i] = jnew('z'); jobj_remove(o, i); }
+    if (!o->len) { jfree(o); *root = NULL; }
+    free(key);
+}
+
+// ------------------------------------------------------------- ordering
+// Keys: canonical 32-bit integers first, numerically; then the rest, by bytes.
+static int db_key_int(const char *k, long long *out) {
+    const char *p = k;
+    if (*p == '-') p++;
+    if (!*p || (*p == '0' && (p[1] || p != k))) { if (!strcmp(k, "0")) { *out = 0; return 1; } return 0; }
+    long long v = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        v = v * 10 + (*p - '0');
+        if (v > 2147483648LL) return 0;
+    }
+    if (k[0] == '-') v = -v;
+    if (v > 2147483647LL || v < -2147483648LL) return 0;
+    *out = v;
+    return 1;
+}
+static int db_keycmp(const char *a, const char *b) {
+    long long x, y;
+    int ia = db_key_int(a, &x), ib = db_key_int(b, &y);
+    if (ia && ib) return x < y ? -1 : x > y ? 1 : (int)strlen(a) - (int)strlen(b);
+    if (ia) return -1;
+    if (ib) return 1;
+    return strcmp(a, b);
+}
+// Values: null < false < true < numbers < strings < objects.
+static int db_rank(const jv *v) {
+    if (!v || v->t == 'z') return 0;
+    if (v->t == 'b') return v->n != 0 ? 2 : 1;
+    if (v->t == 'n') return 3;
+    if (v->t == 's') return 4;
+    return 5;
+}
+static int db_valcmp(const jv *a, const jv *b) {
+    int ra = db_rank(a), rb = db_rank(b);
+    if (ra != rb) return ra < rb ? -1 : 1;
+    if (ra == 3) return a->n < b->n ? -1 : a->n > b->n ? 1 : 0;
+    if (ra == 4) return strcmp(a->s, b->s);
+    return 0;
+}
+
+enum { Q_DEFAULT, Q_KEY, Q_VALUE, Q_CHILD, Q_PRIORITY };
+typedef struct {        // a query's parameters, copied and refined by each call
+    int   order;
+    char *child;        // Q_CHILD: the child path
+    int   has_start, has_end;
+    char *start, *end;  // the bounds as JSON
+    char *start_key, *end_key;   // the key tie-breakers, or NULL
+    int   limit, last;  // limitToFirst / limitToLast (0: none)
+} db_q;
+static void db_q_free(db_q *q) {
+    free(q->child); free(q->start); free(q->end); free(q->start_key); free(q->end_key);
+    memset(q, 0, sizeof *q);
+}
+static void db_q_copy(db_q *d, const db_q *s) {
+    *d = *s;
+    d->child = db_strdup(s->child);
+    d->start = db_strdup(s->start); d->end = db_strdup(s->end);
+    d->start_key = db_strdup(s->start_key); d->end_key = db_strdup(s->end_key);
+}
+static int db_q_filters(const db_q *q) { return q->has_start || q->has_end || q->limit; }
+static void db_q_canon(sb *b, const db_q *q) {   // equal queries, equal text
+    sb_addf(b, "%d|%s|%d:%s:%s|%d:%s:%s|%d:%d", q->order, q->child ? q->child : "",
+            q->has_start, q->start ? q->start : "", q->start_key ? q->start_key : "",
+            q->has_end, q->end ? q->end : "", q->end_key ? q->end_key : "", q->limit, q->last);
+}
+
+typedef struct { const char *key; jv *v; const jv *sort; } db_ent;
+static int db_entcmp(const db_ent *a, const db_ent *b, int order) {
+    if (order == Q_VALUE || order == Q_CHILD) {
+        int c = db_valcmp(a->sort, b->sort);
+        if (c) return c;
+    }
+    return db_keycmp(a->key, b->key);
+}
+static void db_sort(db_ent *e, int n, int order) {   // a stable merge sort
+    if (n < 2) return;
+    db_ent *t = malloc((size_t)n * sizeof *t);
+    for (int w = 1; w < n; w *= 2) {
+        for (int lo = 0; lo < n; lo += 2 * w) {
+            int mid = lo + w < n ? lo + w : n, hi = lo + 2 * w < n ? lo + 2 * w : n;
+            int i = lo, j = mid, k = lo;
+            while (i < mid && j < hi) t[k++] = db_entcmp(&e[j], &e[i], order) < 0 ? e[j++] : e[i++];
+            while (i < mid) t[k++] = e[i++];
+            while (j < hi) t[k++] = e[j++];
+        }
+        memcpy(e, t, (size_t)n * sizeof *t);
+    }
+    free(t);
+}
+// The children of v in the query's order (entries point into v).
+static db_ent *db_children(jv *v, const db_q *q, int *count) {
+    *count = 0;
+    if (!v || v->t != 'o' || !v->len) return NULL;
+    db_ent *e = calloc((size_t)v->len, sizeof *e);
+    int order = q ? q->order : Q_DEFAULT;
+    for (int i = 0; i < v->len; i++) {
+        e[i].key = v->k[i];
+        e[i].v = v->v[i];
+        e[i].sort = order == Q_VALUE ? v->v[i] : order == Q_CHILD ? db_at(v->v[i], q->child) : NULL;
+    }
+    db_sort(e, v->len, order);
+    *count = v->len;
+    return e;
+}
+// A child against a bound: <0 before it, 0 at it, >0 after it.
+static int db_vs_bound(const db_ent *e, int order, const jv *bound, const char *bkey, int is_start) {
+    if (order == Q_KEY) {
+        const char *k = bound && bound->t == 's' ? bound->s : "";
+        return db_keycmp(e->key, k);
+    }
+    int c = db_valcmp(order == Q_VALUE || order == Q_CHILD ? e->sort : NULL, bound);
+    if (c) return c;
+    if (!bkey) return is_start ? 1 : -1;   // the minimum / maximum key
+    return db_keycmp(e->key, bkey);
+}
+// The location's value as the query sees it: ranged and limited (a copy).
+static jv *db_apply_query(const jv *v, const db_q *q) {
+    if (!v) return NULL;
+    if (!q || !db_q_filters(q)) return jcopy(v);
+    if (v->t != 'o') return NULL;   // a leaf has no children to keep
+    int n, bad;
+    db_ent *e = db_children((jv *)v, q, &n);
+    jv *start = q->has_start ? jparse_all(q->start, &bad) : NULL;
+    jv *end = q->has_end ? jparse_all(q->end, &bad) : NULL;
+    int *keep = calloc((size_t)(n ? n : 1), sizeof *keep);
+    int kept = 0;
+    for (int i = 0; i < n; i++) {
+        if (q->has_start && db_vs_bound(&e[i], q->order, start, q->start_key, 1) < 0) continue;
+        if (q->has_end && db_vs_bound(&e[i], q->order, end, q->end_key, 0) > 0) continue;
+        keep[i] = 1;
+        kept++;
+    }
+    if (q->limit && kept > q->limit) {
+        int drop = kept - q->limit;
+        if (q->last) { for (int i = 0; i < n && drop; i++) if (keep[i]) { keep[i] = 0; drop--; } }
+        else { for (int i = n - 1; i >= 0 && drop; i--) if (keep[i]) { keep[i] = 0; drop--; } }
+    }
+    jv *out = jnew('o');
+    for (int i = 0; i < n; i++) if (keep[i]) jobj_add(out, e[i].key, jcopy(e[i].v));
+    free(keep); free(e); jfree(start); jfree(end);
+    if (!out->len) { jfree(out); return NULL; }
+    return out;
+}
+
+// ------------------------------------------------------------- host objects
+enum { K_DB = 1, K_REF, K_QUERY, K_SNAP, K_ERR, K_EXC, K_TASK, K_CB, K_LISTENER, K_TXH,
+       K_MDATA, K_ONDISC, K_LEVEL, K_REG };
+
+typedef struct {
+    char *url;       // scheme://host, no trailing slash
+    char *ns;        // the URL's own query ("ns=..."), or NULL
+    void *app;
+    int   online;
+} db_info;
+
+typedef struct db_mroot { jv *root; int refs; } db_mroot;   // a transaction's data
+
+typedef struct dbo {
+    int      kind;
+    void    *db;          // the FirebaseDatabase it belongs to (pinned for ever)
+    char    *path;        // REF, QUERY, SNAP, MDATA: "" at the root, else "a/b"
+    db_q     q;           // REF, QUERY; SNAP: its children's order
+    db_info *dbi;         // DB
+    jv      *val;         // SNAP: the value (owned)
+    db_mroot *mroot;      // MDATA
+    void   **held; int nheld;
+    int64_t  a, b;        // LISTENER, TXH: the C++ database and listener / transaction.
+                          // ERR, EXC: code. CB: fn, data. LEVEL: ordinal
+    int      i, j;        // LISTENER: child listener. REG: child; removed. CB: delivered. TASK: self-held
+    char    *s;           // ERR, EXC: message. TASK: failure message. REG: last value delivered
+    void    *o1, *o2;     // TASK: result, exception. REG: listener, query
+    int      state;       // TASK: 0 pending, 1 succeeded, 2 failed, 3 cancelled
+    void   **cbs; int ncbs;   // TASK: JniResultCallbacks waiting (held)
+    char   **ck, **cv; int cn;  // REG (child): last children delivered, in order
+} dbo;
+
+static pthread_mutex_t db_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void db_mroot_unref(db_mroot *m) {
+    if (m && __atomic_sub_fetch(&m->refs, 1, __ATOMIC_ACQ_REL) == 0) { jfree(m->root); free(m); }
+}
+static void db_free_strs(char **v, int n) { for (int i = 0; i < n; i++) free(v[i]); free(v); }
+static void db_free(void *p) {   // the payload, at recycle (its holds went at retire)
+    dbo *f = p;
+    if (!f) return;
+    free(f->path);
+    db_q_free(&f->q);
+    if (f->dbi) { free(f->dbi->url); free(f->dbi->ns); free(f->dbi); }
+    jfree(f->val);
+    db_mroot_unref(f->mroot);
+    free(f->held); free(f->cbs); free(f->s);
+    db_free_strs(f->ck, f->cn); db_free_strs(f->cv, f->cn);
+    free(f);
+}
+static void db_box_free(void *p) { free(p); }
+
+// Step 146 calls this as each object is retired (g_lock held): what a host
+// object of this file held is let go.
+void mv_db_retire_locked(klj_object *o) {
+    if (!o || !o->data || o->destroy != db_free) return;
+    dbo *f = o->data;
+    for (int i = 0; i < f->nheld; i++) klj_release_locked(f->held[i]);
+    for (int i = 0; i < f->ncbs; i++) klj_release_locked(f->cbs[i]);
+    f->nheld = f->ncbs = 0;
+}
+
+static void *db_new(const char *cls, int kind, dbo **out) {
+    dbo *f = calloc(1, sizeof *f);
+    f->kind = kind;
+    void *obj = kl_jni_new_object(cls);
+    klj_object *o = klj_as_object(obj);
+    o->data = f;
+    o->destroy = db_free;
+    if (out) *out = f;
+    return obj;
+}
+static dbo *db_of(void *obj, int kind) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || o->destroy != db_free || !o->data) return NULL;
+    dbo *f = o->data;
+    return !kind || f->kind == kind ? f : NULL;
+}
+static void db_hold_in(dbo *f, void *obj) {   // f keeps obj
+    if (!obj) return;
+    klj_hold(obj);
+    pthread_mutex_lock(&db_lock);
+    f->held = realloc(f->held, (size_t)(f->nheld + 1) * sizeof *f->held);
+    f->held[f->nheld++] = obj;
+    pthread_mutex_unlock(&db_lock);
+}
+static const char *db_cls(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    return o ? o->cls : "";
+}
+static db_info *db_dbi(void *db) {
+    dbo *f = db_of(db, K_DB);
+    return f ? f->dbi : NULL;
+}
+
+// --- Java values the C++ SDK unboxes
+static void *db_box(const char *cls, char kind, int64_t v) {   // the runtime's own box shape
+    klj_pref *e = calloc(1, sizeof *e);
+    e->kind = kind;
+    e->ival = v;
+    void *obj = kl_jni_new_object(cls);
+    klj_object *o = klj_as_object(obj);
+    o->data = e;
+    o->destroy = db_box_free;
+    return obj;
+}
+static void *db_double(double d) {   // java.lang.Double as step 145 makes and reads it
+    klj_val arg = {.d = d};
+    return klj_call_binding(kl_jni_class(C_DOUBLE), "<init>", "(D)V", &arg, 1).l;
+}
+static void *db_list_new(void) {     // java.util.ArrayList as step 145 makes and walks it
+    return klj_call_binding(kl_jni_class(C_LIST), "<init>", "()V", NULL, 0).l;
+}
+static void db_list_add(void *list, void *item) {
+    klj_val arg = {.l = item};
+    klj_call_binding(list, "add", "(Ljava/lang/Object;)Z", &arg, 1);
+}
+static klj_list *db_list_of(void *obj) {   // an ArrayList / List payload
+    klj_object *o = klj_as_object(obj);
+    if (!o || !o->data) return NULL;
+    return !strcmp(o->cls, C_LIST) || !strcmp(o->cls, "java/util/List") ? o->data : NULL;
+}
+
+static int db_is_array_like(const jv *v, long long *max) {   // the Android SDK's rule
+    long long m = -1;
+    for (int i = 0; i < v->len; i++) {
+        long long k;
+        if (!db_key_int(v->k[i], &k) || k < 0) return 0;
+        if (k > m) m = k;
+    }
+    *max = m;
+    return v->len > 0 && m < 2LL * v->len;
+}
+// A value as DataSnapshot.getValue answers it.
+static void *db_to_java(const jv *v) {
+    if (!v || v->t == 'z') return NULL;
+    switch (v->t) {
+    case 'b': return db_box("java/lang/Boolean", 'Z', v->n != 0);
+    case 's': return kl_jni_new_string(v->s ? v->s : "");
+    case 'n': {
+        const char *t = v->s ? v->s : "";
+        if (*t && !strpbrk(t, ".eE")) {
+            char *end;
+            errno = 0;
+            long long x = strtoll(t, &end, 10);
+            if (!*end && errno == 0) return db_box("java/lang/Long", 'J', x);
+        }
+        return db_double(v->n);
+    }
+    case 'o': {
+        long long max;
+        if (db_is_array_like(v, &max)) {
+            void *list = db_list_new();
+            for (long long i = 0; i <= max; i++) {
+                char key[24];
+                snprintf(key, sizeof key, "%lld", i);
+                void *e = db_to_java(jget(v, key));
+                db_list_add(list, e);
+            }
+            return list;
+        }
+        void *map = mv_hashmap_new();
+        for (int i = 0; i < v->len; i++)
+            mv_hashmap_put(map, kl_jni_new_string(v->k[i]), db_to_java(v->v[i]));
+        return map;
+    }
+    case 'a': {
+        void *list = db_list_new();
+        for (int i = 0; i < v->len; i++) db_list_add(list, db_to_java(v->v[i]));
+        return list;
+    }
+    }
+    return NULL;
+}
+static jv *db_num(const char *fmt, ...) {
+    char t[64];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(t, sizeof t, fmt, ap);
+    va_end(ap);
+    jv *v = jnew('n');
+    v->s = strdup(t);
+    v->n = strtod(t, NULL);
+    return v;
+}
+// A Java value as the database stores it; *ok = 0 for one it cannot store.
+static jv *db_from_java(void *obj, int *ok, int depth) {
+    if (!obj) return NULL;
+    klj_object *o = klj_as_object(obj);
+    if (!o || depth > 32) { *ok = 0; return NULL; }
+    const char *cls = o->cls;
+    if (!strcmp(cls, KLJ_CLASS_STRING)) { jv *v = jnew('s'); v->s = strdup(o->data ? o->data : ""); return v; }
+    if (!strcmp(cls, "java/lang/Boolean")) { klj_pref *e = o->data; jv *v = jnew('b'); v->n = e && e->ival; return v; }
+    if (!strcmp(cls, "java/lang/Long") || !strcmp(cls, "java/lang/Integer") ||
+        !strcmp(cls, "java/lang/Short") || !strcmp(cls, "java/lang/Byte")) {
+        klj_pref *e = o->data;
+        return db_num("%lld", (long long)(e ? e->ival : 0));
+    }
+    if (!strcmp(cls, "java/lang/Float") || !strcmp(cls, C_DOUBLE)) {
+        double d;
+        if (!strcmp(cls, "java/lang/Float")) { klj_pref *e = o->data; d = e ? e->fval : 0; }
+        else d = klj_call_binding(obj, "doubleValue", "()D", NULL, 0).d;
+        if (isnan(d) || isinf(d)) { *ok = 0; return NULL; }
+        return db_num("%.17g", d);
+    }
+    if (mv_is_hashmap(obj)) {
+        jv *v = jnew('o');
+        void *k, *x;
+        for (unsigned i = 0; mv_hashmap_at(obj, i, &k, &x) > 0; i++) {
+            klj_object *ko = klj_as_object(k);
+            if (!ko || strcmp(ko->cls, KLJ_CLASS_STRING) || !ko->data) { *ok = 0; break; }
+            jv *c = db_from_java(x, ok, depth + 1);
+            if (!*ok) break;
+            jobj_add(v, ko->data, c ? c : jnew('z'));
+        }
+        if (!*ok) { jfree(v); return NULL; }
+        return v;
+    }
+    klj_list *l = db_list_of(obj);
+    klj_array *arr = !l && cls[0] == '[' && cls[1] == 'L' ? o->data : NULL;
+    if (l || arr) {
+        int n = l ? l->count : arr->len;
+        jv *v = jnew('a');
+        for (int i = 0; i < n && *ok; i++) {
+            jv *c = db_from_java(l ? l->items[i] : ((void **)arr->data)[i], ok, depth + 1);
+            v->v = realloc(v->v, (size_t)(v->len + 1) * sizeof *v->v);
+            v->v[v->len++] = c ? c : jnew('z');
+        }
+        if (!*ok) { jfree(v); return NULL; }
+        return v;
+    }
+    KLJ_LOG("Realtime Database: a %s is not a value the database stores", cls);
+    *ok = 0;
+    return NULL;
+}
+
+// --- errors
+static void *db_error(int code, const char *msg) {
+    dbo *f;
+    void *obj = db_new(C_ERR, K_ERR, &f);
+    f->a = code;
+    f->s = strdup(msg && *msg ? msg : db_code_msg(code));
+    return obj;
+}
+static char *db_exc_msg(const char *msg) {   // DatabaseError.toException's message
+    sb b = {0};
+    sb_add(&b, "Firebase Database error: ");
+    sb_add(&b, msg ? msg : "");
+    return sb_take(&b);
+}
+static void *db_exception(const char *msg) {
+    dbo *f;
+    void *obj = db_new(C_EXC, K_EXC, &f);
+    f->a = DE_UNKNOWN_ERROR;
+    f->s = strdup(msg ? msg : "");
+    return obj;
+}
+static void *db_throw(const char *cls, const char *why) {
+    KLJ_LOG("Realtime Database: %s -> %s", why, cls);
+    kl_jni_throw(cls);
+    return NULL;
+}
+
+// ------------------------------------------------------------- tasks
+// A task holds itself until it has told a callback its outcome (j: that hold is
+// still on): the SDK registers its JniResultCallback only after the call that
+// made the task returned, and a task that failed at once must still be there.
+static void *db_task_new(void) {
+    dbo *f;
+    void *t = db_new(C_TASK, K_TASK, &f);
+    klj_hold(t);
+    f->j = 1;
+    return t;
+}
+static void db_task_deliver(void *task);
+static void db_task_finish(void *task, int state, void *result, void *exc, const char *msg) {
+    dbo *t = db_of(task, K_TASK);
+    if (!t) return;
+    pthread_mutex_lock(&db_lock);
+    if (t->state) { pthread_mutex_unlock(&db_lock); return; }
+    t->state = state;
+    t->s = db_strdup(msg);
+    pthread_mutex_unlock(&db_lock);
+    if (result) { db_hold_in(t, result); t->o1 = result; }
+    if (exc) { db_hold_in(t, exc); t->o2 = exc; }
+    klj_hold(task);
+    kl_mv_ui_later(db_task_deliver, task);
+}
+static void db_task_fail(void *task, const char *msg) {
+    char *m = db_exc_msg(msg);
+    db_task_finish(task, 2, NULL, db_exception(m), m);
+    free(m);
+}
+static void *db_done_task(void) {
+    void *t = db_task_new();
+    db_task_finish(t, 1, NULL, NULL, NULL);
+    return t;
+}
+static void *db_failed_task(const char *msg) {
+    void *t = db_task_new();
+    db_task_fail(t, msg);
+    return t;
+}
+typedef void (*db_on_result_fn)(void *env, void *thiz, void *result, uint8_t success,
+                                uint8_t cancelled, void *msg, int64_t fn, int64_t data);
+static void db_cb_call(void *cb, int state, void *result, void *exc, const char *msg) {
+    dbo *c = db_of(cb, K_CB);
+    if (!c) return;
+    pthread_mutex_lock(&db_lock);
+    int was = c->i;
+    c->i = 1;   // delivered (once, whichever of completion and cancel() comes first)
+    pthread_mutex_unlock(&db_lock);
+    if (was) return;
+    db_on_result_fn fn = (db_on_result_fn)kl_jni_native(C_CB, "nativeOnResult",
+                                                        "(Ljava/lang/Object;ZZLjava/lang/String;JJ)V");
+    if (!fn) { KLJ_LOG("Realtime Database: JniResultCallback.nativeOnResult is not registered"); return; }
+    void *env = kl_jni_env();
+    void *jmsg = state == 2 ? kl_jni_new_string(msg ? msg : "") : state == 3 ? kl_jni_new_string("cancelled") : NULL;
+    fn(env, cb, state == 1 ? result : state == 2 ? exc : NULL, state == 1, state == 3, jmsg, c->a, c->b);
+    if (jmsg) klj_release(jmsg);
+}
+// On the UI drain: every callback registered so far hears the outcome.
+static void db_task_deliver(void *task) {
+    dbo *t = db_of(task, K_TASK);
+    if (t) {
+        pthread_mutex_lock(&db_lock);
+        void **cbs = t->cbs; int n = t->ncbs;
+        t->cbs = NULL; t->ncbs = 0;
+        int state = t->state; void *res = t->o1, *exc = t->o2;
+        char *msg = db_strdup(t->s);
+        pthread_mutex_unlock(&db_lock);
+        for (int i = 0; i < n; i++) { db_cb_call(cbs[i], state, res, exc, msg); klj_release(cbs[i]); }
+        free(cbs);
+        free(msg);
+        pthread_mutex_lock(&db_lock);
+        int self_hold = n > 0 && t->j;
+        if (self_hold) t->j = 0;
+        pthread_mutex_unlock(&db_lock);
+        if (self_hold) klj_release(task);
+    }
+    klj_release(task);
+}
+
+// ------------------------------------------------------------- objects
+static void *db_ref_new(void *db, const char *path) {
+    dbo *f;
+    void *obj = db_new(C_REF, K_REF, &f);
+    f->db = db;
+    f->path = strdup(path ? path : "");
+    return obj;
+}
+static void *db_snap_new(void *db, const char *path, jv *val, const db_q *order) {
+    dbo *f;
+    void *obj = db_new(C_SNAP, K_SNAP, &f);
+    f->db = db;
+    f->path = strdup(path ? path : "");
+    f->val = val;
+    if (order) { f->q.order = order->order; f->q.child = db_strdup(order->child); }
+    return obj;
+}
+static void *db_mdata_new(void *db, db_mroot *m, const char *path) {
+    dbo *f;
+    void *obj = db_new(C_MD, K_MDATA, &f);
+    f->db = db;
+    f->path = strdup(path ? path : "");
+    __atomic_add_fetch(&m->refs, 1, __ATOMIC_ACQ_REL);
+    f->mroot = m;
+    return obj;
+}
+// sb: the database URL followed by the path, each segment percent-encoded.
+static void sb_location(sb *b, db_info *d, const char *path) {
+    sb_add(b, d->url);
+    if (path && *path) { sb_put(b, "/", 1); sb_pct(b, path, 1); }
+}
+
+// ------------------------------------------------------------- requests
+enum { OP_READ, OP_WRITE, OP_TX_READ, OP_TX_WRITE };
+typedef struct {
+    int    what;
+    void  *db;
+    char  *path;          // the location
+    db_q   q;             // OP_READ: the query
+    int    whole;         // OP_READ: read without server-side query parameters
+    void  *reg;           // OP_READ: a registration (held), or...
+    void  *single;        // ...a single-value listener (held)
+    void  *task;          // OP_WRITE: the write's task (held)
+    char  *method, *body, *etag;
+    void  *txh;           // OP_TX_*: the CppTransactionHandler (held)
+    int    tries;
+    jv    *cur;           // OP_TX_*: the value the transaction last saw
+} db_op;
+static void db_op_free(db_op *op) {
+    if (op->reg) klj_release(op->reg);
+    if (op->single) klj_release(op->single);
+    if (op->task) klj_release(op->task);
+    if (op->txh) klj_release(op->txh);
+    free(op->path); db_q_free(&op->q);
+    free(op->method); free(op->body); free(op->etag);
+    jfree(op->cur);
+    free(op);
+}
+static db_op *db_op_new(int what, void *db, const char *path) {
+    db_op *op = calloc(1, sizeof *op);
+    op->what = what;
+    op->db = db;
+    op->path = strdup(path ? path : "");
+    return op;
+}
+
+static void db_net_done(void *ctx, int status, const char *body, long len, const char *err, const char *hdrs);
+
+// The URL of a request: <url>/<path>.json[?<query>]
+static char *db_url(db_info *d, const char *path, const db_q *q, int whole) {
+    sb b = {0};
+    sb_location(&b, d, path);
+    sb_add(&b, ".json");
+    int any = 0;
+#define QP(name) do { sb_put(&b, any++ ? "&" : "?", 1); sb_add(&b, name); sb_put(&b, "=", 1); } while (0)
+    if (d->ns) { QP("ns"); sb_pct(&b, d->ns, 0); }
+    if (q && !whole && db_q_filters(q)) {
+        QP("orderBy");
+        if (q->order == Q_KEY) sb_pct(&b, "\"$key\"", 0);
+        else if (q->order == Q_VALUE) sb_pct(&b, "\"$value\"", 0);
+        else if (q->order == Q_CHILD) { sb t = {0}; sb_jstr(&t, q->child); sb_pct(&b, t.p, 0); free(t.p); }
+        else sb_pct(&b, "\"$priority\"", 0);
+        // A key tie-breaker the REST API cannot take: the range goes to the
+        // server without it, and the limit is applied here.
+        int keyed = q->start_key || q->end_key;
+        if (q->has_start) { QP("startAt"); sb_pct(&b, q->start, 0); }
+        if (q->has_end) { QP("endAt"); sb_pct(&b, q->end, 0); }
+        if (q->limit && !keyed) {
+            QP(q->last ? "limitToLast" : "limitToFirst");
+            sb_addf(&b, "%d", q->limit);
+        }
+    }
+#undef QP
+    return sb_take(&b);
+}
+static void db_send(db_op *op, const char *method, const char *url, const char *body, const char *headers) {
+    db_info *d = db_dbi(op->db);
+    if (!d || !d->online) {
+        db_net_done(op, 0, NULL, 0, "offline (goOffline)", NULL);
+        return;
+    }
+    sb hdr = {0};
+    sb_put(&hdr, "", 0);
+    if (body) sb_add(&hdr, "Content-Type: application/json\n");
+    if (headers) sb_add(&hdr, headers);
+    mv_net_fetch_headers(method, url, hdr.p, body, body ? (long)strlen(body) : 0, 30.0, db_net_done, op);
+    free(hdr.p);
+}
+static void db_read_send(db_op *op) {
+    db_info *d = db_dbi(op->db);
+    if (!d) { db_net_done(op, 0, NULL, 0, "no database", NULL); return; }
+    char *url = db_url(d, op->path, &op->q, op->whole);
+    db_send(op, "GET", url, NULL, NULL);
+    free(url);
+}
+
+// ---- listener registrations
+static void **db_regs; static int db_nregs;   // active registrations (held)
+static void db_reg_drop(void *reg) {          // no longer active
+    dbo *r = db_of(reg, K_REG);
+    int found = 0;
+    pthread_mutex_lock(&db_lock);
+    if (r) r->j = 1;
+    for (int i = 0; i < db_nregs; i++)
+        if (db_regs[i] == reg) { db_regs[i] = db_regs[--db_nregs]; found = 1; break; }
+    pthread_mutex_unlock(&db_lock);
+    if (found) klj_release(reg);
+}
+static void db_reg_fetch(void *reg) {
+    dbo *r = db_of(reg, K_REG);
+    dbo *s = r ? db_of(r->o2, 0) : NULL;
+    if (!r || !s || r->j) return;
+    db_op *op = db_op_new(OP_READ, s->db, s->path);
+    db_q_copy(&op->q, &s->q);
+    op->reg = reg;
+    klj_hold(reg);
+    db_read_send(op);
+}
+// After this client's write: what overlaps it is read again.
+static void db_refresh_after(void *db, const char *touched) {
+    pthread_mutex_lock(&db_lock);
+    int n = db_nregs;
+    void **regs = malloc((size_t)(n ? n : 1) * sizeof *regs);
+    for (int i = 0; i < n; i++) regs[i] = db_regs[i];
+    pthread_mutex_unlock(&db_lock);
+    for (int i = 0; i < n; i++) klj_hold(regs[i]);
+    for (int i = 0; i < n; i++) {
+        dbo *r = db_of(regs[i], K_REG);
+        dbo *s = r ? db_of(r->o2, 0) : NULL;
+        if (s && s->db == db && db_overlap(s->path, touched)) db_reg_fetch(regs[i]);
+        klj_release(regs[i]);
+    }
+    free(regs);
+}
+
+// ---- events, delivered on the UI drain
+enum { EV_VALUE, EV_CANCEL, EV_ADDED, EV_CHANGED, EV_MOVED, EV_REMOVED };
+typedef struct db_ev {
+    int   type;
+    void *listener;      // held
+    void *reg;           // held, or NULL for a single-value listener
+    void *obj;           // the snapshot or the error (held)
+    char *prev;          // the previous sibling's key, or NULL
+    struct db_ev *next;
+} db_ev;
+typedef void (*db_on_snap_fn)(void *env, void *clazz, int64_t db, int64_t l, void *snap);
+typedef void (*db_on_child_fn)(void *env, void *clazz, int64_t db, int64_t l, void *snap, void *prev);
+static void db_ev_deliver(void *p) {
+    for (db_ev *ev = p, *next; ev; ev = next) {
+        next = ev->next;
+        dbo *l = db_of(ev->listener, K_LISTENER);
+        dbo *r = ev->reg ? db_of(ev->reg, K_REG) : NULL;
+        pthread_mutex_lock(&db_lock);
+        int64_t a = l ? l->a : 0, b = l ? l->b : 0;
+        int live = l && a && b && (!ev->reg || (r && !r->j) || ev->type == EV_CANCEL);
+        pthread_mutex_unlock(&db_lock);
+        if (live) {
+            const char *cls = db_cls(ev->listener);
+            void *env = kl_jni_env(), *clazz = kl_jni_class(cls);
+            const char *name = ev->type == EV_VALUE ? "nativeOnDataChange" : ev->type == EV_CANCEL ? "nativeOnCancelled"
+                             : ev->type == EV_ADDED ? "nativeOnChildAdded" : ev->type == EV_CHANGED ? "nativeOnChildChanged"
+                             : ev->type == EV_MOVED ? "nativeOnChildMoved" : "nativeOnChildRemoved";
+            const char *sig = ev->type == EV_VALUE ? "(JJ" SIG_SNAP ")V" : ev->type == EV_CANCEL ? "(JJ" SIG_ERR ")V"
+                            : ev->type == EV_REMOVED ? "(JJ" SIG_SNAP ")V" : "(JJ" SIG_SNAP "Ljava/lang/String;)V";
+            void *fn = kl_jni_native(cls, name, sig);
+            if (!fn) KLJ_LOG("Realtime Database: %s.%s is not registered", cls, name);
+            else if (ev->type == EV_ADDED || ev->type == EV_CHANGED || ev->type == EV_MOVED) {
+                void *prev = ev->prev ? kl_jni_new_string(ev->prev) : NULL;
+                ((db_on_child_fn)fn)(env, clazz, a, b, ev->obj, prev);
+                if (prev) klj_release(prev);
+            } else ((db_on_snap_fn)fn)(env, clazz, a, b, ev->obj);
+        }
+        if (ev->obj) klj_release(ev->obj);
+        klj_release(ev->listener);
+        if (ev->reg) klj_release(ev->reg);
+        free(ev->prev);
+        free(ev);
+    }
+}
+static db_ev *db_ev_new(db_ev ***tail, int type, void *listener, void *reg, void *obj, const char *prev) {
+    db_ev *ev = calloc(1, sizeof *ev);
+    ev->type = type;
+    ev->listener = listener; klj_hold(listener);
+    if (reg) { ev->reg = reg; klj_hold(reg); }
+    if (obj) { ev->obj = obj; klj_hold(obj); }
+    ev->prev = db_strdup(prev);
+    **tail = ev;
+    *tail = &ev->next;
+    return ev;
+}
+
+// A read's answer for a registration or a single-value listener.
+static void db_answer(db_op *op, jv *value) {
+    db_ev *head = NULL, **tail = &head;
+    if (op->single) {
+        void *snap = db_snap_new(op->db, op->path, value, &op->q);
+        db_ev_new(&tail, EV_VALUE, op->single, NULL, snap, NULL);
+        kl_mv_ui_later(db_ev_deliver, head);
+        return;
+    }
+    dbo *r = db_of(op->reg, K_REG);
+    if (!r) { jfree(value); return; }
+    void *listener = r->o1;
+    if (!r->i) {   // a value listener: the value, when it is not the one it last had
+        char *text = jtext(value);
+        pthread_mutex_lock(&db_lock);
+        int same = r->s && !strcmp(r->s, text);
+        if (!same) { free(r->s); r->s = text; text = NULL; }
+        pthread_mutex_unlock(&db_lock);
+        free(text);
+        if (same) { jfree(value); return; }
+        void *snap = db_snap_new(op->db, op->path, value, &op->q);
+        db_ev_new(&tail, EV_VALUE, listener, op->reg, snap, NULL);
+        kl_mv_ui_later(db_ev_deliver, head);
+        return;
+    }
+    // a child listener: what differs from the children it last had
+    int n;
+    db_ent *e = db_children(value, &op->q, &n);
+    char **nk = calloc((size_t)(n ? n : 1), sizeof *nk), **nv = calloc((size_t)(n ? n : 1), sizeof *nv);
+    for (int i = 0; i < n; i++) { nk[i] = strdup(e[i].key); nv[i] = jtext(e[i].v); }
+    pthread_mutex_lock(&db_lock);
+    char **ok = r->ck, **ov = r->cv; int on = r->cn;
+    r->ck = nk; r->cv = nv; r->cn = n;
+    pthread_mutex_unlock(&db_lock);
+    for (int i = 0; i < on; i++) {   // removed, with the value it had
+        int found = 0;
+        for (int j = 0; j < n && !found; j++) found = !strcmp(ok[i], nk[j]);
+        if (found) continue;
+        int bad;
+        char *cp = db_join(op->path, ok[i]);
+        void *snap = db_snap_new(op->db, cp, jnorm(jparse_all(ov[i], &bad)), NULL);
+        free(cp);
+        db_ev_new(&tail, EV_REMOVED, listener, op->reg, snap, NULL);
+    }
+    for (int j = 0; j < n; j++) {
+        int was = -1;
+        for (int i = 0; i < on && was < 0; i++) if (!strcmp(ok[i], nk[j])) was = i;
+        const char *prev = j ? nk[j - 1] : NULL;
+        int type;
+        if (was < 0) type = EV_ADDED;
+        else if (strcmp(ov[was], nv[j])) type = EV_CHANGED;
+        else continue;
+        char *cp = db_join(op->path, nk[j]);
+        void *snap = db_snap_new(op->db, cp, jcopy(e[j].v), NULL);
+        free(cp);
+        if (type == EV_CHANGED && op->q.order != Q_KEY) {   // its place moved too
+            const char *oprev = NULL;
+            for (int i = was - 1; i >= 0 && !oprev; i--) {   // its old previous sibling still here
+                for (int k = 0; k < n; k++) if (!strcmp(ok[i], nk[k])) { oprev = ok[i]; break; }
+            }
+            if ((oprev == NULL) != (prev == NULL) || (oprev && strcmp(oprev, prev)))
+                db_ev_new(&tail, EV_MOVED, listener, op->reg, snap, prev);
+        }
+        db_ev_new(&tail, type, listener, op->reg, snap, prev);
+    }
+    db_free_strs(ok, on); db_free_strs(ov, on);
+    free(e);
+    jfree(value);
+    if (head) kl_mv_ui_later(db_ev_deliver, head);
+}
+static void db_answer_error(db_op *op, int code, const char *msg) {
+    void *err = db_error(code, msg);
+    db_ev *head = NULL, **tail = &head;
+    if (op->single) db_ev_new(&tail, EV_CANCEL, op->single, NULL, err, NULL);
+    else if (db_of(op->reg, K_REG)) {
+        db_ev_new(&tail, EV_CANCEL, db_of(op->reg, K_REG)->o1, op->reg, err, NULL);
+        db_reg_drop(op->reg);   // a cancelled listener hears nothing more, as on Android
+    }
+    if (head) kl_mv_ui_later(db_ev_deliver, head);
+}
+
+// ---- transactions
+typedef void *(*db_do_tx_fn)(void *env, void *clazz, int64_t db, int64_t tx, void *mdata);
+typedef void (*db_tx_done_fn)(void *env, void *clazz, int64_t db, int64_t tx, void *err, uint8_t committed, void *snap);
+static void db_tx_complete(db_op *op, void *err, int committed, jv *value) {
+    dbo *h = db_of(op->txh, K_TXH);
+    pthread_mutex_lock(&db_lock);
+    int64_t a = h ? h->a : 0, b = h ? h->b : 0;
+    pthread_mutex_unlock(&db_lock);
+    void *snap = err ? NULL : db_snap_new(op->db, op->path, value, NULL);
+    if (err) jfree(value);
+    if (snap) klj_hold(snap);   // ours for the call; the SDK takes its own global reference
+    if (err) klj_hold(err);
+    if (a && b) {
+        db_tx_done_fn fn = (db_tx_done_fn)kl_jni_native(C_TH, "nativeOnComplete", "(JJ" SIG_ERR "Z" SIG_SNAP ")V");
+        if (fn) fn(kl_jni_env(), kl_jni_class(C_TH), a, b, err, (uint8_t)committed, snap);
+        else KLJ_LOG("Realtime Database: CppTransactionHandler.nativeOnComplete is not registered");
+    }
+    if (snap) klj_release(snap);
+    if (err) klj_release(err);
+}
+static void db_tx_send_read(db_op *op);
+// On the UI drain: the transaction function sees the current value; what it
+// leaves is written if the location still holds that value.
+static void db_tx_run(void *p) {
+    db_op *op = p;
+    dbo *h = db_of(op->txh, K_TXH);
+    pthread_mutex_lock(&db_lock);
+    int64_t a = h ? h->a : 0, b = h ? h->b : 0;
+    pthread_mutex_unlock(&db_lock);
+    if (!a || !b) { db_op_free(op); return; }   // the SDK let go of it
+    db_mroot *m = calloc(1, sizeof *m);
+    m->root = jcopy(op->cur);
+    m->refs = 1;
+    void *md = db_mdata_new(op->db, m, "");
+    klj_hold(md);   // ours for the call; the SDK takes and drops its own global reference
+    db_do_tx_fn fn = (db_do_tx_fn)kl_jni_native(C_TH, "nativeDoTransaction",
+                                                "(JJLcom/google/firebase/database/MutableData;)Lcom/google/firebase/database/MutableData;");
+    void *out = fn ? fn(kl_jni_env(), kl_jni_class(C_TH), a, b, md) : NULL;
+    if (!fn) KLJ_LOG("Realtime Database: CppTransactionHandler.nativeDoTransaction is not registered");
+    if (!out) {   // aborted: the value as it is
+        klj_release(md);
+        db_mroot_unref(m);
+        db_tx_complete(op, NULL, 0, jcopy(op->cur));
+        db_op_free(op);
+        return;
+    }
+    char *body = jtext(m->root);
+    klj_release(md);
+    db_mroot_unref(m);
+    db_info *d = db_dbi(op->db);
+    op->what = OP_TX_WRITE;
+    free(op->body);
+    op->body = body;
+    sb url = {0};
+    sb_location(&url, d, op->path);
+    sb_add(&url, ".json");
+    if (d->ns) { sb_add(&url, "?ns="); sb_pct(&url, d->ns, 0); }
+    sb hdr = {0};
+    sb_put(&hdr, "", 0);
+    if (op->etag) sb_addf(&hdr, "if-match: %s\n", op->etag);
+    db_send(op, "PUT", url.p, op->body, hdr.p);
+    free(url.p);
+    free(hdr.p);
+}
+static void db_tx_send_read(db_op *op) {
+    db_info *d = db_dbi(op->db);
+    op->what = OP_TX_READ;
+    char *url = db_url(d, op->path, NULL, 1);
+    db_send(op, "GET", url, NULL, "X-Firebase-ETag: true\n");
+    free(url);
+}
+typedef struct { db_op *op; void *err; int committed; jv *value; } db_tx_end;
+static void db_tx_end_deliver(void *p) {
+    db_tx_end *e = p;
+    db_tx_complete(e->op, e->err, e->committed, e->value);
+    char *touched = e->committed ? strdup(e->op->path) : NULL;
+    void *db = e->op->db;
+    db_op_free(e->op);
+    free(e);
+    if (touched) { db_refresh_after(db, touched); free(touched); }
+}
+static void db_tx_end_post(db_op *op, void *err, int committed, jv *value) {
+    db_tx_end *e = calloc(1, sizeof *e);
+    e->op = op; e->err = err; e->committed = committed; e->value = value;
+    kl_mv_ui_later(db_tx_end_deliver, e);
+}
+static char *db_header(const char *hdrs, const char *name) {   // a response header's value
+    size_t n = strlen(name);
+    for (const char *p = hdrs; p && *p; ) {
+        const char *e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l > n && !strncasecmp(p, name, n) && p[n] == ':') {
+            const char *v = p + n + 1;
+            while (*v == ' ') v++;
+            size_t vl = l - (size_t)(v - p);
+            while (vl && (v[vl - 1] == '\r' || v[vl - 1] == ' ')) vl--;
+            return strndup(v, vl);
+        }
+        p = e ? e + 1 : NULL;
+    }
+    return NULL;
+}
+
+// ---- answers
+static int db_http_code(int status) {
+    if (status == 401 || status == 403) return DE_PERMISSION_DENIED;
+    if (status >= 500 || status == 423 || status == 429) return DE_UNAVAILABLE;
+    return DE_OPERATION_FAILED;
+}
+static void db_fail(db_op *op, int code, const char *msg) {
+    switch (op->what) {
+    case OP_READ:
+        db_answer_error(op, code, msg);
+        db_op_free(op);
+        return;
+    case OP_WRITE:
+        db_task_fail(op->task, msg);
+        db_op_free(op);
+        return;
+    default:
+        db_tx_end_post(op, db_error(code, msg), 0, NULL);
+        return;
+    }
+}
+static void db_net_done(void *ctx, int status, const char *body, long len, const char *err, const char *hdrs) {
+    (void)len;
+    db_op *op = ctx;
+    if (status == 0) {
+        KLJ_LOG("Realtime Database: no response (%s)", err ? err : "offline");
+        db_fail(op, DE_DISCONNECTED, db_code_msg(DE_DISCONNECTED));
+        return;
+    }
+    int bad;
+    jv *r = jparse_all(body && *body ? body : "null", &bad);
+    if (op->what == OP_TX_WRITE && status == 412 && op->tries + 1 < DB_MAX_TX_RETRIES) {
+        // another client wrote first: run again on what it wrote
+        op->tries++;
+        free(op->etag);
+        op->etag = db_header(hdrs, "ETag");
+        jfree(op->cur);
+        op->cur = bad ? NULL : jnorm(r);
+        KLJ_LOG("Realtime Database: transaction conflict, retry %d", op->tries);
+        if (!op->etag || bad) db_tx_send_read(op);
+        else kl_mv_ui_later(db_tx_run, op);
+        return;
+    }
+    if (status >= 300) {
+        const char *m = r && r->t == 'o' && jget(r, "error") && jget(r, "error")->t == 's' ? jget(r, "error")->s : NULL;
+        int code = op->what == OP_TX_WRITE && status == 412 ? DE_MAX_RETRIES : db_http_code(status);
+        KLJ_LOG("Realtime Database: HTTP %d", status);
+        if (op->what == OP_READ && !op->whole && status == 400 && m && strstr(m, "Index not defined")) {
+            // no index on the server for this query: read it whole and filter here
+            KLJ_LOG("Realtime Database: no server index for a query; filtering on the client");
+            jfree(r);
+            op->whole = 1;
+            db_read_send(op);
+            return;
+        }
+        char msg[512];
+        if (code == DE_OPERATION_FAILED && m) snprintf(msg, sizeof msg, "%s", m);
+        else snprintf(msg, sizeof msg, "%s", db_code_msg(code));
+        jfree(r);
+        db_fail(op, code, msg);
+        return;
+    }
+    if (bad) { db_fail(op, DE_UNKNOWN_ERROR, "The Realtime Database response was not JSON."); return; }
+    jv *value = jnorm(r);
+    switch (op->what) {
+    case OP_READ: {
+        jv *shaped = db_apply_query(value, &op->q);
+        jfree(value);
+        db_answer(op, shaped);
+        db_op_free(op);
+        return;
+    }
+    case OP_WRITE: {
+        KLJ_LOG("Realtime Database: %s -> ok", op->method);
+        db_task_finish(op->task, 1, NULL, NULL, NULL);
+        jfree(value);
+        char *touched = strdup(op->path);
+        void *db = op->db;
+        db_op_free(op);
+        db_refresh_after(db, touched);
+        free(touched);
+        return;
+    }
+    case OP_TX_READ:
+        free(op->etag);
+        op->etag = db_header(hdrs, "ETag");
+        jfree(op->cur);
+        op->cur = value;
+        kl_mv_ui_later(db_tx_run, op);
+        return;
+    case OP_TX_WRITE:
+        KLJ_LOG("Realtime Database: transaction committed");
+        db_tx_end_post(op, NULL, 1, value);
+        return;
+    }
+}
+
+// A write: `method` of `body` at the reference's path (+ sub, e.g. ".priority").
+static void *db_write(void *ref, const char *method, const char *sub, jv *value, int send_body) {
+    dbo *r = db_of(ref, 0);
+    db_info *d = r ? db_dbi(r->db) : NULL;
+    if (!d) { jfree(value); return db_failed_task("not a database reference"); }
+    void *task = db_task_new();
+    db_op *op = db_op_new(OP_WRITE, r->db, r->path);
+    op->task = task; klj_hold(task);
+    op->method = strdup(method);
+    if (send_body) op->body = jtext(value);
+    jfree(value);
+    char *p = sub ? db_join(r->path, sub) : strdup(r->path);
+    sb url = {0};
+    sb_location(&url, d, p);
+    sb_add(&url, ".json");
+    if (d->ns) { sb_add(&url, "?ns="); sb_pct(&url, d->ns, 0); }
+    free(p);
+    db_send(op, method, url.p, op->body, NULL);
+    free(url.p);
+    return task;
+}
+// value with a priority, as the REST API takes it.
+static jv *db_with_priority(jv *value, jv *prio) {
+    if (!prio) return value;
+    if (!value) { jfree(prio); return NULL; }
+    if (value->t != 'o') {
+        jv *w = jnew('o');
+        jobj_add(w, ".value", value);
+        value = w;
+    }
+    jobj_add(value, ".priority", prio);
+    return value;
+}
+
+// ------------------------------------------------------------- bindings
+#define B(name) static klj_val name(void *env, void *self, const klj_val *a, int n)
+#define ARG(i) (n > (i) ? a[i].l : NULL)
+#define RET(x) return (klj_val){.l = (x)}
+#define RETJ(x) return (klj_val){.j = (uint64_t)(int64_t)(x)}
+
+B(db_noop) { (void)env; (void)self; (void)a; (void)n; return (klj_val){0}; }
+
+// ---- FirebaseDatabase
+#define DB_MAX 8
+static void *db_dbs[DB_MAX];
+static int db_offline_all;   // DatabaseReference.goOffline()
+
+static void *db_get_instance(void *app, const char *url_in) {
+    if (!app) return db_throw("java/lang/NullPointerException", "FirebaseDatabase.getInstance: no FirebaseApp");
+    void *opts_url = NULL;
+    const char *url = url_in;
+    if (!url || !*url) {
+        void *opts = klj_call_binding(app, "getOptions", "()Lcom/google/firebase/FirebaseOptions;", NULL, 0).l;
+        opts_url = opts ? klj_call_binding(opts, "getDatabaseUrl", "()Ljava/lang/String;", NULL, 0).l : NULL;
+        url = opts_url ? klj_str(opts_url) : NULL;
+    }
+    if (!url || !*url) {
+        if (opts_url) klj_release(opts_url);
+        return db_throw(C_EXC, "FirebaseDatabase.getInstance: no database URL among the app's options");
+    }
+    // scheme://host[/][?ns=x]
+    const char *sch = strstr(url, "://");
+    const char *host = sch ? sch + 3 : NULL;
+    size_t hl = host ? strcspn(host, "/?") : 0;
+    if (!host || !hl || (strncmp(url, "https://", 8) && strncmp(url, "http://", 7))) {
+        if (opts_url) klj_release(opts_url);
+        return db_throw(C_EXC, "FirebaseDatabase.getInstance: not a database URL");
+    }
+    char *base = strndup(url, (size_t)(host - url) + hl);
+    for (char *c = base + (host - url); *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
+    const char *nsq = strstr(host, "ns=");
+    char *ns = nsq ? strndup(nsq + 3, strcspn(nsq + 3, "&")) : NULL;
+    if (opts_url) klj_release(opts_url);
+    pthread_mutex_lock(&db_lock);
+    for (int i = 0; i < DB_MAX; i++) {
+        db_info *d = db_dbs[i] ? db_dbi(db_dbs[i]) : NULL;
+        if (d && d->app == app && !strcmp(d->url, base) &&
+            ((!d->ns && !ns) || (d->ns && ns && !strcmp(d->ns, ns)))) {
+            void *found = db_dbs[i];
+            pthread_mutex_unlock(&db_lock);
+            free(base); free(ns);
+            return found;
+        }
+    }
+    pthread_mutex_unlock(&db_lock);
+    db_info *d = calloc(1, sizeof *d);
+    d->url = base;
+    d->ns = ns;
+    d->app = app;
+    d->online = !db_offline_all;
+    dbo *f;
+    void *db = db_new(C_DB, K_DB, &f);
+    f->dbi = d;
+    f->db = db;
+    kl_jni_pin_object(db);
+    pthread_mutex_lock(&db_lock);
+    for (int i = 0; i < DB_MAX; i++) if (!db_dbs[i]) { db_dbs[i] = db; break; }
+    pthread_mutex_unlock(&db_lock);
+    KLJ_LOG("FirebaseDatabase.getInstance -> an instance on the Realtime Database REST API");
+    return db;
+}
+B(db_DB_getInstance) { (void)env; (void)self; RET(db_get_instance(ARG(0), NULL)); }
+B(db_DB_getInstanceUrl) {
+    (void)env; (void)self;
+    const char *url = ARG(1) ? klj_str(ARG(1)) : NULL;
+    if (!url || !*url) RET(db_throw(C_EXC, "FirebaseDatabase.getInstance: an empty database URL"));
+    RET(db_get_instance(ARG(0), url));
+}
+B(db_DB_getDefault) {
+    (void)env; (void)self; (void)a; (void)n;
+    void *app = klj_call_binding(kl_jni_class(C_APP), "getInstance", "()L" C_APP ";", NULL, 0).l;
+    RET(db_get_instance(app, NULL));
+}
+B(db_DB_getApp) { (void)env; (void)a; (void)n; db_info *d = db_dbi(self); RET(d ? d->app : NULL); }
+B(db_DB_getReference) {
+    (void)env; (void)a; (void)n;
+    if (!db_of(self, K_DB)) RET(NULL);
+    RET(db_ref_new(self, ""));
+}
+B(db_DB_getReferencePath) {
+    (void)env;
+    if (!db_of(self, K_DB)) RET(NULL);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!p) RET(db_throw("java/lang/NullPointerException", "getReference(null)"));
+    char *norm = db_norm_path(p);
+    if (!norm) RET(db_throw(C_EXC, "getReference: an invalid path"));
+    void *ref = db_ref_new(self, norm);
+    free(norm);
+    RET(ref);
+}
+B(db_DB_getReferenceFromUrl) {
+    (void)env;
+    db_info *d = db_dbi(self);
+    const char *u = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!d || !u) RET(db_throw(C_EXC, "getReferenceFromUrl: no URL"));
+    size_t bl = strlen(d->url);
+    if (strncasecmp(u, d->url, bl) || (u[bl] && u[bl] != '/' && u[bl] != '?'))
+        RET(db_throw(C_EXC, "getReferenceFromUrl: a URL of another database"));
+    const char *p = u + bl;
+    size_t pl = strcspn(p, "?");
+    char *raw = malloc(pl + 1);   // percent-decoded
+    size_t k = 0;
+    for (size_t i = 0; i < pl; i++) {
+        if (p[i] == '%' && i + 2 < pl) {
+            char h[3] = {p[i + 1], p[i + 2], 0};
+            raw[k++] = (char)strtol(h, NULL, 16);
+            i += 2;
+        } else raw[k++] = p[i];
+    }
+    raw[k] = 0;
+    char *norm = db_norm_path(raw);
+    free(raw);
+    if (!norm) RET(db_throw(C_EXC, "getReferenceFromUrl: an invalid path"));
+    void *ref = db_ref_new(self, norm);
+    free(norm);
+    RET(ref);
+}
+B(db_DB_goOnline) { (void)env; (void)a; (void)n; db_info *d = db_dbi(self); if (d) d->online = 1; return (klj_val){0}; }
+B(db_DB_goOffline) { (void)env; (void)a; (void)n; db_info *d = db_dbi(self); if (d) d->online = 0; return (klj_val){0}; }
+static void db_all_online(int on) {
+    pthread_mutex_lock(&db_lock);
+    db_offline_all = !on;
+    for (int i = 0; i < DB_MAX; i++) { db_info *d = db_dbs[i] ? db_dbi(db_dbs[i]) : NULL; if (d) d->online = on; }
+    pthread_mutex_unlock(&db_lock);
+}
+B(db_Ref_goOnline) { (void)env; (void)self; (void)a; (void)n; db_all_online(1); return (klj_val){0}; }
+B(db_Ref_goOffline) { (void)env; (void)self; (void)a; (void)n; db_all_online(0); return (klj_val){0}; }
+B(db_DB_getSdkVersion) { (void)env; (void)self; (void)a; (void)n; RET(kl_jni_new_string("20.3.0")); }
+static void *db_levels[5];
+B(db_Level_valueOf) {
+    (void)env; (void)self;
+    static const char *const names[5] = {"DEBUG", "INFO", "WARN", "ERROR", "NONE"};
+    const char *s = ARG(0) ? klj_str(ARG(0)) : NULL;
+    for (int i = 0; s && i < 5; i++) {
+        if (strcmp(s, names[i])) continue;
+        pthread_mutex_lock(&db_lock);
+        if (!db_levels[i]) {
+            dbo *f;
+            db_levels[i] = db_new(C_LVL, K_LEVEL, &f);
+            f->a = i;
+            kl_jni_pin_object(db_levels[i]);
+        }
+        void *lv = db_levels[i];
+        pthread_mutex_unlock(&db_lock);
+        RET(lv);
+    }
+    RET(db_throw("java/lang/IllegalArgumentException", "Logger.Level.valueOf: no such level"));
+}
+
+// ---- DatabaseError
+B(db_Err_getCode) { (void)env; (void)a; (void)n; dbo *f = db_of(self, 0); RETJ(f ? (int32_t)f->a : DE_UNKNOWN_ERROR); }
+B(db_Err_getMessage) { (void)env; (void)a; (void)n; dbo *f = db_of(self, 0); RET(kl_jni_new_string(f && f->s ? f->s : "")); }
+B(db_Err_getDetails) { (void)env; (void)self; (void)a; (void)n; RET(kl_jni_new_string("")); }
+B(db_Err_toException) {
+    (void)env; (void)a; (void)n;
+    dbo *f = db_of(self, K_ERR);
+    char *m = db_exc_msg(f ? f->s : "");
+    void *e = db_exception(m);
+    free(m);
+    RET(e);
+}
+// DatabaseError's static int codes (kl_jni.c's field lookup asks, step 161).
+int mv_db_static_field(const char *cls, const char *name, char want, klj_val *out) {
+    if (!cls || strcmp(cls, C_ERR) || want != 'I') return 0;
+    for (int i = 0; db_codes[i].name; i++)
+        if (!strcmp(name, db_codes[i].name)) { out->j = (uint64_t)(int64_t)db_codes[i].code; return 1; }
+    return 0;
+}
+
+// ---- references
+B(db_Ref_child) {
+    (void)env;
+    dbo *r = db_of(self, 0);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!r || !p) RET(db_throw("java/lang/NullPointerException", "DatabaseReference.child(null)"));
+    char *norm = db_norm_path(p);
+    if (!norm) RET(db_throw(C_EXC, "DatabaseReference.child: an invalid path"));
+    char *full = db_join(r->path, norm);
+    void *ref = db_ref_new(r->db, full);
+    free(norm); free(full);
+    RET(ref);
+}
+// A push id: 8 characters of time (ms), 12 random, in an order-preserving alphabet.
+static const char db_push_chars[] = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+static int db_rand64(void) {
+#if defined(__APPLE__)
+    return (int)arc4random_uniform(64);
+#else
+    return (int)(random() & 63);
+#endif
+}
+static char *db_push_id(void) {
+    static int64_t last_ms;
+    static int last_rand[12];
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    int64_t now = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    char id[21];
+    pthread_mutex_lock(&db_lock);
+    int dup = now == last_ms;
+    last_ms = now;
+    for (int i = 7; i >= 0; i--) { id[i] = db_push_chars[now % 64]; now /= 64; }
+    if (!dup) {
+        for (int i = 0; i < 12; i++) last_rand[i] = db_rand64();
+    } else {   // the same millisecond: the previous random part plus one, so ids stay ordered
+        int i = 11;
+        for (; i >= 0 && last_rand[i] == 63; i--) last_rand[i] = 0;
+        if (i >= 0) last_rand[i]++;
+    }
+    for (int i = 0; i < 12; i++) id[8 + i] = db_push_chars[last_rand[i]];
+    pthread_mutex_unlock(&db_lock);
+    id[20] = 0;
+    return strdup(id);
+}
+B(db_Ref_push) {
+    (void)env; (void)a; (void)n;
+    dbo *r = db_of(self, 0);
+    if (!r) RET(NULL);
+    char *id = db_push_id();
+    char *full = db_join(r->path, id);
+    void *ref = db_ref_new(r->db, full);
+    free(id); free(full);
+    RET(ref);
+}
+static jv *db_value_arg(void *obj, int *ok) {   // for a write: NULL with *ok = 0 on a bad value
+    *ok = 1;
+    jv *v = db_from_java(obj, ok, 0);
+    return *ok ? jnorm(v) : (jfree(v), NULL);
+}
+B(db_Ref_setValue) {
+    (void)env;
+    int ok;
+    jv *v = db_value_arg(ARG(0), &ok);
+    if (!ok) RET(db_failed_task("Failed to parse node: a value the database cannot store"));
+    RET(db_write(self, "PUT", NULL, v, 1));
+}
+B(db_Ref_setValuePriority) {
+    (void)env;
+    int ok, ok2 = 1;
+    jv *v = db_value_arg(ARG(0), &ok);
+    jv *p = ok ? db_value_arg(ARG(1), &ok2) : NULL;
+    if (!ok || (ARG(1) && (!ok2 || !p || p->t == 'o' || p->t == 'b'))) {
+        jfree(v); jfree(p);
+        RET(db_failed_task("Invalid priority: a priority is a string or a number"));
+    }
+    RET(db_write(self, "PUT", NULL, db_with_priority(v, p), 1));
+}
+B(db_Ref_setPriority) {
+    (void)env;
+    int ok;
+    jv *p = db_value_arg(ARG(0), &ok);
+    if (!ok || (p && (p->t == 'o' || p->t == 'b'))) { jfree(p); RET(db_failed_task("Invalid priority: a priority is a string or a number")); }
+    RET(db_write(self, "PUT", ".priority", p, 1));
+}
+B(db_Ref_updateChildren) {
+    (void)env;
+    if (!mv_is_hashmap(ARG(0))) RET(db_failed_task("updateChildren takes a map"));
+    int ok = 1;
+    jv *v = db_from_java(ARG(0), &ok, 0);   // null values stay: they delete
+    if (!ok) { jfree(v); RET(db_failed_task("Failed to parse node: a value the database cannot store")); }
+    for (int i = 0; v && i < v->len; i++) {
+        char *k = db_norm_path(v->k[i]);
+        if (!k) { jfree(v); RET(db_failed_task("Invalid path in updateChildren")); }
+        free(v->k[i]);
+        v->k[i] = k;
+    }
+    if (!v || !v->len) { jfree(v); RET(db_done_task()); }   // nothing to do
+    RET(db_write(self, "PATCH", NULL, v, 1));
+}
+B(db_Ref_removeValue) { (void)env; (void)a; (void)n; RET(db_write(self, "DELETE", NULL, NULL, 0)); }
+B(db_Ref_onDisconnect) {
+    (void)env; (void)a; (void)n;
+    dbo *r = db_of(self, 0);
+    if (!r) RET(NULL);
+    dbo *f;
+    void *od = db_new(C_OD, K_ONDISC, &f);
+    f->db = r->db;
+    f->path = strdup(r->path);
+    RET(od);
+}
+B(db_OD_op) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG_ONCE("Realtime Database: an onDisconnect operation is acknowledged; a REST client has no connection whose loss would run it");
+    RET(db_done_task());
+}
+B(db_Ref_runTransaction) {
+    (void)env;
+    dbo *r = db_of(self, 0);
+    void *h = ARG(0);
+    if (!r || !db_of(h, K_TXH)) RET(NULL);
+    db_op *op = db_op_new(OP_TX_READ, r->db, r->path);
+    op->txh = h;
+    klj_hold(h);
+    db_tx_send_read(op);
+    return (klj_val){0};
+}
+B(db_Ref_getDatabase) { (void)env; (void)a; (void)n; dbo *r = db_of(self, 0); RET(r ? r->db : NULL); }
+B(db_Ref_toString) {
+    (void)env; (void)a; (void)n;
+    dbo *r = db_of(self, 0);
+    db_info *d = r ? db_dbi(r->db) : NULL;
+    if (!d) RET(kl_jni_new_string(""));
+    sb b = {0};
+    sb_location(&b, d, r->path);
+    void *s = kl_jni_new_string(b.p);
+    free(b.p);
+    RET(s);
+}
+B(db_Ref_getParent) {
+    (void)env; (void)a; (void)n;
+    dbo *r = db_of(self, 0);
+    char *p = r ? db_parent(r->path) : NULL;
+    if (!p) RET(NULL);
+    void *ref = db_ref_new(r->db, p);
+    free(p);
+    RET(ref);
+}
+B(db_Ref_getRoot) { (void)env; (void)a; (void)n; dbo *r = db_of(self, 0); RET(r ? db_ref_new(r->db, "") : NULL); }
+B(db_Ref_getKey) {
+    (void)env; (void)a; (void)n;
+    dbo *r = db_of(self, 0);
+    const char *k = r ? db_last(r->path) : NULL;
+    RET(k ? kl_jni_new_string(k) : NULL);
+}
+
+// ---- queries (a DatabaseReference is one too)
+static void *db_q_derive(void *from, dbo **out) {
+    dbo *s = db_of(from, 0);
+    if (!s || (s->kind != K_REF && s->kind != K_QUERY)) return NULL;
+    dbo *f;
+    void *obj = db_new(C_Q, K_QUERY, &f);
+    f->db = s->db;
+    f->path = strdup(s->path);
+    db_q_copy(&f->q, &s->q);
+    *out = f;
+    return obj;
+}
+static klj_val db_order(void *self, int order, const char *child) {
+    dbo *s = db_of(self, 0);
+    if (s && s->q.order != Q_DEFAULT) RET(db_throw("java/lang/IllegalArgumentException", "Query: a second orderBy"));
+    char *c = NULL;
+    if (order == Q_CHILD) {
+        c = child ? db_norm_path(child) : NULL;
+        if (!c || !*c) { free(c); RET(db_throw("java/lang/IllegalArgumentException", "orderByChild: an invalid path")); }
+    }
+    dbo *f;
+    void *q = db_q_derive(self, &f);
+    if (!q) { free(c); RET(NULL); }
+    f->q.order = order;
+    f->q.child = c;
+    RET(q);
+}
+B(db_Q_orderByKey) { (void)env; (void)a; (void)n; return db_order(self, Q_KEY, NULL); }
+B(db_Q_orderByValue) { (void)env; (void)a; (void)n; return db_order(self, Q_VALUE, NULL); }
+B(db_Q_orderByPriority) { (void)env; (void)a; (void)n; return db_order(self, Q_PRIORITY, NULL); }
+B(db_Q_orderByChild) { (void)env; return db_order(self, Q_CHILD, ARG(0) ? klj_str(ARG(0)) : NULL); }
+static klj_val db_limit(void *self, int lim, int last) {
+    dbo *s = db_of(self, 0);
+    if (lim <= 0) RET(db_throw("java/lang/IllegalArgumentException", "Query: a limit must be positive"));
+    if (s && s->q.limit) RET(db_throw("java/lang/IllegalArgumentException", "Query: a limit was already set"));
+    dbo *f;
+    void *q = db_q_derive(self, &f);
+    if (!q) RET(NULL);
+    f->q.limit = lim;
+    f->q.last = last;
+    RET(q);
+}
+B(db_Q_limitToFirst) { (void)env; return db_limit(self, n > 0 ? (int)(int32_t)a[0].j : 0, 0); }
+B(db_Q_limitToLast) { (void)env; return db_limit(self, n > 0 ? (int)(int32_t)a[0].j : 0, 1); }
+// kind: 's' string, 'd' double, 'z' boolean. which: 1 start, 2 end, 3 both (equalTo)
+static klj_val db_bound(void *self, int which, char kind, const klj_val *a, int n, int keyed) {
+    dbo *s = db_of(self, 0);
+    if (!s) RET(NULL);
+    if (((which & 1) && s->q.has_start) || ((which & 2) && s->q.has_end))
+        RET(db_throw("java/lang/IllegalArgumentException", "Query: a bound was already set"));
+    sb b = {0};
+    if (kind == 's') {
+        const char *v = n > 0 && a[0].l ? klj_str(a[0].l) : NULL;
+        if (v) sb_jstr(&b, v); else sb_add(&b, "null");
+    } else if (kind == 'd') {
+        double d = n > 0 ? a[0].d : 0;
+        if (isnan(d) || isinf(d)) { free(b.p); RET(db_throw("java/lang/IllegalArgumentException", "Query: a bound that is not a number")); }
+        sb_addf(&b, "%.17g", d);
+    } else sb_add(&b, n > 0 && (uint8_t)a[0].j ? "true" : "false");
+    const char *key = keyed && n > 1 && a[1].l ? klj_str(a[1].l) : NULL;
+    if (s->q.order == Q_KEY && (kind != 's' || key)) {
+        free(b.p);
+        RET(db_throw("java/lang/IllegalArgumentException", "Query: orderByKey bounds are keys (strings), without a key name"));
+    }
+    dbo *f;
+    void *q = db_q_derive(self, &f);
+    if (!q) { free(b.p); RET(NULL); }
+    if (which & 1) { f->q.has_start = 1; f->q.start = strdup(b.p); f->q.start_key = db_strdup(key); }
+    if (which & 2) { f->q.has_end = 1; f->q.end = strdup(b.p); f->q.end_key = db_strdup(key); }
+    free(b.p);
+    RET(q);
+}
+#define BOUND(fn, which, kind, keyed) B(fn) { (void)env; return db_bound(self, which, kind, a, n, keyed); }
+BOUND(db_Q_startAtS, 1, 's', 0) BOUND(db_Q_startAtD, 1, 'd', 0) BOUND(db_Q_startAtZ, 1, 'z', 0)
+BOUND(db_Q_startAtSK, 1, 's', 1) BOUND(db_Q_startAtDK, 1, 'd', 1) BOUND(db_Q_startAtZK, 1, 'z', 1)
+BOUND(db_Q_endAtS, 2, 's', 0) BOUND(db_Q_endAtD, 2, 'd', 0) BOUND(db_Q_endAtZ, 2, 'z', 0)
+BOUND(db_Q_endAtSK, 2, 's', 1) BOUND(db_Q_endAtDK, 2, 'd', 1) BOUND(db_Q_endAtZK, 2, 'z', 1)
+BOUND(db_Q_equalToS, 3, 's', 0) BOUND(db_Q_equalToD, 3, 'd', 0) BOUND(db_Q_equalToZ, 3, 'z', 0)
+BOUND(db_Q_equalToSK, 3, 's', 1) BOUND(db_Q_equalToDK, 3, 'd', 1) BOUND(db_Q_equalToZK, 3, 'z', 1)
+B(db_Q_getRef) { (void)env; (void)a; (void)n; dbo *s = db_of(self, 0); RET(s ? db_ref_new(s->db, s->path) : NULL); }
+B(db_Q_keepSynced) { (void)env; (void)self; (void)a; (void)n; return (klj_val){0}; }
+static void *db_reg_new(void *listener, void *subject, int child) {
+    dbo *r;
+    void *reg = db_new("java/lang/Object", K_REG, &r);
+    db_hold_in(r, listener); r->o1 = listener;
+    db_hold_in(r, subject); r->o2 = subject;
+    r->i = child;
+    klj_hold(reg);   // the active list's
+    pthread_mutex_lock(&db_lock);
+    db_regs = realloc(db_regs, (size_t)(db_nregs + 1) * sizeof *db_regs);
+    db_regs[db_nregs++] = reg;
+    pthread_mutex_unlock(&db_lock);
+    return reg;
+}
+static klj_val db_add_listener(void *self, void *listener, int child) {
+    dbo *s = db_of(self, 0);
+    dbo *l = db_of(listener, K_LISTENER);
+    if (!s || !l) RET(db_throw("java/lang/NullPointerException", "Query.add*Listener: not a listener of this runtime"));
+    void *reg = db_reg_new(listener, self, child);
+    db_reg_fetch(reg);
+    RET(listener);
+}
+B(db_Q_addValueEventListener) { (void)env; (void)n; return db_add_listener(self, ARG(0), 0); }
+B(db_Q_addChildEventListener) { (void)env; (void)n; return db_add_listener(self, ARG(0), 1); }
+B(db_Q_addSingle) {
+    (void)env;
+    dbo *s = db_of(self, 0);
+    void *listener = ARG(0);
+    if (!s || !db_of(listener, K_LISTENER)) RET(db_throw("java/lang/NullPointerException", "addListenerForSingleValueEvent: not a listener of this runtime"));
+    db_op *op = db_op_new(OP_READ, s->db, s->path);
+    db_q_copy(&op->q, &s->q);
+    op->single = listener;
+    klj_hold(listener);
+    db_read_send(op);
+    return (klj_val){0};
+}
+B(db_Q_removeListener) {
+    (void)env;
+    dbo *s = db_of(self, 0);
+    void *listener = ARG(0);
+    if (!s) return (klj_val){0};
+    sb want = {0};
+    db_q_canon(&want, &s->q);
+    pthread_mutex_lock(&db_lock);
+    int nr = db_nregs;
+    void **regs = malloc((size_t)(nr ? nr : 1) * sizeof *regs);
+    for (int i = 0; i < nr; i++) regs[i] = db_regs[i];
+    pthread_mutex_unlock(&db_lock);
+    for (int i = 0; i < nr; i++) {
+        dbo *r = db_of(regs[i], K_REG);
+        dbo *q = r ? db_of(r->o2, 0) : NULL;
+        if (!r || r->o1 != listener || !q || q->db != s->db || strcmp(q->path, s->path)) continue;
+        sb have = {0};
+        db_q_canon(&have, &q->q);
+        int same = !strcmp(have.p, want.p);
+        free(have.p);
+        if (same) db_reg_drop(regs[i]);
+    }
+    free(regs);
+    free(want.p);
+    return (klj_val){0};
+}
+
+// ---- snapshots
+static dbo *db_snap(void *obj) { return db_of(obj, K_SNAP); }
+B(db_Snap_child) {
+    (void)env;
+    dbo *s = db_snap(self);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    char *norm = p ? db_norm_path(p) : NULL;
+    if (!s || !norm) { free(norm); RET(db_throw(C_EXC, "DataSnapshot.child: an invalid path")); }
+    char *full = db_join(s->path, norm);
+    void *c = db_snap_new(s->db, full, jcopy(db_at(s->val, norm)), NULL);
+    free(norm); free(full);
+    RET(c);
+}
+B(db_Snap_hasChild) {
+    (void)env;
+    dbo *s = db_snap(self);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    char *norm = p ? db_norm_path(p) : NULL;
+    int has = s && norm && *norm && db_at(s->val, norm) != NULL;
+    free(norm);
+    RETJ(has);
+}
+B(db_Snap_hasChildren) { (void)env; (void)a; (void)n; dbo *s = db_snap(self); RETJ(s && s->val && s->val->t == 'o' && s->val->len > 0); }
+B(db_Snap_exists) { (void)env; (void)a; (void)n; dbo *s = db_snap(self); RETJ(s && s->val); }
+B(db_Snap_getValue) { (void)env; (void)a; (void)n; dbo *s = db_snap(self); RET(s ? db_to_java(s->val) : NULL); }
+B(db_Snap_getChildrenCount) { (void)env; (void)a; (void)n; dbo *s = db_snap(self); RETJ(s && s->val && s->val->t == 'o' ? s->val->len : 0); }
+B(db_Snap_getRef) { (void)env; (void)a; (void)n; dbo *s = db_snap(self); RET(s ? db_ref_new(s->db, s->path) : NULL); }
+B(db_Snap_getKey) {
+    (void)env; (void)a; (void)n;
+    dbo *s = db_snap(self);
+    const char *k = s ? db_last(s->path) : NULL;
+    RET(k ? kl_jni_new_string(k) : NULL);
+}
+B(db_Snap_getChildren) {   // an Iterable of child snapshots, in the snapshot's order
+    (void)env; (void)a; (void)n;
+    dbo *s = db_snap(self);
+    void *list = db_list_new();
+    int cn;
+    db_ent *e = s ? db_children(s->val, &s->q, &cn) : NULL;
+    for (int i = 0; e && i < cn; i++) {
+        char *full = db_join(s->path, e[i].key);
+        db_list_add(list, db_snap_new(s->db, full, jcopy(e[i].v), NULL));
+        free(full);
+    }
+    free(e);
+    RET(list);
+}
+B(db_null) { (void)env; (void)self; (void)a; (void)n; RET(NULL); }
+B(db_Snap_toString) {
+    (void)env; (void)a; (void)n;
+    dbo *s = db_snap(self);
+    sb b = {0};
+    sb_add(&b, "DataSnapshot { key = ");
+    sb_add(&b, s && db_last(s->path) ? db_last(s->path) : "null");
+    sb_add(&b, ", value = ");
+    jcanon(&b, s ? s->val : NULL);
+    sb_add(&b, " }");
+    void *r = kl_jni_new_string(b.p);
+    free(b.p);
+    RET(r);
+}
+
+// ---- MutableData (a transaction's data, shared by every child of it)
+static dbo *db_md(void *obj) { return db_of(obj, K_MDATA); }
+static jv *db_md_node(dbo *m) { return db_at(m->mroot->root, m->path); }
+B(db_MD_hasChildren) { (void)env; (void)a; (void)n; dbo *m = db_md(self); jv *v = m ? db_md_node(m) : NULL; RETJ(v && v->t == 'o' && v->len > 0); }
+B(db_MD_hasChild) {
+    (void)env;
+    dbo *m = db_md(self);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    char *norm = p ? db_norm_path(p) : NULL;
+    int has = m && norm && *norm && db_at(db_md_node(m), norm) != NULL;
+    free(norm);
+    RETJ(has);
+}
+B(db_MD_child) {
+    (void)env;
+    dbo *m = db_md(self);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    char *norm = p ? db_norm_path(p) : NULL;
+    if (!m || !norm) { free(norm); RET(db_throw(C_EXC, "MutableData.child: an invalid path")); }
+    char *full = db_join(m->path, norm);
+    void *c = db_mdata_new(m->db, m->mroot, full);
+    free(norm); free(full);
+    RET(c);
+}
+B(db_MD_getChildrenCount) { (void)env; (void)a; (void)n; dbo *m = db_md(self); jv *v = m ? db_md_node(m) : NULL; RETJ(v && v->t == 'o' ? v->len : 0); }
+B(db_MD_getChildren) {
+    (void)env; (void)a; (void)n;
+    dbo *m = db_md(self);
+    void *list = db_list_new();
+    int cn;
+    db_ent *e = m ? db_children(db_md_node(m), NULL, &cn) : NULL;
+    for (int i = 0; e && i < cn; i++) {
+        char *full = db_join(m->path, e[i].key);
+        db_list_add(list, db_mdata_new(m->db, m->mroot, full));
+        free(full);
+    }
+    free(e);
+    RET(list);
+}
+B(db_MD_getKey) {
+    (void)env; (void)a; (void)n;
+    dbo *m = db_md(self);
+    const char *k = m ? db_last(m->path) : NULL;
+    RET(k ? kl_jni_new_string(k) : NULL);
+}
+B(db_MD_getValue) { (void)env; (void)a; (void)n; dbo *m = db_md(self); RET(m ? db_to_java(db_md_node(m)) : NULL); }
+B(db_MD_setValue) {
+    (void)env;
+    dbo *m = db_md(self);
+    if (!m) return (klj_val){0};
+    int ok;
+    jv *v = db_value_arg(ARG(0), &ok);
+    if (!ok) { db_throw(C_EXC, "MutableData.setValue: a value the database cannot store"); return (klj_val){0}; }
+    pthread_mutex_lock(&db_lock);
+    db_put_at(&m->mroot->root, m->path, v);
+    pthread_mutex_unlock(&db_lock);
+    return (klj_val){0};
+}
+B(db_MD_equals) {
+    (void)env;
+    dbo *x = db_md(self), *y = db_md(ARG(0));
+    RETJ(x && y && x->mroot == y->mroot && !strcmp(x->path, y->path));
+}
+B(db_MD_toString) {
+    (void)env; (void)a; (void)n;
+    dbo *m = db_md(self);
+    sb b = {0};
+    sb_add(&b, "MutableData { key = ");
+    sb_add(&b, m && db_last(m->path) ? db_last(m->path) : "null");
+    sb_add(&b, ", value = ");
+    jcanon(&b, m ? db_md_node(m) : NULL);
+    sb_add(&b, " }");
+    void *r = kl_jni_new_string(b.p);
+    free(b.p);
+    RET(r);
+}
+
+// ---- the C++ SDK's own listener and handler classes
+static klj_val db_listener_new(void *self, const klj_val *a, int n, int kind, int child) {
+    dbo *l;
+    void *obj = db_new(klj_class_name(self), kind, &l);
+    l->a = n > 0 ? (int64_t)a[0].j : 0;
+    l->b = n > 1 ? (int64_t)a[1].j : 0;
+    l->i = child;
+    RET(obj);
+}
+B(db_VL_init) { (void)env; return db_listener_new(self, a, n, K_LISTENER, 0); }
+B(db_CL_init) { (void)env; return db_listener_new(self, a, n, K_LISTENER, 1); }
+B(db_TH_init) { (void)env; return db_listener_new(self, a, n, K_TXH, 0); }
+B(db_EL_discard) {
+    (void)env; (void)a; (void)n;
+    dbo *l = db_of(self, 0);
+    if (l) { pthread_mutex_lock(&db_lock); l->a = l->b = 0; pthread_mutex_unlock(&db_lock); }
+    return (klj_val){0};
+}
+B(db_TH_discard) {
+    (void)env; (void)a; (void)n;
+    dbo *h = db_of(self, K_TXH);
+    int64_t tx = 0;
+    if (h) { pthread_mutex_lock(&db_lock); tx = h->b; h->a = h->b = 0; pthread_mutex_unlock(&db_lock); }
+    RETJ(tx);
+}
+
+// ---- tasks: this file's, else step 145's
+static klj_val db_forward(const char *cls, const char *name, const char *sig,
+                          void *env, void *self, const klj_val *a, int n) {
+    for (const klj_binding *b = klj_bind_firestore; b->cls; b++)
+        if (!strcmp(b->cls, cls) && !strcmp(b->name, name) && !strcmp(b->sig, sig)) return b->fn(env, self, a, n);
+    KLJ_LOG("no host implementation for %s.%s%s", cls, name, sig);
+    return (klj_val){0};
+}
+#define CB_INIT_SIG "(" SIG_TASK "JJ)V"
+B(db_CB_init) {
+    void *task = ARG(0);
+    dbo *t = db_of(task, K_TASK);
+    if (!t) return db_forward(C_CB, "<init>", CB_INIT_SIG, env, self, a, n);
+    dbo *c;
+    void *cb = db_new(C_CB, K_CB, &c);
+    c->a = n > 1 ? (int64_t)a[1].j : 0;
+    c->b = n > 2 ? (int64_t)a[2].j : 0;
+    klj_hold(cb);   // the task's list
+    pthread_mutex_lock(&db_lock);
+    t->cbs = realloc(t->cbs, (size_t)(t->ncbs + 1) * sizeof *t->cbs);
+    t->cbs[t->ncbs++] = cb;
+    int done = t->state != 0;
+    pthread_mutex_unlock(&db_lock);
+    if (done) { klj_hold(task); kl_mv_ui_later(db_task_deliver, task); }
+    RET(cb);
+}
+B(db_CB_cancel) {
+    if (!db_of(self, K_CB)) return db_forward(C_CB, "cancel", "()V", env, self, a, n);
+    db_cb_call(self, 3, NULL, NULL, NULL);
+    return (klj_val){0};
+}
+#define TASK_FWD(fn, name, sig, expr)                                              \
+    B(fn) {                                                                        \
+        dbo *t = db_of(self, K_TASK);                                              \
+        if (!t) return db_forward(C_TASK, name, sig, env, self, a, n);             \
+        expr;                                                                      \
+    }
+TASK_FWD(db_Task_getResult, "getResult", "()Ljava/lang/Object;",
+         if (t->state == 0) { kl_jni_throw("java/lang/IllegalStateException"); RET(NULL); }
+         if (t->state != 1) { kl_jni_throw("com/google/android/gms/tasks/RuntimeExecutionException"); RET(NULL); }
+         RET(t->o1))
+TASK_FWD(db_Task_getException, "getException", "()Ljava/lang/Exception;", RET(t->state == 2 ? t->o2 : NULL))
+TASK_FWD(db_Task_isComplete, "isComplete", "()Z", RETJ(t->state != 0))
+TASK_FWD(db_Task_isSuccessful, "isSuccessful", "()Z", RETJ(t->state == 1))
+TASK_FWD(db_Task_isCanceled, "isCanceled", "()Z", RETJ(t->state == 3))
+// Throwable.getMessage / toString on a DatabaseException or DatabaseError.
+B(db_Exc_getMessage) { (void)env; (void)a; (void)n; dbo *f = db_of(self, 0); RET(kl_jni_new_string(f && f->s ? f->s : "")); }
+
+#undef B
+#define DB(cls, name, sig, fn) {cls, name, sig, fn}
+#define SIG_Q    "L" C_Q ";"
+#define SIG_REF  "L" C_REF ";"
+const klj_binding klj_bind_database[] = {
+    // FirebaseDatabase
+    DB(C_DB, "getInstance", "(L" C_APP ";)L" C_DB ";", db_DB_getInstance),
+    DB(C_DB, "getInstance", "(L" C_APP ";Ljava/lang/String;)L" C_DB ";", db_DB_getInstanceUrl),
+    DB(C_DB, "getInstance", "()L" C_DB ";", db_DB_getDefault),
+    DB(C_DB, "getApp", "()L" C_APP ";", db_DB_getApp),
+    DB(C_DB, "getReference", "()" SIG_REF, db_DB_getReference),
+    DB(C_DB, "getReference", "(Ljava/lang/String;)" SIG_REF, db_DB_getReferencePath),
+    DB(C_DB, "getReferenceFromUrl", "(Ljava/lang/String;)" SIG_REF, db_DB_getReferenceFromUrl),
+    DB(C_DB, "purgeOutstandingWrites", "()V", db_noop),
+    DB(C_DB, "goOnline", "()V", db_DB_goOnline),
+    DB(C_DB, "goOffline", "()V", db_DB_goOffline),
+    DB(C_DB, "setLogLevel", "(L" C_LVL ";)V", db_noop),
+    DB(C_DB, "setPersistenceEnabled", "(Z)V", db_noop),
+    DB(C_DB, "setPersistenceCacheSizeBytes", "(J)V", db_noop),
+    DB(C_DB, "getSdkVersion", "()Ljava/lang/String;", db_DB_getSdkVersion),
+    DB(C_LVL, "valueOf", "(Ljava/lang/String;)L" C_LVL ";", db_Level_valueOf),
+    // DatabaseError, DatabaseException
+    DB(C_ERR, "getCode", "()I", db_Err_getCode),
+    DB(C_ERR, "getMessage", "()Ljava/lang/String;", db_Err_getMessage),
+    DB(C_ERR, "getDetails", "()Ljava/lang/String;", db_Err_getDetails),
+    DB(C_ERR, "toString", "()Ljava/lang/String;", db_Err_getMessage),
+    DB(C_ERR, "toException", "()L" C_EXC ";", db_Err_toException),
+    DB(C_EXC, "getMessage", "()Ljava/lang/String;", db_Exc_getMessage),
+    DB(C_EXC, "getLocalizedMessage", "()Ljava/lang/String;", db_Exc_getMessage),
+    DB(C_EXC, "toString", "()Ljava/lang/String;", db_Exc_getMessage),
+    // DatabaseReference
+    DB(C_REF, "child", "(Ljava/lang/String;)" SIG_REF, db_Ref_child),
+    DB(C_REF, "push", "()" SIG_REF, db_Ref_push),
+    DB(C_REF, "setValue", "(Ljava/lang/Object;)" SIG_TASK, db_Ref_setValue),
+    DB(C_REF, "setValue", "(Ljava/lang/Object;Ljava/lang/Object;)" SIG_TASK, db_Ref_setValuePriority),
+    DB(C_REF, "setPriority", "(Ljava/lang/Object;)" SIG_TASK, db_Ref_setPriority),
+    DB(C_REF, "updateChildren", "(Ljava/util/Map;)" SIG_TASK, db_Ref_updateChildren),
+    DB(C_REF, "removeValue", "()" SIG_TASK, db_Ref_removeValue),
+    DB(C_REF, "onDisconnect", "()L" C_OD ";", db_Ref_onDisconnect),
+    DB(C_REF, "runTransaction", "(L" DB_PKG "Transaction$Handler;Z)V", db_Ref_runTransaction),
+    DB(C_REF, "runTransaction", "(L" DB_PKG "Transaction$Handler;)V", db_Ref_runTransaction),
+    DB(C_REF, "goOffline", "()V", db_Ref_goOffline),
+    DB(C_REF, "goOnline", "()V", db_Ref_goOnline),
+    DB(C_REF, "getDatabase", "()L" C_DB ";", db_Ref_getDatabase),
+    DB(C_REF, "toString", "()Ljava/lang/String;", db_Ref_toString),
+    DB(C_REF, "getParent", "()" SIG_REF, db_Ref_getParent),
+    DB(C_REF, "getRoot", "()" SIG_REF, db_Ref_getRoot),
+    DB(C_REF, "getKey", "()Ljava/lang/String;", db_Ref_getKey),
+    // OnDisconnect
+    DB(C_OD, "setValue", "(Ljava/lang/Object;)" SIG_TASK, db_OD_op),
+    DB(C_OD, "setValue", "(Ljava/lang/Object;Ljava/lang/String;)" SIG_TASK, db_OD_op),
+    DB(C_OD, "setValue", "(Ljava/lang/Object;D)" SIG_TASK, db_OD_op),
+    DB(C_OD, "updateChildren", "(Ljava/util/Map;)" SIG_TASK, db_OD_op),
+    DB(C_OD, "removeValue", "()" SIG_TASK, db_OD_op),
+    DB(C_OD, "cancel", "()" SIG_TASK, db_OD_op),
+    // Query
+    DB(C_Q, "addValueEventListener", "(L" DB_PKG "ValueEventListener;)L" DB_PKG "ValueEventListener;", db_Q_addValueEventListener),
+    DB(C_Q, "addChildEventListener", "(L" DB_PKG "ChildEventListener;)L" DB_PKG "ChildEventListener;", db_Q_addChildEventListener),
+    DB(C_Q, "addListenerForSingleValueEvent", "(L" DB_PKG "ValueEventListener;)V", db_Q_addSingle),
+    DB(C_Q, "removeEventListener", "(L" DB_PKG "ValueEventListener;)V", db_Q_removeListener),
+    DB(C_Q, "removeEventListener", "(L" DB_PKG "ChildEventListener;)V", db_Q_removeListener),
+    DB(C_Q, "keepSynced", "(Z)V", db_Q_keepSynced),
+    DB(C_Q, "startAt", "(Ljava/lang/String;)" SIG_Q, db_Q_startAtS),
+    DB(C_Q, "startAt", "(D)" SIG_Q, db_Q_startAtD),
+    DB(C_Q, "startAt", "(Z)" SIG_Q, db_Q_startAtZ),
+    DB(C_Q, "startAt", "(Ljava/lang/String;Ljava/lang/String;)" SIG_Q, db_Q_startAtSK),
+    DB(C_Q, "startAt", "(DLjava/lang/String;)" SIG_Q, db_Q_startAtDK),
+    DB(C_Q, "startAt", "(ZLjava/lang/String;)" SIG_Q, db_Q_startAtZK),
+    DB(C_Q, "endAt", "(Ljava/lang/String;)" SIG_Q, db_Q_endAtS),
+    DB(C_Q, "endAt", "(D)" SIG_Q, db_Q_endAtD),
+    DB(C_Q, "endAt", "(Z)" SIG_Q, db_Q_endAtZ),
+    DB(C_Q, "endAt", "(Ljava/lang/String;Ljava/lang/String;)" SIG_Q, db_Q_endAtSK),
+    DB(C_Q, "endAt", "(DLjava/lang/String;)" SIG_Q, db_Q_endAtDK),
+    DB(C_Q, "endAt", "(ZLjava/lang/String;)" SIG_Q, db_Q_endAtZK),
+    DB(C_Q, "equalTo", "(Ljava/lang/String;)" SIG_Q, db_Q_equalToS),
+    DB(C_Q, "equalTo", "(D)" SIG_Q, db_Q_equalToD),
+    DB(C_Q, "equalTo", "(Z)" SIG_Q, db_Q_equalToZ),
+    DB(C_Q, "equalTo", "(Ljava/lang/String;Ljava/lang/String;)" SIG_Q, db_Q_equalToSK),
+    DB(C_Q, "equalTo", "(DLjava/lang/String;)" SIG_Q, db_Q_equalToDK),
+    DB(C_Q, "equalTo", "(ZLjava/lang/String;)" SIG_Q, db_Q_equalToZK),
+    DB(C_Q, "limitToFirst", "(I)" SIG_Q, db_Q_limitToFirst),
+    DB(C_Q, "limitToLast", "(I)" SIG_Q, db_Q_limitToLast),
+    DB(C_Q, "orderByChild", "(Ljava/lang/String;)" SIG_Q, db_Q_orderByChild),
+    DB(C_Q, "orderByPriority", "()" SIG_Q, db_Q_orderByPriority),
+    DB(C_Q, "orderByKey", "()" SIG_Q, db_Q_orderByKey),
+    DB(C_Q, "orderByValue", "()" SIG_Q, db_Q_orderByValue),
+    DB(C_Q, "getRef", "()" SIG_REF, db_Q_getRef),
+    // DataSnapshot
+    DB(C_SNAP, "child", "(Ljava/lang/String;)L" C_SNAP ";", db_Snap_child),
+    DB(C_SNAP, "hasChild", "(Ljava/lang/String;)Z", db_Snap_hasChild),
+    DB(C_SNAP, "hasChildren", "()Z", db_Snap_hasChildren),
+    DB(C_SNAP, "exists", "()Z", db_Snap_exists),
+    DB(C_SNAP, "getValue", "()Ljava/lang/Object;", db_Snap_getValue),
+    DB(C_SNAP, "getChildrenCount", "()J", db_Snap_getChildrenCount),
+    DB(C_SNAP, "getRef", "()" SIG_REF, db_Snap_getRef),
+    DB(C_SNAP, "getKey", "()Ljava/lang/String;", db_Snap_getKey),
+    DB(C_SNAP, "getChildren", "()Ljava/lang/Iterable;", db_Snap_getChildren),
+    DB(C_SNAP, "getPriority", "()Ljava/lang/Object;", db_null),
+    DB(C_SNAP, "toString", "()Ljava/lang/String;", db_Snap_toString),
+    // MutableData
+    DB(C_MD, "hasChildren", "()Z", db_MD_hasChildren),
+    DB(C_MD, "hasChild", "(Ljava/lang/String;)Z", db_MD_hasChild),
+    DB(C_MD, "child", "(Ljava/lang/String;)L" C_MD ";", db_MD_child),
+    DB(C_MD, "getChildrenCount", "()J", db_MD_getChildrenCount),
+    DB(C_MD, "getChildren", "()Ljava/lang/Iterable;", db_MD_getChildren),
+    DB(C_MD, "getKey", "()Ljava/lang/String;", db_MD_getKey),
+    DB(C_MD, "getValue", "()Ljava/lang/Object;", db_MD_getValue),
+    DB(C_MD, "setValue", "(Ljava/lang/Object;)V", db_MD_setValue),
+    DB(C_MD, "setPriority", "(Ljava/lang/Object;)V", db_noop),
+    DB(C_MD, "getPriority", "()Ljava/lang/Object;", db_null),
+    DB(C_MD, "equals", "(Ljava/lang/Object;)Z", db_MD_equals),
+    DB(C_MD, "toString", "()Ljava/lang/String;", db_MD_toString),
+    // the C++ SDK's listener and handler classes
+    DB(C_VL, "<init>", "(JJ)V", db_VL_init),
+    DB(C_CL, "<init>", "(JJ)V", db_CL_init),
+    DB(C_EL, "discardPointers", "()V", db_EL_discard),
+    DB(C_VL, "discardPointers", "()V", db_EL_discard),
+    DB(C_CL, "discardPointers", "()V", db_EL_discard),
+    DB(C_TH, "<init>", "(JJ)V", db_TH_init),
+    DB(C_TH, "discardPointers", "()J", db_TH_discard),
+    // gms tasks and their callbacks: this file's tasks, else step 145's
+    DB(C_CB, "<init>", CB_INIT_SIG, db_CB_init),
+    DB(C_CB, "cancel", "()V", db_CB_cancel),
+    DB(C_TASK, "getResult", "()Ljava/lang/Object;", db_Task_getResult),
+    DB(C_TASK, "getException", "()Ljava/lang/Exception;", db_Task_getException),
+    DB(C_TASK, "isComplete", "()Z", db_Task_isComplete),
+    DB(C_TASK, "isSuccessful", "()Z", db_Task_isSuccessful),
+    DB(C_TASK, "isCanceled", "()Z", db_Task_isCanceled),
+    {NULL, NULL, NULL, NULL},
+};
+'''
+if not os.path.exists(p) or open(p).read() != src:
+    open(p, "w").write(src)
+print("overlay: the Realtime Database's Java side on the REST API (runtime/jni/kl_jni_database.c)")
+PYEOF
+
+# 161 — step 160's file joins the runtime: its binding table is walked before
+# step 145's (its gms Task / JniResultCallback answer for the tasks it made and
+# hand every other one to Firestore's table); a retired object of the file lets
+# go of what it held (step 146's walk); DatabaseError's static int codes
+# (DISCONNECTED, PERMISSION_DENIED, ...), which the SDK reads once at
+# initialisation, have their Android values; the file is in RUNTIME_JNI. And
+# FirebaseOptions.getDatabaseUrl says whether it answered a URL (never the URL):
+# a title whose FirebaseDatabase.DefaultInstance threw before any database
+# call reached Java ("Specify DatabaseURL ...", caught by the title) shows
+# there whether the options it read carried one.
+python3 - "$K/runtime/jni/kl_jni_int.h" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Realtime Database's Java side (step 161)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    old = "extern const klj_binding klj_bind_firestore[];   // metavision: Firestore's Java side (step 146)\n"
+    s = sub(s, old, old + "extern const klj_binding klj_bind_database[];    // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: kl_jni_int.h: the Realtime Database's binding table")
+PYEOF
+
+python3 - "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Realtime Database's Java side (step 161)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    # walked before Firestore's: the shared Task / JniResultCallback hand on what is not theirs
+    old = "    klj_bind_firestore,   // metavision: Firestore's Java side (step 146)\n"
+    s = sub(s, old, "    klj_bind_database,    // " + marker + ": before Firestore's (shared tasks)\n" + old)
+    # a retired object of the file lets go of what it held
+    old = "void mv_fs_retire_locked(klj_object *o);\n"
+    s = sub(s, old, old + "void mv_db_retire_locked(klj_object *o);   // " + marker + "\n")
+    old = "    mv_fs_retire_locked(o);\n"
+    s = sub(s, old, old + "    mv_db_retire_locked(o);   // " + marker + "\n")
+    # DatabaseError's static int codes
+    old = "    {   // metavision: references are held (step 146): Firestore's enum constants and SetOptions.OVERWRITE\n"
+    s = sub(s, old,
+        "    {   // " + marker + ": DatabaseError's static int codes\n"
+        "        int mv_db_static_field(const char *cls, const char *name, char want, klj_val *out);\n"
+        "        klj_val mv_dv;\n"
+        "        if (mv_db_static_field(w->cls, w->name, want, &mv_dv)) return mv_dv;\n"
+        "    }\n" + old)
+    open(p, "w").write(s)
+print("overlay: kl_jni.c: the Realtime Database's table (before Firestore's), its retire hook and DatabaseError's codes")
+PYEOF
+
+python3 - "$K/runtime/jni/kl_jni_net.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: getDatabaseUrl says whether it answered one (step 161)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    old = ("static klj_val mv_fbo_get(void *self, int i) {\n"
+           "    mv_fbo *o = mv_fbo_of(self);\n")
+    s = sub(s, old, old +
+        "    if (i == MV_FBO_DB_URL)   // " + marker + "\n"
+        "        KLJ_LOG(\"FirebaseOptions.getDatabaseUrl -> %s\", o && o->v[i] && *o->v[i] ? \"a URL\" : \"none\");\n")
+    open(p, "w").write(s)
+print("overlay: FirebaseOptions.getDatabaseUrl says whether it answered a URL")
+PYEOF
+
+python3 - "$K/Makefile" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if "runtime/jni/kl_jni_database.c" not in s:
+    old = "RUNTIME_JNI += runtime/jni/kl_jni_firestore.c   # metavision: Firestore's Java side (step 146)\n"
+    s = sub(s, old, old + "RUNTIME_JNI += runtime/jni/kl_jni_database.c    # metavision: Realtime Database's Java side (step 161)\n")
+    open(p, "w").write(s)
+print("overlay: Makefile RUNTIME_JNI += runtime/jni/kl_jni_database.c")
+PYEOF
+
+# 162 — the request a Realtime Database transaction makes:
+# klepton-overlay/MetavisionNet.swift (copied by step 147) also defines
+# mv_net_fetch_headers, the same URLSession request answering the response
+# headers ("Name: value" lines) for the ETag a conditional write needs, over
+# step 160's weak default (mv_net_fetch without headers, so a transaction then
+# writes without a precondition). Checked here, so an app built from this
+# overlay never silently runs on the fallback.
+python3 - "$K/visionos/Sources/MetavisionNet.swift" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if '@_cdecl("mv_net_fetch_headers")' not in s:
+    sys.exit(f"overlay: {p} does not define mv_net_fetch_headers (step 162)")
+print("overlay: MetavisionNet.swift answers response headers too (mv_net_fetch_headers)")
+PYEOF
