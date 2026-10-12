@@ -4,8 +4,9 @@
 # The build runner never sees an APK (the simulator pass gets its data from
 # tools/metavision-sim-data instead). It needs, per target, only the guest's
 # arm64 libraries (klepton-ld translates them there, mkguest.sh wraps them as
-# frameworks), its decoded AndroidManifest.xml (permissions, package) and string
-# resources (res/values/strings.xml), plus the
+# frameworks), its decoded AndroidManifest.xml (permissions, package), string
+# resources (res/values/strings.xml) and signing certificate (META-INF's v1
+# block, or the certificate itself for a title signed v2/v3 only), plus the
 # generated target table. Assets, OBBs and decoded
 # metadata go to the headset's app container at install time, not into the
 # build. Guest code is not ours to publish, so the bundle is AES-256 encrypted
@@ -49,6 +50,19 @@ for t in "$@"; do
     if [ -f "$G/$t/res/values/strings.xml" ]; then
         mkdir -p "$STAGE/guests/$t/res/values"
         cp "$G/$t/res/values/strings.xml" "$STAGE/guests/$t/res/values/"
+    fi
+    # Its signing certificate: the overlay carries it into the launcher
+    # catalogue (PackageInfo.signatures). The v1 signature block when the APK
+    # has one; else the certificate out of the APK's v2/v3 signing block, which
+    # the runner cannot read itself (it never sees an APK).
+    mkdir -p "$STAGE/guests/$t/original/META-INF"
+    for f in "$G/$t"/original/META-INF/*.RSA "$G/$t"/original/META-INF/*.DSA "$G/$t"/original/META-INF/*.EC; do
+        if [ -f "$f" ]; then cp "$f" "$STAGE/guests/$t/original/META-INF/"; fi
+    done
+    if ! ls "$STAGE/guests/$t/original/META-INF" | grep -q .; then
+        apk=$(python3 -c "import json; print(json.load(open('$G/targets.json'))['$t'].get('apk') or '')")   # relative to $G
+        "$ROOT/tools/metavision-apk-cert" -o "$STAGE/guests/$t/original/apk-cert.der" "$G/$t" "$G/$apk" ||
+            echo "  ! $t: no signing certificate found" >&2
     fi
     echo "  + $t  ($(du -sh "$G/$t/lib/arm64-v8a" | cut -f1))" >&2
 done

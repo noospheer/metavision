@@ -6478,6 +6478,222 @@ if marker not in s:
 print("overlay: Google Play services report missing")
 PYEOF
 
+# 77 — the APK's signing certificate. A native library that checks it was not
+# re-signed goes ActivityThread -> Application -> PackageManager, asks
+# getPackageInfo(<own package>, GET_SIGNATURES) and reads PackageInfo.signatures.
+# Nothing answered that field, so the guest got null, called
+# Signature.toCharsString() on it and crashed in strlen(NULL). The field is now
+# a one-element Signature[] holding the title's own signing certificate:
+# toCharsString (lowercase hex of the DER, Android's format), toChars,
+# toByteArray, hashCode (Arrays.hashCode of the DER) and equals; signingInfo /
+# SigningInfo.getApkContentsSigners answer the same array for the newer API.
+# The DER comes from KL_APK_CERT (hex), which the launcher sets from the
+# catalogue (below); without it the field stays null, as before, and says so.
+python3 - "$K/runtime/jni/kl_jni_services.c" "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+ps, pj = sys.argv[1:3]
+marker = "metavision: the APK's signing certificate (step 77)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+
+s = open(ps).read()
+if marker not in s:
+    s = sub(ps, s, "const klj_binding klj_bind_services[] = {\n", "// " + marker + r'''
+// KL_APK_CERT: hex of the signing certificate's DER, read once. Never logged.
+#define MV_SIG_CLASS "android/content/pm/Signature"
+#define MV_SIGINFO_CLASS "android/content/pm/SigningInfo"
+static unsigned char *mv_cert;
+static size_t mv_cert_len;
+static pthread_once_t mv_cert_once = PTHREAD_ONCE_INIT;
+static int mv_hex_nibble(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+static void mv_cert_load(void) {
+    const char *e = kl_env_str("KL_APK_CERT", NULL);
+    size_t n = e ? strlen(e) : 0;
+    if (!n || n % 2) {
+        KLJ_LOG("PackageInfo.signatures -> null (no KL_APK_CERT: the title's signing certificate is not known)");
+        return;
+    }
+    unsigned char *d = malloc(n / 2);
+    for (size_t i = 0; d && i < n / 2; i++) {
+        int hi = mv_hex_nibble(e[2 * i]), lo = mv_hex_nibble(e[2 * i + 1]);
+        if (hi < 0 || lo < 0) {
+            free(d);
+            KLJ_LOG("PackageInfo.signatures -> null (KL_APK_CERT is not hex)");
+            return;
+        }
+        d[i] = (unsigned char)(hi << 4 | lo);
+    }
+    if (!d) return;
+    mv_cert = d;
+    mv_cert_len = n / 2;
+    KLJ_LOG("PackageInfo.signatures: the title's signing certificate from KL_APK_CERT (%zu bytes)", mv_cert_len);
+}
+// The one Signature[] every read answers: host-held, so pinned, as is its element.
+static void *mv_signatures(void) {
+    pthread_once(&mv_cert_once, mv_cert_load);
+    if (!mv_cert) return NULL;
+    static void *arr, *sig;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (!arr) {
+        void *s = klj_singleton(MV_SIG_CLASS, &sig).l;
+        void *a = klj_new_array('L', MV_SIG_CLASS, 1);
+        ((void **)klj_arr(a)->data)[0] = s;
+        klj_as_object(a)->pinned = 1;
+        arr = a;
+    }
+    pthread_mutex_unlock(&lock);
+    return arr;
+}
+klj_val mv_PackageInfo_signatures(void) {
+    return (klj_val){.l = mv_signatures()};
+}
+klj_val mv_PackageInfo_signingInfo(void) {
+    static void *si;
+    return mv_signatures() ? klj_singleton(MV_SIGINFO_CLASS, &si) : (klj_val){0};
+}
+static klj_val mv_Signature_toCharsString(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    if (!mv_cert) return (klj_val){0};
+    static const char hex[] = "0123456789abcdef";
+    char *t = malloc(2 * mv_cert_len + 1);
+    if (!t) return (klj_val){0};
+    for (size_t i = 0; i < mv_cert_len; i++) {
+        t[2 * i] = hex[mv_cert[i] >> 4];
+        t[2 * i + 1] = hex[mv_cert[i] & 15];
+    }
+    t[2 * mv_cert_len] = 0;
+    void *str = kl_jni_new_string(t);
+    free(t);
+    return (klj_val){.l = str};
+}
+static klj_val mv_Signature_toChars(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static const char hex[] = "0123456789abcdef";
+    void *out = klj_new_array('C', NULL, (int)(2 * mv_cert_len));
+    uint16_t *c = klj_arr(out)->data;
+    for (size_t i = 0; mv_cert && i < mv_cert_len; i++) {
+        c[2 * i] = (uint16_t)hex[mv_cert[i] >> 4];
+        c[2 * i + 1] = (uint16_t)hex[mv_cert[i] & 15];
+    }
+    return (klj_val){.l = out};
+}
+static klj_val mv_Signature_toByteArray(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    void *out = klj_new_array('B', NULL, (int)mv_cert_len);
+    if (mv_cert && mv_cert_len) memcpy(klj_arr(out)->data, mv_cert, mv_cert_len);
+    return (klj_val){.l = out};
+}
+static klj_val mv_Signature_hashCode(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    uint32_t h = 1;   // Arrays.hashCode(byte[]): 31*h + (signed) byte, wrapping
+    for (size_t i = 0; mv_cert && i < mv_cert_len; i++)
+        h = 31u * h + (uint32_t)(int32_t)(int8_t)mv_cert[i];
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)h};
+}
+static klj_val mv_Signature_equals(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    void *other = n > 0 ? a[0].l : NULL;
+    if (!other) return (klj_val){0};
+    if (other == self) return (klj_val){.j = 1};
+    klj_object *o = klj_as_object(other);   // there is one certificate: any Signature is it
+    return (klj_val){.j = o && strcmp(o->cls, MV_SIG_CLASS) == 0};
+}
+static klj_val mv_SigningInfo_signers(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = mv_signatures()};
+}
+static klj_val mv_SigningInfo_false(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+
+const klj_binding klj_bind_services[] = {
+    {MV_SIG_CLASS, "toCharsString", "()Ljava/lang/String;", mv_Signature_toCharsString},   // ''' + marker + r'''
+    {MV_SIG_CLASS, "toChars", "()[C", mv_Signature_toChars},
+    {MV_SIG_CLASS, "toByteArray", "()[B", mv_Signature_toByteArray},
+    {MV_SIG_CLASS, "hashCode", "()I", mv_Signature_hashCode},
+    {MV_SIG_CLASS, "equals", "(Ljava/lang/Object;)Z", mv_Signature_equals},
+    {MV_SIGINFO_CLASS, "getApkContentsSigners", "()[L" MV_SIG_CLASS ";", mv_SigningInfo_signers},
+    {MV_SIGINFO_CLASS, "getSigningCertificateHistory", "()[L" MV_SIG_CLASS ";", mv_SigningInfo_signers},
+    {MV_SIGINFO_CLASS, "hasMultipleSigners", "()Z", mv_SigningInfo_false},
+    {MV_SIGINFO_CLASS, "hasPastSigningCertificates", "()Z", mv_SigningInfo_false},
+''')
+    open(ps, "w").write(s)
+
+s = open(pj).read()
+if marker not in s:
+    s = sub(pj, s, "static const klj_field g_fields[] = {\n",
+        "// " + marker + ": defined in kl_jni_services.c\n"
+        "klj_val mv_PackageInfo_signatures(void);\n"
+        "klj_val mv_PackageInfo_signingInfo(void);\n"
+        "static const klj_field g_fields[] = {\n")
+    s = sub(pj, s,
+        "            \"[Landroid/content/pm/FeatureInfo;\", klj_PackageInfo_reqFeatures),\n",
+        "            \"[Landroid/content/pm/FeatureInfo;\", klj_PackageInfo_reqFeatures),\n"
+        "    // " + marker + "\n"
+        "    KLJ_FFN(\"android/content/pm/PackageInfo\", \"signatures\",\n"
+        "            \"[Landroid/content/pm/Signature;\", mv_PackageInfo_signatures),\n"
+        "    KLJ_FFN(\"android/content/pm/PackageInfo\", \"signingInfo\",\n"
+        "            \"Landroid/content/pm/SigningInfo;\", mv_PackageInfo_signingInfo),\n")
+    open(pj, "w").write(s)
+print("overlay: PackageInfo.signatures answers the title's signing certificate")
+PYEOF
+
+# ...and the catalogue carries each title's certificate: the DER of its
+# signer's first certificate (tools/metavision-apk-cert: the tree's v1 block,
+# else the APK's v2/v3 signing block, else the bundle's apk-cert.der), as hex,
+# set as KL_APK_CERT when the title is picked. Only counts are printed here.
+S="$K/visionos/Sources/MetavisionLibrary.swift"
+if [ -f "$S" ] && [ -f "$ROOT/build/guests/targets.json" ]; then
+python3 - "$S" "$ROOT/build/guests/targets.json" "$ROOT/tools/metavision-apk-cert" <<'PYEOF'
+import json, os, re, subprocess, sys
+p, tj, tool = sys.argv[1:4]
+s = open(p).read()
+marker = "metavision: the title's signing certificate (step 77)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+rows = json.load(open(tj))
+def cert_hex(k):
+    v = rows.get(k, {})
+    tree = os.path.join(os.path.dirname(tj), v.get("tree", k))
+    apk = v.get("apk") and os.path.join(os.path.dirname(tj), v["apk"])   # relative to build/guests
+    args = [sys.executable, tool, tree] + ([apk] if apk else [])
+    r = subprocess.run(args, capture_output=True, text=True)
+    h = r.stdout.strip() if r.returncode == 0 else ""
+    return h if re.fullmatch(r"(?:[0-9a-f]{2})+", h) else ""
+carried = 0
+if marker not in s:
+    s = sub(s, "    let res: String        // metavision: the title's resource strings (step 74): name=value lines (\"\" if none)\n",
+        "    let res: String        // metavision: the title's resource strings (step 74): name=value lines (\"\" if none)\n"
+        "    let cert: String       // " + marker + ": DER as hex (\"\" if unknown)\n")
+    def entry(m):
+        global carried
+        h = cert_hex(json.loads(m.group(1)))
+        carried += bool(h)
+        return m.group(0)[:-1] + ", cert: \"" + h + "\")"
+    s, n = re.subn(r'MetavisionTitle\(id: ("(?:[^"\\]|\\.)*"), .*, res: "(?:[^"\\]|\\.)*"\)(?=,?\n)', entry, s)
+    if n != len(rows):
+        sys.exit(f"overlay: anchor moved upstream in {p}: {n} catalogue entries for {len(rows)} titles")
+    s = sub(s, "        else { unsetenv(\"KL_RES_STRINGS\") }\n",
+        "        else { unsetenv(\"KL_RES_STRINGS\") }\n"
+        "        // " + marker + ": what PackageInfo.signatures answers.\n"
+        "        if let c = all.first(where: { $0.id == id })?.cert, !c.isEmpty { setenv(\"KL_APK_CERT\", c, 1) }\n"
+        "        else { unsetenv(\"KL_APK_CERT\") }\n")
+    open(p, "w").write(s)
+print(f"overlay: the catalogue carries signing certificates ({carried} titles have one)")
+PYEOF
+fi
+
 # 79 — test runs never tap a control that leaves the title. The presser already
 # skipped controls labelled Quit, Exit and the like, but the scripted trigger
 # and the hands-free "select" tap wherever the pointer rests, and a menu the

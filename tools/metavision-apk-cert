@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""metavision-apk-cert — the DER of a guest's signing certificate.
+
+What PackageManager.getPackageInfo(.., GET_SIGNATURES).signatures[0] holds on
+Android: the first certificate of the APK's signer. Looked for, in order:
+
+  1. <tree>/original/META-INF/*.RSA|*.DSA|*.EC  (v1: PKCS#7 SignedData)
+  2. the APK's signing block, v2 then v3          (when an APK path is given
+                                                    and exists)
+  3. <tree>/original/apk-cert.der                 (what the CI bundle carries
+                                                    for a title signed v2/v3 only)
+
+  tools/metavision-apk-cert TREE [APK]            hex of the DER on stdout
+  tools/metavision-apk-cert -o FILE TREE [APK]    the DER into FILE
+
+Exit 1 (nothing written) when no certificate is found. Pure python, no openssl:
+a minimal DER walker is enough to reach SignedData.certificates[0].
+"""
+import glob, os, struct, sys
+
+
+def tlv(b, i):
+    """(tag, header length, content length) of the DER element at b[i]."""
+    tag = b[i]
+    n = b[i + 1]
+    if n < 0x80:
+        return tag, 2, n
+    k = n & 0x7F
+    if not 1 <= k <= 4:
+        raise ValueError("unsupported DER length")
+    return tag, 2 + k, int.from_bytes(b[i + 2:i + 2 + k], "big")
+
+
+def pkcs7_first_cert(b):
+    # ContentInfo SEQ { OID signedData, [0] { SignedData SEQ { version,
+    # digestAlgorithms SET, encapContentInfo SEQ, [0] IMPLICIT certificates } } }
+    tag, h, _ = tlv(b, 0)
+    if tag != 0x30:
+        return None
+    i = h
+    tag, h, n = tlv(b, i)                      # contentType OID
+    if tag != 0x06:
+        return None
+    i += h + n
+    tag, h, _ = tlv(b, i)                      # [0] EXPLICIT
+    if tag != 0xA0:
+        return None
+    i += h
+    tag, h, _ = tlv(b, i)                      # SignedData
+    if tag != 0x30:
+        return None
+    i += h
+    for want in (0x02, 0x31, 0x30):            # version, digestAlgorithms, encapContentInfo
+        tag, h, n = tlv(b, i)
+        if tag != want:
+            return None
+        i += h + n
+    tag, h, _ = tlv(b, i)                      # certificates [0] IMPLICIT SET OF
+    if tag != 0xA0:
+        return None
+    i += h
+    tag, h, n = tlv(b, i)                      # the first Certificate
+    if tag != 0x30:
+        return None
+    return bytes(b[i:i + h + n])
+
+
+def apk_block_cert(apk):
+    with open(apk, "rb") as f:
+        f.seek(0, 2)
+        size = f.tell()
+        tail = min(size, 65535 + 22)
+        f.seek(size - tail)
+        t = f.read(tail)
+        e = t.rfind(b"PK\x05\x06")
+        if e < 0:
+            return None
+        cd = struct.unpack_from("<I", t, e + 16)[0]
+        if cd < 32:
+            return None
+        f.seek(cd - 24)
+        footer = f.read(24)
+        if footer[8:] != b"APK Sig Block 42":
+            return None
+        bsize = struct.unpack_from("<Q", footer)[0]
+        f.seek(cd - bsize - 8)
+        block = f.read(bsize - 16)            # the leading size and the pairs
+    pairs, i = {}, 8                           # after the leading size
+    while i + 12 <= len(block):
+        n, pid = struct.unpack_from("<QI", block, i)
+        pairs.setdefault(pid, block[i + 12:i + 8 + n])
+        i += 8 + n
+    for pid in (0x7109871A, 0xF05368C0, 0x1B93AD61):   # v2, v3, v3.1
+        v = pairs.get(pid)
+        if not v:
+            continue
+        # signers (u32-prefixed) > signer (u32) > signed data (u32) >
+        # digests (u32, skipped) > certificates (u32) > certificate (u32)
+        o = 4                                  # into the signers sequence
+        o += 4                                 # into the first signer
+        o += 4                                 # into its signed data
+        o += 4 + struct.unpack_from("<I", v, o)[0]
+        o += 4                                 # into the certificates sequence
+        n = struct.unpack_from("<I", v, o)[0]
+        if n:
+            return bytes(v[o + 4:o + 4 + n])
+    return None
+
+
+def find_cert(tree, apk=None):
+    for f in sorted(glob.glob(os.path.join(tree, "original", "META-INF", "*"))):
+        if os.path.splitext(f)[1].upper() in (".RSA", ".DSA", ".EC"):
+            try:
+                der = pkcs7_first_cert(open(f, "rb").read())
+            except (ValueError, IndexError):
+                der = None
+            if der:
+                return der
+    if apk and os.path.isfile(apk):
+        try:
+            der = apk_block_cert(apk)
+        except (ValueError, IndexError, struct.error, OSError):
+            der = None
+        if der:
+            return der
+    f = os.path.join(tree, "original", "apk-cert.der")
+    if os.path.isfile(f):
+        der = open(f, "rb").read()
+        if der[:1] == b"\x30":
+            return der
+    return None
+
+
+def main(argv):
+    out = None
+    if argv[:1] == ["-o"]:
+        out, argv = argv[1], argv[2:]
+    if not 1 <= len(argv) <= 2:
+        sys.stderr.write(__doc__)
+        return 2
+    der = find_cert(argv[0], argv[1] if len(argv) > 1 else None)
+    if not der:
+        return 1
+    if out:
+        open(out, "wb").write(der)
+    else:
+        print(der.hex())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
