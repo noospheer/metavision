@@ -10714,3 +10714,172 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: android_get_device_api_level and the target SDK level are answered")
 PYEOF
+
+# 100 — a window outlives its owner until its last ANativeWindow_release.
+# A codec output surface's window (an AImageReader's, or a SurfaceTexture's
+# frame consumer, step 82) was freed with its owner, while
+# ANativeWindow_fromSurface (step 84) had handed out a counted reference to it:
+# a caller that released that reference after the SurfaceTexture (Android
+# allows either order) decremented `refs` inside freed memory. The window is
+# 24 bytes and `refs` its first word, which is where the allocator keeps a
+# freed block's encoded free-list link, so the decrement corrupted the free
+# list and the next allocation of that size, on whatever thread, trapped in
+# the allocator. Now the owner's kl_ndk_window_free only drops the creator's
+# reference (and the owner pointer); the block is freed by whichever of the
+# two drops the count to zero. A window whose owner lives on keeps today's
+# behaviour (a release never frees it).
+python3 - "$K/runtime/guest/kl_ndk.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a window outlives its owner (step 100)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    void   *owner;\n} kl_native_window;\n",
+               "    void   *owner;\n"
+               "    int     mv_dead;    // " + marker + ": the owner let go\n"
+               "} kl_native_window;\n")
+    s = sub(s, "    if (win && win != (void *)&g_window) free(win);\n}\n",
+        "    // " + marker + r''': the owner's reference only.
+    // A reference ANativeWindow_fromSurface handed out keeps the block until
+    // its ANativeWindow_release; the owner pointer goes now, so a configure
+    // with that window finds no owner rather than a freed one.
+    if (!win || win == (void *)&g_window) return;
+    kl_native_window *nw = win;
+    __atomic_store_n(&nw->owner, NULL, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&nw->mv_dead, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_sub_fetch(&nw->refs, 1, __ATOMIC_SEQ_CST) <= 0) { free(nw); return; }
+    static unsigned said;
+    if (said++ < 4)
+        fprintf(stderr, "  [ndk] window %p outlives its owner: freed at its last "
+                        "ANativeWindow_release\n", win);
+}
+''')
+    s = sub(s, "static void    kl_ANativeWindow_release(kl_native_window *w) { if (w) __atomic_fetch_sub(&w->refs, 1, __ATOMIC_RELAXED); }\n",
+        "// " + marker + ": the last reference to a window\n"
+        "// whose owner already let go frees it; any other window is never freed here.\n"
+        "static void    kl_ANativeWindow_release(kl_native_window *w) {\n"
+        "    if (!w) return;\n"
+        "    if (__atomic_sub_fetch(&w->refs, 1, __ATOMIC_SEQ_CST) <= 0 && w != &g_window &&\n"
+        "        __atomic_load_n(&w->mv_dead, __ATOMIC_SEQ_CST))\n"
+        "        free(w);\n"
+        "}\n")
+    open(p, "w").write(s)
+print("overlay: a window outlives its owner until its last ANativeWindow_release")
+PYEOF
+
+# 101 — the video-player plugin's player lifecycle (step 91), made safe
+# against its own order of teardown and against concurrent callers:
+#  - the render-thread reaper releases the player's window reference before
+#    the Surface and the SurfaceTexture (the SurfaceTexture's release can free
+#    the consumer the window belongs to; step 100 makes the other order safe
+#    too).
+#  - CloseVideo, OpenVideoFromFile, Deinitialise and DestroyPlayer are
+#    serialised per player (a recursive lock: open closes first), so two
+#    threads never join the same worker or start one while another closes.
+#  - DestroyPlayer is idempotent; OpenVideoFromFile on a destroyed player
+#    (the title may keep the object) answers false rather than starting a
+#    worker no one would join.
+#  - RendererSetupPlayer finishing after DestroyPlayer already buried the
+#    player's objects buries what it made too (they leaked, and the
+#    SurfaceTexture's consumer thread lived on).
+python3 - "$K/runtime/jni/kl_jni_videoplugin.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the video player's lifecycle (step 101)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    int64_t   ring_pts;                // presentation time of the next frame out\n} avp;\n",
+               "    int64_t   ring_pts;                // presentation time of the next frame out\n"
+               "    pthread_mutex_t mv_op;             // " + marker + ": open/close/destroy, recursive\n"
+               "} avp;\n")
+    # the reaper: the window reference first
+    s = sub(s, "        if (g->window && M.win_release) M.win_release(g->window);\n        if (avp_gl_load()) {\n",
+               "        if (avp_gl_load()) {\n")
+    s = sub(s, "        avp_grave *next = g->next;\n        if (g->st) {\n",
+               "        avp_grave *next = g->next;\n"
+               "        // " + marker + ": the window reference before\n"
+               "        // the SurfaceTexture, whose release can free the consumer it belongs to.\n"
+               "        if (g->window && M.win_release) M.win_release(g->window);\n"
+               "        if (g->st) {\n")
+    # creation: the lock
+    s = sub(s, "    pthread_mutex_init(&p->lk, NULL);\n    p->ring = ring;\n",
+               "    pthread_mutex_init(&p->lk, NULL);\n"
+               "    {   // " + marker + "\n"
+               "        pthread_mutexattr_t at;\n"
+               "        pthread_mutexattr_init(&at);\n"
+               "        pthread_mutexattr_settype(&at, PTHREAD_MUTEX_RECURSIVE);\n"
+               "        pthread_mutex_init(&p->mv_op, &at);\n"
+               "        pthread_mutexattr_destroy(&at);\n"
+               "    }\n"
+               "    p->ring = ring;\n")
+    # close: serialised
+    s = sub(s, "static void avp_close(avp *p) {\n    atomic_store(&p->quit, 1);\n",
+               "// " + marker + r''': one closer at a time, so a worker is
+// joined once and never while another caller starts one.
+static void avp_close_ops(avp *p);
+static void avp_close(avp *p) {
+    pthread_mutex_lock(&p->mv_op);
+    avp_close_ops(p);
+    pthread_mutex_unlock(&p->mv_op);
+}
+static void avp_close_ops(avp *p) {
+    atomic_store(&p->quit, 1);
+''')
+    # render setup finishing after destroy
+    s = sub(s, "static void avp_render_setup(avp *p) {\n",
+               "static void avp_bury(avp *p);   // " + marker + "\n"
+               "static void avp_render_setup(avp *p) {\n")
+    s = sub(s, "    p->gl_setup = 1;\n    pthread_mutex_unlock(&p->lk);\n",
+               "    p->gl_setup = 1;\n"
+               "    int mv_late = !p->alive;   // " + marker + ": destroyed meanwhile;\n"
+               "                               // its workers are joined, so what was made here goes too\n"
+               "    pthread_mutex_unlock(&p->lk);\n"
+               "    if (mv_late) {\n"
+               "        avp_bury(p);\n"
+               "        KLJ_LOG(\"video plugin player %d: set up after DestroyPlayer — buried\", p->index);\n"
+               "        return;\n"
+               "    }\n")
+    # destroy: serialised and idempotent
+    s = sub(s, "    avp *p = avp_at(index);\n    if (!p) return (klj_val){0};\n    avp_close(p);                      // Deinitialise\n",
+               "    avp *p = avp_at(index);\n"
+               "    if (!p) return (klj_val){0};\n"
+               "    pthread_mutex_lock(&p->mv_op);     // " + marker + "\n"
+               "    pthread_mutex_lock(&p->lk);\n"
+               "    int mv_alive = p->alive;\n"
+               "    pthread_mutex_unlock(&p->lk);\n"
+               "    if (!mv_alive) { pthread_mutex_unlock(&p->mv_op); return (klj_val){0}; }\n"
+               "    avp_close(p);                      // Deinitialise\n")
+    s = sub(s, "    p->deinitialised = 1;\n    KLJ_LOG(\"video plugin: DestroyPlayer(%d)\", index);\n",
+               "    p->deinitialised = 1;\n"
+               "    pthread_mutex_unlock(&p->mv_op);   // " + marker + "\n"
+               "    KLJ_LOG(\"video plugin: DestroyPlayer(%d)\", index);\n")
+    # open: serialised, refused once destroyed
+    s = sub(s, "static klj_val avp_open(void *env, void *self, const klj_val *a, int n) {\n",
+               "// " + marker + r''': under the player's lock, and
+// refused on a destroyed player (no one would join its worker).
+static klj_val avp_open_body(void *env, void *self, const klj_val *a, int n);
+static klj_val avp_open(void *env, void *self, const klj_val *a, int n) {
+    avp *p = avp_of(self);
+    if (!p) return (klj_val){.j = 0};
+    pthread_mutex_lock(&p->mv_op);
+    pthread_mutex_lock(&p->lk);
+    int alive = p->alive;
+    pthread_mutex_unlock(&p->lk);
+    klj_val r = alive ? avp_open_body(env, self, a, n) : (klj_val){.j = 0};
+    pthread_mutex_unlock(&p->mv_op);
+    if (!alive) KLJ_LOG("video plugin player %d: OpenVideoFromFile after DestroyPlayer — refused", p->index);
+    return r;
+}
+static klj_val avp_open_body(void *env, void *self, const klj_val *a, int n) {
+''')
+    open(p, "w").write(s)
+print("overlay: the video player's teardown: window reference first, serialised open/close/destroy")
+PYEOF
