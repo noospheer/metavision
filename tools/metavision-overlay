@@ -7275,3 +7275,32 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: auto-play guards controls that leave the title")
 PYEOF
+
+# 90 — a library that is not 64-bit ARM is left out, not the whole title. A
+# title can ship a stray 32-bit library in its arm64-v8a folder; Android's
+# loader refuses it ("wrong ELF class") and the title runs without it, but the
+# translator stopped on it and the launcher left the whole title out of every
+# build. Such a library is now skipped with a note, so the guest's dlopen of
+# it fails exactly as it does on a Quest.
+M="$K/visionos/mkguest.sh"
+grep -q 'metavision: non-arm64 libraries skipped (step 90)' "$M" || {
+    [ "$(grep -c '  \[ -f "\$SRC/\$NAME.so" \] || { echo "!! \$SRC/\$NAME.so missing"; exit 1; }' "$M")" = 1 ] ||
+        die "mkguest.sh library-loop anchor not found"
+    python3 - "$M" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = '  [ -f "$SRC/$NAME.so" ] || { echo "!! $SRC/$NAME.so missing"; exit 1; }\n'
+new = old + (
+    '  # metavision: non-arm64 libraries skipped (step 90) — ELFCLASS64 and EM_AARCH64,\n'
+    '  # or Android\'s loader would refuse it too.\n'
+    '  if [ "$(od -An -tu1 -j4 -N1 "$SRC/$NAME.so" | tr -d \' \')" != 2 ] ||\n'
+    '     [ "$(od -An -tu1 -j18 -N1 "$SRC/$NAME.so" | tr -d \' \')" != 183 ]; then\n'
+    '    echo "  $NAME.so: not a 64-bit ARM library — left out, as Android\'s loader would refuse it"\n'
+    '    continue\n'
+    '  fi\n')
+assert s.count(old) == 1
+open(p, "w").write(s.replace(old, new))
+PYEOF
+}
+echo "overlay: a library that is not 64-bit ARM is left out, not the whole title"
