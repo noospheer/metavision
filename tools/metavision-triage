@@ -53,6 +53,10 @@ PT_ON = re.compile(r"\[passthrough\] on\b")
 # context: Unity's compute shaders come back as shader 0 ("no infolog") and its
 # std430 blocks do not compile. A known limitation, reported, not an error.
 GLES_COMPUTE = re.compile(r"GLSL compilation failed, no infolog provided|'std430' : invalid layout qualifier")
+# A movie the runtime could not open (the player answered setDataSource false).
+MEDIA_FAIL = re.compile(r"MediaPlayer14: could not open (\S+)|\[avdec\] (?:cannot open the container (\S+?):|(\S+) carries no video track)")
+# A Java method the title called with no host implementation: (class, method).
+NOHOST = re.compile(r"^\[jni\] no host implementation for ([\w/$]+)\.(\w+|<init>)\(", re.M)
 # The title asked for passthrough, which is not available: a black background is by design.
 PASSTHROUGH = re.compile(r"Failed to initialize Insight Passthrough|doesn't support XR_FB_passthrough")
 # The title records (the microphone is an input it reacts to).
@@ -287,6 +291,22 @@ def triage(d: Path):
         notes.append("needs passthrough (not available)")
     if GLES_COMPUTE.search(text):
         notes.append("needs GLES compute (not available): its compute effects are missing")
+    # A movie the title opened and the runtime could not: whatever it plays
+    # on (a 360 environment, an intro) stays empty — often why a shot is dark.
+    failed = sorted({next(g for g in m.groups() if g).rsplit("/", 1)[-1]
+                     for m in MEDIA_FAIL.finditer(text)})
+    if failed:
+        notes.append(f"MEDIA: {len(failed)} movie(s) could not be opened ({', '.join(failed[:2])}"
+                     + (", ..." if len(failed) > 2 else "") + ")")
+    # Java the title called that the runtime does not implement, by class:
+    # names the SDK a missing feature belongs to (a cloud database, a store).
+    nohost = {}
+    for m in NOHOST.finditer(text):
+        nohost.setdefault(m.group(1), set()).add(m.group(2))
+    if nohost:
+        top = sorted(nohost.items(), key=lambda kv: -len(kv[1]))[:2]
+        notes.append(f"unimplemented Java: {sum(len(v) for v in nohost.values())} method(s) in "
+                     f"{len(nohost)} class(es), most in " + ", ".join(k for k, _ in top))
     peaks = [int(m.group(1)) for m in AUDIO.finditer(text)]
     if peaks and max(peaks) == 0:
         # Silence is a failure only when the title ships sound to play: one

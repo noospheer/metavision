@@ -11339,3 +11339,287 @@ static void mv_xr_system_props_chain(const void *next) {
     open(p, "w").write(s)
 print("overlay: xrGetSystemProperties answers the XR_FB_passthrough system properties")
 PYEOF
+
+# 115 — a movie the guest finds through the OBB read-through opens. An Unreal
+# title lists Content/Movies, finds its movie there (a virtual entry of the
+# read-through VFS: the file stays inside the expansion file, STORED) and hands
+# MediaPlayer14 that loose path with offset 0 and the entry's length. The
+# decoder opened the path on the host, where nothing exists ("cannot open the
+# container ... No such file or directory"), setDataSource answered false and
+# the title's movie surface stayed black for the whole session.
+#  - kl_obbmap_window(loose, ...) answers the archive and the byte window of a
+#    stored indexed entry (or bank), as kl_obbmap_fopen serves it; compressed
+#    and pak-internal-zlib entries are refused (they have no plain window).
+#  - kl_avdec_open and kl_avdemux_open resolve a path that does not exist on
+#    the host through it first: the window's base is added to the guest's
+#    offset and the length is clamped to the entry. A loose container that IS
+#    its own file is opened directly, with no slice copy.
+python3 - "$K/runtime/guest/kl_obbmap.c" "$K/runtime/guest/kl_obbmap.h" "$K/runtime/media/kl_avdec.m" <<'PYEOF'
+import sys
+marker = "metavision: a movie inside the OBB read-through opens (step 115)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "FILE *kl_obbmap_window_fopen(const char *obb, unsigned long long off, unsigned long long size) {\n"
+    s = sub(p, s, old, "// " + marker + "\n" + r'''int kl_obbmap_window(const char *loose, char *obb, size_t cap,
+                     unsigned long long *off, unsigned long long *size) {
+    if (!loose || !obb || !cap) return 0;
+    obb_entry *e = find(loose);
+    obb_entry tmp;
+    if (!e) {
+        obb_bank *b = bank_find(loose);
+        if (!b) return 0;
+        memset(&tmp, 0, sizeof tmp);
+        snprintf(tmp.obb, sizeof tmp.obb, "%s", b->obb);
+        tmp.method = b->method; tmp.size = b->size; tmp.lhdr = b->lhdr;
+        e = &tmp;
+    }
+    if (e->method != 0 || e->is_zpak) return 0;   // no plain byte window
+    FILE *f = fopen(e->obb, "rb");
+    if (!f) return 0;
+    uint64_t base;
+    int ok = data_offset(f, e, &base);
+    fclose(f);
+    if (!ok) return 0;
+    snprintf(obb, cap, "%s", e->obb);
+    if (off) *off = base;
+    if (size) *size = e->size;
+    return 1;
+}
+''' + old)
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    old = "// A read-only FILE* over that window.\n"
+    s = sub(p, s, old,
+        "// " + marker + ": the archive and byte window of\n"
+        "// a STORED indexed loose path (or bank); 1 and the window, or 0.\n"
+        "int kl_obbmap_window(const char *loose, char *obb, size_t cap,\n"
+        "                     unsigned long long *off, unsigned long long *size);\n" + old)
+    open(p, "w").write(s)
+p = sys.argv[3]
+s = open(p).read()
+if marker not in s:
+    old = "static int slice_out(const char *container, long long off, long long len,\n"
+    s = sub(p, s, old, "// " + marker + r'''
+#include "kl_obbmap.h"
+// A path that is not on the host but is an entry of the OBB read-through:
+// open the archive at the entry's window instead. `buf` holds the new path.
+static void mv_obb_resolve(const char **path, long long *off, long long *len,
+                           char *buf, size_t cap) {
+    struct stat st;
+    if (!*path || stat(*path, &st) == 0) return;
+    unsigned long long base = 0, size = 0;
+    if (!kl_obbmap_window(*path, buf, cap, &base, &size)) return;
+    long long o = *off > 0 ? *off : 0;
+    if ((unsigned long long)o > size) return;
+    long long room = (long long)(size - (unsigned long long)o);
+    long long l = (*len > 0 && *len < room) ? *len : room;
+    fprintf(stderr, "  [avdec] %s is inside %s (%lld bytes at %llu)\n",
+            *path, buf, l, base + (unsigned long long)o);
+    *path = buf;
+    if (base == 0 && o == 0 && stat(buf, &st) == 0 && (long long)st.st_size == l) {
+        *off = 0; *len = 0;          // the entry IS the file: open it whole
+    } else {
+        *off = (long long)base + o; *len = l;
+    }
+}
+
+''' + old)
+    hdr = "    char real[1024];\n    if (offset > 0 || size > 0) {\n"
+    s = sub(p, s, "kl_avdec *kl_avdec_open(const char *path, long long offset, long long size) {\n    if (!path || !*path) return NULL;\n" + hdr,
+        "kl_avdec *kl_avdec_open(const char *path, long long offset, long long size) {\n    if (!path || !*path) return NULL;\n"
+        "    char mv_obb[1024];   // " + marker + "\n"
+        "    mv_obb_resolve(&path, &offset, &size, mv_obb, sizeof mv_obb);\n" + hdr)
+    s = sub(p, s, "kl_avdemux *kl_avdemux_open(const char *container, long long offset, long long size) {\n    if (!container || !*container) return NULL;\n" + hdr,
+        "kl_avdemux *kl_avdemux_open(const char *container, long long offset, long long size) {\n    if (!container || !*container) return NULL;\n"
+        "    char mv_obb[1024];   // " + marker + "\n"
+        "    mv_obb_resolve(&container, &offset, &size, mv_obb, sizeof mv_obb);\n" + hdr)
+    open(p, "w").write(s)
+print("overlay: kl_avdec opens a movie that lives inside the OBB read-through")
+PYEOF
+
+# 116 — MediaPlayer14's GLES frame path: getVideoLastFrame(texture). An Unreal
+# title on GLES (vulkanRenderer=0) without GL_OES_EGL_image_external (which is
+# not advertised: ANGLE's Metal backend lacks it) takes UE4's copy path: each
+# tick its render thread makes a media texture sample (an RGBA8 texture of the
+# video's size) and calls getVideoLastFrame(<its GL name>), which on Android
+# renders the newest frame into that texture and answers whether there was a
+# new one. It answered "a frame exists" and wrote nothing, so the samples were
+# empty textures — a 360 video environment showed as black.
+#  - kl_glfb_upload_texture(tex, w, h, format, pixels) writes a 2D texture's
+#    level 0 on the calling thread's context, saving and restoring the 2D
+#    binding of the active unit, the unpack buffer and the unpack alignment,
+#    row length and skips; kl_glfb_texture_bgra(tex) says from the storage
+#    table whether the guest allocated it as BGRA8 (1), something else (0) or
+#    unknown (-1).
+#  - getVideoLastFrame(tex) on a non-Vulkan player uploads the decoder's newest
+#    frame (BGRA; converted to RGBA once per decoded frame unless the texture
+#    is BGRA) into `tex` and answers true only for a frame not yet delivered,
+#    as Android's player does; a Vulkan player keeps the old answer. The
+#    resolution latch is set here as getVideoLastFrameData sets it.
+python3 - "$K/runtime/gfx/kl_glfb.c" "$K/runtime/gfx/kl_glfb.h" "$K/runtime/jni/kl_jni_ue4.c" <<'PYEOF'
+import sys
+marker = "metavision: MediaPlayer14's GLES frame path (step 116)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "int kl_glfb_image_bind_texture(void *image, uint32_t tex) {\n"
+    s = sub(p, s, old, "// " + marker + "\n" + r'''int kl_glfb_texture_bgra(uint32_t tex) {
+    uint32_t fmt = 0;
+    if (!tex || !klfb_tex_info(tex, &fmt, NULL, NULL)) return -1;
+    return fmt == 0x93A1 /* BGRA8_EXT */ || fmt == 0x80E1 /* BGRA_EXT */;
+}
+
+int kl_glfb_upload_texture(uint32_t tex, int32_t w, int32_t h, uint32_t format,
+                           const void *pixels) {
+    static void (*bind)(uint32_t, uint32_t);
+    static void (*bindbuf)(uint32_t, uint32_t);
+    static void (*store)(uint32_t, int32_t);
+    if (!tex || w <= 0 || h <= 0 || !pixels || !a_glGetIntegerv) return 0;
+    if (!kl_glfb_current_context()) return -1;
+    if (!bind)    bind    = (void (*)(uint32_t, uint32_t))asym("glBindTexture");
+    if (!bindbuf) bindbuf = (void (*)(uint32_t, uint32_t))asym("glBindBuffer");
+    if (!store)   store   = (void (*)(uint32_t, int32_t))asym("glPixelStorei");
+    if (!g_real_TexSubImage2D)
+        g_real_TexSubImage2D = (void (*)(uint32_t, int32_t, int32_t, int32_t, int32_t, int32_t,
+                                         uint32_t, uint32_t, const void *))asym("glTexSubImage2D");
+    if (!bind || !bindbuf || !store || !g_real_TexSubImage2D) return 0;
+    // Never wider or taller than the storage the guest allocated.
+    int32_t tw = 0, th = 0;
+    if (klfb_tex_info(tex, NULL, &tw, &th) && tw > 0 && th > 0) {
+        if (w > tw) w = tw;
+        if (h > th) h = th;
+    }
+    // GL_UNPACK_ALIGNMENT, ROW_LENGTH, SKIP_ROWS, SKIP_PIXELS, and the unpack
+    // buffer (a bound one turns `pixels` into an offset): set for a tightly
+    // packed client array, restored after.
+    static const uint32_t pn[4] = {0x0CF5, 0x0CF2, 0x0CF3, 0x0CF4};
+    static const int32_t  want[4] = {4, 0, 0, 0};
+    int32_t saved[4] = {4, 0, 0, 0}, prev = 0, pbo = 0;
+    a_glGetIntegerv(GL_TEXTURE_BINDING_2D_, &prev);
+    a_glGetIntegerv(0x88EF /* PIXEL_UNPACK_BUFFER_BINDING */, &pbo);
+    for (int i = 0; i < 4; i++) {
+        a_glGetIntegerv(pn[i], &saved[i]);
+        if (saved[i] != want[i]) store(pn[i], want[i]);
+    }
+    if (pbo) bindbuf(0x88EC /* PIXEL_UNPACK_BUFFER */, 0);
+    if (a_glGetError) while (a_glGetError() != 0) {}
+    bind(GL_TEXTURE_2D_IMG_, tex);
+    g_real_TexSubImage2D(GL_TEXTURE_2D_IMG_, 0, 0, 0, w, h, format, 0x1401 /* UNSIGNED_BYTE */, pixels);
+    uint32_t err = a_glGetError ? a_glGetError() : 0;
+    bind(GL_TEXTURE_2D_IMG_, (uint32_t)prev);
+    if (pbo) bindbuf(0x88EC, (uint32_t)pbo);
+    for (int i = 0; i < 4; i++)
+        if (saved[i] != want[i]) store(pn[i], saved[i]);
+    static unsigned said;
+    if (err && said++ < 4)
+        fprintf(stderr, "  [glfb] upload into texture %u (%dx%d, format 0x%04x) failed: GL error 0x%04x\n",
+                tex, w, h, format, err);
+    return err == 0;
+}
+
+''' + old)
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    old = "int   kl_glfb_current_context(void);\n"
+    s = sub(p, s, old, old +
+        "// " + marker + ": write level 0 of 2D texture\n"
+        "// `tex` from tightly packed `format`/UNSIGNED_BYTE pixels on the calling\n"
+        "// thread's context, leaving bindings and unpack state as they were.\n"
+        "// 1 written, 0 failed, -1 no current context. kl_glfb_texture_bgra: 1 if\n"
+        "// the guest allocated `tex` as BGRA8, 0 another format, -1 unknown.\n"
+        "int   kl_glfb_upload_texture(uint32_t tex, int32_t w, int32_t h, uint32_t format,\n"
+        "                             const void *pixels);\n"
+        "int   kl_glfb_texture_bgra(uint32_t tex);\n")
+    open(p, "w").write(s)
+p = sys.argv[3]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, '#include "kl_egl.h"\n', '#include "kl_egl.h"\n#include "kl_glfb.h"   // ' + marker + "\n")
+    s = sub(p, s, "    int        res_changed;\n} klj_media;\n",
+        "    int        res_changed;\n"
+        "    // " + marker + "\n"
+        "    unsigned long long mv_gl_serial;     // newest frame written into a guest texture\n"
+        "    unsigned char     *mv_rgba;          // that frame as RGBA, converted once\n"
+        "    size_t             mv_rgba_bytes;\n"
+        "    unsigned long long mv_rgba_serial;\n"
+        "} klj_media;\n")
+    s = sub(p, s, "    if (m && m->dec) { kl_avdec_close(m->dec); m->dec = NULL; m->started = 0; }\n",
+        "    if (m && m->dec) { kl_avdec_close(m->dec); m->dec = NULL; m->started = 0; }\n"
+        "    if (m) {   // " + marker + "\n"
+        "        free(m->mv_rgba); m->mv_rgba = NULL; m->mv_rgba_bytes = 0;\n"
+        "        m->mv_rgba_serial = 0; m->mv_gl_serial = 0;\n"
+        "    }\n")
+    old = ("static klj_val klj_MP14_getVideoLastFrame(void *env, void *self, const klj_val *a, int n) {\n"
+           "    (void)env; (void)a; (void)n;\n"
+           "    klj_media *m = klj_media_of(self);\n"
+           "    if (!m || !m->dec) return (klj_val){.j = 0};\n")
+    s = sub(p, s, old, "// " + marker + r'''
+static klj_val mv_MP14_frame_into_texture(klj_media *m, uint32_t tex) {
+    int w = 0, h = 0;
+    size_t bytes = 0;
+    unsigned long long serial = 0;
+    const unsigned char *px = kl_avdec_frame(m->dec, &w, &h, &bytes, &serial);
+    if (!px || !serial || w <= 0 || h <= 0 || bytes < (size_t)w * (size_t)h * 4)
+        return (klj_val){.j = 0};
+    if (serial == m->mv_gl_serial) return (klj_val){.j = 0};   // nothing new
+    if (w != m->last_w || h != m->last_h) {
+        m->res_changed = 1;
+        m->last_w = w; m->last_h = h;
+        m->buffer = NULL;
+    }
+    int r = 0;
+    if (kl_glfb_texture_bgra(tex) == 1) {
+        r = kl_glfb_upload_texture(tex, w, h, 0x80E1 /* BGRA_EXT */, px);
+    } else {
+        size_t need = (size_t)w * (size_t)h * 4;
+        if (m->mv_rgba_bytes != need) {
+            free(m->mv_rgba);
+            m->mv_rgba = malloc(need);
+            m->mv_rgba_bytes = m->mv_rgba ? need : 0;
+            m->mv_rgba_serial = 0;
+        }
+        if (!m->mv_rgba) return (klj_val){.j = 0};
+        if (m->mv_rgba_serial != serial) {
+            const uint32_t *src = (const uint32_t *)px;
+            uint32_t *dst = (uint32_t *)m->mv_rgba;
+            for (size_t i = 0, np = (size_t)w * (size_t)h; i < np; i++) {
+                uint32_t v = src[i];   // B G R A in memory -> R G B A
+                dst[i] = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+            }
+            m->mv_rgba_serial = serial;
+        }
+        r = kl_glfb_upload_texture(tex, w, h, 0x1908 /* RGBA */, m->mv_rgba);
+        if (r == 0) r = kl_glfb_upload_texture(tex, w, h, 0x80E1 /* BGRA_EXT */, px);
+    }
+    static unsigned said;
+    if (said < 2 || (r != 1 && said < 6)) {
+        said++;
+        KLJ_LOG("MediaPlayer14.getVideoLastFrame(%u): %dx%d frame %llu %s", tex, w, h,
+                serial, r == 1 ? "written into the texture"
+                      : r < 0 ? "NOT written (no GL context on this thread)"
+                              : "NOT written (GL refused the upload)");
+    }
+    if (r != 1) return (klj_val){.j = 0};
+    m->mv_gl_serial = serial;
+    return (klj_val){.j = 1};
+}
+
+''' + old +
+        "    if (!m->vulkan && n > 0 && (uint32_t)a[0].j != 0)   // " + marker + "\n"
+        "        return mv_MP14_frame_into_texture(m, (uint32_t)a[0].j);\n")
+    open(p, "w").write(s)
+print("overlay: MediaPlayer14.getVideoLastFrame writes the frame into the guest's GLES texture")
+PYEOF
