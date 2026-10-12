@@ -25,7 +25,14 @@ void *kl_shim_lookup(const char *name) {
 FILE *kl_host_file(void *g) { return (FILE *)g; }
 static int g_real_dlopen_calls;
 // Klepton's own dlopen: android_dlopen_ext reaches it through the dlopen wrapper.
-void *klb_dlopen(const char *p, int f) { (void)p; g_real_dlopen_calls++; g_dlopen_flags = f; return (void *)0x1234; }
+static int g_refuse_mxa;              // klb_dlopen refuses Meta XR Audio (KL_DLOPEN_REFUSE)
+static char g_last_dlopen[256];
+void *klb_dlopen(const char *p, int f) {
+    g_real_dlopen_calls++; g_dlopen_flags = f;
+    snprintf(g_last_dlopen, sizeof g_last_dlopen, "%s", p ? p : "");
+    if (g_refuse_mxa && p && strstr(p, "MetaXRAudioUnity")) return NULL;
+    return (void *)0x1234;
+}
 void *klb_dlsym(void *h, const char *n) { (void)h; (void)n; return (void *)0x9abc; }
 static char g_fake_ovrp;
 int kl_ovrp_is_handle(const void *h) { return h == &g_fake_ovrp; }
@@ -227,11 +234,19 @@ int main(void) {
     void *ndk = dlo("/system/lib64/libandroid.so", 0);
     assert(ndk && ndk != (void *)0x1234 && g_real_dlopen_calls == before + 1);
     assert(dls(ndk, "ptrace") == kl_shim_lookup("ptrace"));
-    // Meta XR Audio stand-in: never reaches klb_dlopen; every symbol answers 0
+    // Meta XR Audio: the real library when it loads (a bare P/Invoke name is
+    // opened by its soname); the stand-in, every symbol answering 0, only when
+    // klb_dlopen refuses it
     void *mxa = dlo("/data/app/x/lib/arm64/libMetaXRAudioUnity.so", 0);
-    assert(mxa && g_real_dlopen_calls == before + 1);
+    assert(mxa == (void *)0x1234 && g_real_dlopen_calls == before + 2);
+    mxa = dlo("MetaXRAudioUnity", 0);
+    assert(mxa == (void *)0x1234 && !strcmp(g_last_dlopen, "libMetaXRAudioUnity.so"));
+    g_refuse_mxa = 1;
+    mxa = dlo("MetaXRAudioUnity", 0);
+    assert(mxa && mxa != (void *)0x1234);
     long (*z)(void) = (long (*)(void))dls(mxa, "ovrAudio_CreateContext");
     assert(z && z() == 0);
+    g_refuse_mxa = 0;
 
     // OVRPlugin capability questions answer "no" through the plugin handle only
     int32_t (*q)(char *) = (int32_t (*)(char *))dls(&g_fake_ovrp, "ovrp_GetBodyTrackingEnabled");

@@ -326,11 +326,14 @@ static const char *base_name(const char *p) {
 // them, where a plain dlopen looks for the file among the title's libraries.
 static char g_ndk_handle;
 
-// Meta XR Audio's native plugin: Klepton refuses it by name (it patches its own
-// code pages, which visionOS kills a process for), so every P/Invoke into it
-// threw DllNotFoundException each frame. A stand-in whose every entry point
-// answers 0 — ovrAudio's success, no effect definitions, NULL handles — leaves
-// audio unspatialised instead of throwing.
+// Meta XR Audio's native plugin. The real library comes first: it loads as a
+// translated guest library (overlay step 135), and the C# must reach the SAME
+// image Unity's audio engine loaded, or its version check and context calls
+// answer for a plugin that is not the one spatialising. Only when the plugin is
+// refused (KL_DLOPEN_REFUSE=MetaXRAudioUnity) or absent does the stand-in
+// answer: every entry point returns 0 — ovrAudio's success, NULL handles — so
+// audio plays unspatialised instead of each P/Invoke throwing
+// DllNotFoundException every frame.
 static char g_zero_handle;
 static const char *const k_zero_libs[] = { "MetaXRAudioUnity", "libMetaXRAudioUnity.so" };
 static long mv_zero(void) { return 0; }
@@ -338,7 +341,17 @@ static const char *const k_ndk_libs[] = { "libandroid.so", "libnativewindow.so" 
 
 static void *mv_dlopen(const char *path, int flags) {
     for (size_t i = 0; path && i < sizeof k_zero_libs / sizeof k_zero_libs[0]; i++)
-        if (strcmp(base_name(path), k_zero_libs[i]) == 0) return &g_zero_handle;
+        if (strcmp(base_name(path), k_zero_libs[i]) == 0) {
+            // A bare P/Invoke name has no file of that name; the library's own
+            // soname finds it in the guest's library directory.
+            void *h = klb_dlopen(strchr(path, '/') ? path : "libMetaXRAudioUnity.so", flags);
+            if (h) return h;
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [mv-shim] %s -> stand-in (the plugin did not load: "
+                                "Meta XR Audio answers 0, audio unspatialised)\n", path);
+            return &g_zero_handle;
+        }
     for (size_t i = 0; path && i < sizeof k_ndk_libs / sizeof k_ndk_libs[0]; i++)
         if (strcmp(base_name(path), k_ndk_libs[i]) == 0) return &g_ndk_handle;
     if (path && strcmp(base_name(path), "libossdk.oculus.so") == 0) {

@@ -12315,3 +12315,42 @@ static XrResult mv_xr_LocateHandJointsEXT(void *tracker, const void *info, void 
     open(p, "w").write(s)
 print("overlay: xrCreateHandTrackerEXT / xrLocateHandJointsEXT answer the visionOS hand, with the FB aim state")
 PYEOF
+
+# 135 — Meta XR Audio's Unity plugin (libMetaXRAudioUnity) loads like any other
+# guest library. It was on kl_dl's GLOBAL default refusal list as an "AMFI
+# tripper that maps/patches executable pages", but the binary cannot do that:
+# across every SDK version in the catalogue (1.97 .. 1.113) it imports no
+# mmap, mprotect, mremap or memfd, its only raw syscalls are sched_setaffinity,
+# gettid and rt_sigprocmask (all answered by klb_syscall), and its init_array
+# is outline-atomics HWCAP detection, CPU-flag statics, a mutex, and the Unity
+# effect-parameter registration — no code is generated or rewritten anywhere.
+# klepton-ld translates every copy with 0 refused TLS/x18/CTR sites, and the
+# older Oculus spatializer built from the same audio engine already runs as a
+# translated dylib in this catalogue. Refused, every title shipping it had no
+# spatializer (Unity: "Audio source failed to initialize audio spatializer",
+# once per playing source per frame) and the C# P/Invokes reached a zero
+# stand-in whose version 0.0.0 fails the SDK's compatibility check
+# ("Incompatible SDK version"). The other global refusals are unchanged, and
+# KL_DLOPEN_REFUSE=MetaXRAudioUnity restores the refusal for an A/B (the
+# P/Invoke stand-in in shims/mv_shims.c then answers, as before).
+python3 - "$K/runtime/kl_dl.c" <<'PYEOF'
+import sys
+marker = "metavision: Meta XR Audio's Unity plugin is not refused (step 135)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = ('        static const char *const global[] = {\n'
+           '            "MetaXRAudioUnity", "SDKTelemetry", "OVRMetricsTool",\n')
+    s = sub(p, s, old,
+           '        // ' + marker + ': libMetaXRAudioUnity imports no\n'
+           '        // mmap/mprotect and generates no code; it loads translated like\n'
+           '        // any guest library. KL_DLOPEN_REFUSE=MetaXRAudioUnity refuses it.\n'
+           '        static const char *const global[] = {\n'
+           '            "SDKTelemetry", "OVRMetricsTool",\n')
+    open(p, "w").write(s)
+print("overlay: Meta XR Audio's Unity plugin loads as a translated guest library")
+PYEOF
