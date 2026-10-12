@@ -241,7 +241,8 @@ enum MetavisionAutoplay {
         // Look around; once a minute (40-50 s) turn right round and back.
         let turn = ramp(40, 42) - ramp(48, 50)
         let yaw = 75 * sinf(tau * t / 16) * (1 - turn) + 180 * turn
-        let pitch = 25 * sinf(tau * t / 7)
+        // Down to the floor (-60) as well as up: some scenery is only below a level gaze.
+        let pitch = -20 + 40 * sinf(tau * t / 7)
         // Walk about a metre each way, sidestep, and crouch at 20-26 s.
         let fwd = 0.6 * sinf(tau * t / 30), side = 0.3 * sinf(tau * t / 22)
         let crouch = 0.35 * (ramp(20, 21) - ramp(25, 26))
