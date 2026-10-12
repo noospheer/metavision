@@ -6694,6 +6694,465 @@ print(f"overlay: the catalogue carries signing certificates ({carried} titles ha
 PYEOF
 fi
 
+# 78 — java.io files, Unity's DeviceInfo and permission request, and framework
+# constants. Several calls the catalogue makes had no host implementation:
+#  - java.io.File(File, String), canRead, canWrite and FileOutputStream
+#    (open, write, close): a title that writes its own file got nothing back and
+#    the bytes went nowhere. File gains its constructors and the usual queries
+#    (exists, isDirectory, isFile, length, lastModified, getName, mkdir(s),
+#    delete, space) and FileOutputStream writes for real, both on the host
+#    path the runtime's guest-path mapping gives (kl_guest_path: /sdcard and
+#    the files directories land in the app container, as getFilesDir does).
+#  - com.unity3d.player.DeviceInfo, which Unity's Java answers from Build,
+#    Locale and the clock: the same Build.MODEL / VERSION.RELEASE and locale
+#    the runtime already reports elsewhere, the boot time from the clocks and
+#    the cache volume's size in KiB, as Unity computes it.
+#  - UnityPermissions.requestUserPermissions: each permission is decided by the
+#    manifest model (klj_permission_state) and the callback proxy, when there
+#    is one, is told the result the way Unity's Java does. Before Unity 2023
+#    the interface is onPermissionGranted/onPermissionDenied(String) (Unity's
+#    Java reports a denial as onPermissionDenied on API 30+, and the presented
+#    API is 32); from 2023 on it is onPermissionResult(String[], int[]) with
+#    1 granted / 2 denied. The engine version is read off libunity's build
+#    stamp; when it cannot be read the callback is not called. A request
+#    whose callback argument is null (a plain Object in the signature) only
+#    logs the decisions.
+#  - framework constants read as fields: Configuration.fontWeightAdjustment
+#    (FONT_WEIGHT_ADJUSTMENT_UNDEFINED), WindowManager.LayoutParams
+#    .FLAG_DIM_BEHIND, Window.FEATURE_NO_TITLE, View.VISIBLE, Gravity.TOP and
+#    LEFT, Color.TRANSPARENT, the android.R.attr progress bar styles, and the
+#    Settings keys SCREEN_OFF_TIMEOUT and DEVICE_NAME — the platform's values.
+python3 - "$K/runtime/jni/kl_jni_services.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: java.io files and Unity's DeviceInfo (step 78)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "const klj_binding klj_bind_services[] = {\n", "// " + marker + "\n" + r'''#include <math.h>
+#include <sys/statvfs.h>
+#include <time.h>
+extern void kl_jni_throw(const char *);
+// A File carries its path as the guest spells it (as klj_new_file does);
+// every operation maps it to the host with kl_guest_path. Unlike
+// klj_new_file, constructing one creates nothing on disk.
+static void *mv_file_new(const char *path) {
+    void *obj = kl_jni_new_object("java/io/File");
+    klj_as_object(obj)->data = strdup(path ? path : "");
+    return klj_own(obj, free);
+}
+static const char *mv_file_path(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o && o->data && strcmp(o->cls, "java/io/File") == 0 ? o->data : NULL;
+}
+static const char *mv_file_host(void *self, char *buf, size_t cap) {
+    const char *g = mv_file_path(self);
+    return g ? kl_guest_path(g, buf, cap) : NULL;
+}
+// new File(parent, child): Java joins with one separator, and an empty parent
+// path means the root.
+static void *mv_file_join(const char *parent, const char *child) {
+    char out[1024];
+    if (!child) child = "";
+    if (!parent) snprintf(out, sizeof out, "%s", child);
+    else if (!*parent) snprintf(out, sizeof out, "/%s", child[0] == '/' ? child + 1 : child);
+    else {
+        size_t pl = strlen(parent);
+        while (pl > 1 && parent[pl - 1] == '/') pl--;
+        while (*child == '/') child++;
+        if (*child) snprintf(out, sizeof out, "%.*s/%s", (int)pl, parent, child);
+        else        snprintf(out, sizeof out, "%.*s", (int)pl, parent);
+    }
+    return mv_file_new(out);
+}
+static klj_val mv_File_init_s(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    const char *path = n > 0 ? klj_str(a[0].l) : NULL;
+    if (!path) { kl_jni_throw("java/lang/NullPointerException"); return (klj_val){0}; }
+    return (klj_val){.l = mv_file_new(path)};
+}
+static klj_val mv_File_init_fs(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return (klj_val){.l = mv_file_join(n > 0 && a[0].l ? mv_file_path(a[0].l) : NULL,
+                                       n > 1 ? klj_str(a[1].l) : NULL)};
+}
+static klj_val mv_File_init_ss(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return (klj_val){.l = mv_file_join(n > 0 && a[0].l ? klj_str(a[0].l) : NULL,
+                                       n > 1 ? klj_str(a[1].l) : NULL)};
+}
+static int mv_file_stat(void *self, struct stat *st) {
+    char buf[1024];
+    const char *h = mv_file_host(self, buf, sizeof buf);
+    return h && stat(h, st) == 0;
+}
+static int mv_file_access(void *self, int mode) {
+    char buf[1024];
+    const char *h = mv_file_host(self, buf, sizeof buf);
+    return h && access(h, mode) == 0;
+}
+#define MV_FILE_Z(Name, expr) \
+    static klj_val mv_File_##Name(void *env, void *self, const klj_val *a, int n) { \
+        (void)env; (void)a; (void)n; struct stat st; (void)st; \
+        return (klj_val){.j = (expr) ? 1u : 0u}; }
+MV_FILE_Z(exists,      mv_file_stat(self, &st))
+MV_FILE_Z(isDirectory, mv_file_stat(self, &st) && S_ISDIR(st.st_mode))
+MV_FILE_Z(isFile,      mv_file_stat(self, &st) && S_ISREG(st.st_mode))
+MV_FILE_Z(canRead,     mv_file_access(self, R_OK))
+MV_FILE_Z(canWrite,    mv_file_access(self, W_OK))
+static klj_val mv_File_length(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    struct stat st;
+    return (klj_val){.j = mv_file_stat(self, &st) && S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0};
+}
+static klj_val mv_File_lastModified(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    struct stat st;
+    return (klj_val){.j = mv_file_stat(self, &st) ? (uint64_t)((int64_t)st.st_mtime * 1000) : 0};
+}
+static klj_val mv_File_getName(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    const char *g = mv_file_path(self);
+    const char *b = g ? strrchr(g, '/') : NULL;
+    return (klj_val){.l = kl_jni_new_string(b ? b + 1 : g ? g : "")};
+}
+static klj_val mv_File_mkdir(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char buf[1024];
+    const char *h = mv_file_host(self, buf, sizeof buf);
+    return (klj_val){.j = h && mkdir(h, 0755) == 0 ? 1u : 0u};
+}
+static klj_val mv_File_mkdirs(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char buf[1024];
+    struct stat st;
+    const char *h = mv_file_host(self, buf, sizeof buf);
+    if (!h || stat(h, &st) == 0) return (klj_val){.j = 0};   // Java: false when it already exists
+    klj_mkdir_p(h);
+    return (klj_val){.j = stat(h, &st) == 0 && S_ISDIR(st.st_mode) ? 1u : 0u};
+}
+static klj_val mv_File_delete(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    char buf[1024];
+    const char *h = mv_file_host(self, buf, sizeof buf);
+    return (klj_val){.j = h && remove(h) == 0 ? 1u : 0u};
+}
+static int64_t mv_space(const char *host, int which) {
+    struct statvfs v;
+    if (!host || statvfs(host, &v) != 0) return 0;
+    uint64_t blocks = which == 0 ? v.f_blocks : which == 1 ? v.f_bfree : v.f_bavail;
+    return (int64_t)(blocks * (uint64_t)v.f_frsize);
+}
+#define MV_FILE_SPACE(Name, W) \
+    static klj_val mv_File_##Name(void *env, void *self, const klj_val *a, int n) { \
+        (void)env; (void)a; (void)n; char buf[1024]; \
+        return (klj_val){.j = (uint64_t)mv_space(mv_file_host(self, buf, sizeof buf), W)}; }
+MV_FILE_SPACE(getTotalSpace,  0)
+MV_FILE_SPACE(getFreeSpace,   1)
+MV_FILE_SPACE(getUsableSpace, 2)
+
+// FileOutputStream: the open FILE* is the payload; close() drops it, and an
+// unclosed stream is closed when its object is retired.
+#define MV_FOS_CLASS "java/io/FileOutputStream"
+static void mv_fos_free(void *p) { if (p) fclose(p); }
+static klj_val mv_fos_open(const char *guest, int append) {
+    char buf[1024];
+    const char *h = guest ? kl_guest_path(guest, buf, sizeof buf) : NULL;
+    FILE *f = h ? fopen(h, append ? "ab" : "wb") : NULL;
+    KLJ_LOG("FileOutputStream(\"%s\"%s) -> %s", guest ? guest : "(null)",
+            append ? ", append" : "", f ? "open" : strerror(errno));
+    if (!f) { kl_jni_throw("java/io/FileNotFoundException"); return (klj_val){0}; }
+    void *obj = kl_jni_new_object(MV_FOS_CLASS);
+    klj_as_object(obj)->data = f;
+    return (klj_val){.l = klj_own(obj, mv_fos_free)};
+}
+static klj_val mv_FOS_init_f(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return mv_fos_open(n > 0 && a[0].l ? mv_file_path(a[0].l) : NULL, n > 1 && (uint8_t)a[1].j);
+}
+static klj_val mv_FOS_init_s(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    return mv_fos_open(n > 0 ? klj_str(a[0].l) : NULL, n > 1 && (uint8_t)a[1].j);
+}
+static FILE *mv_fos_of(void *self) {
+    klj_object *o = klj_as_object(self);
+    FILE *f = o && strcmp(o->cls, MV_FOS_CLASS) == 0 ? o->data : NULL;
+    if (!f) kl_jni_throw("java/io/IOException");   // closed, or not a stream of ours
+    return f;
+}
+static void mv_fos_put(void *self, const void *p, size_t len) {
+    FILE *f = mv_fos_of(self);
+    if (f && len && fwrite(p, 1, len, f) != len) kl_jni_throw("java/io/IOException");
+}
+static klj_val mv_FOS_write_bii(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_array *arr = n > 0 && a[0].l ? klj_arr(a[0].l) : NULL;
+    int off = n > 1 ? (int)(int32_t)a[1].j : 0, len = n > 2 ? (int)(int32_t)a[2].j : 0;
+    if (!arr || arr->kind != 'B' || off < 0 || len < 0 || off > arr->len - len) {
+        kl_jni_throw(arr ? "java/lang/IndexOutOfBoundsException" : "java/lang/NullPointerException");
+        return (klj_val){0};
+    }
+    mv_fos_put(self, (const char *)arr->data + off, (size_t)len);
+    return (klj_val){0};
+}
+static klj_val mv_FOS_write_b(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    klj_array *arr = n > 0 && a[0].l ? klj_arr(a[0].l) : NULL;
+    if (!arr || arr->kind != 'B') { kl_jni_throw("java/lang/NullPointerException"); return (klj_val){0}; }
+    mv_fos_put(self, arr->data, (size_t)arr->len);
+    return (klj_val){0};
+}
+static klj_val mv_FOS_write_i(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    unsigned char c = (unsigned char)(n > 0 ? a[0].j : 0);
+    mv_fos_put(self, &c, 1);
+    return (klj_val){0};
+}
+static klj_val mv_FOS_flush(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (o && o->data && strcmp(o->cls, MV_FOS_CLASS) == 0) fflush(o->data);
+    return (klj_val){0};
+}
+static klj_val mv_FOS_close(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    klj_object *o = klj_as_object(self);
+    if (o && o->data && strcmp(o->cls, MV_FOS_CLASS) == 0) {   // a second close is a no-op, as in Java
+        fclose(o->data);
+        o->data = NULL;
+    }
+    return (klj_val){0};
+}
+
+// com.unity3d.player.DeviceInfo: what Unity's Java reads, from the same
+// sources the runtime answers Build, Locale and the clock from.
+static klj_val mv_DeviceInfo_getDeviceModel(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *m = kl_jni_build_string("MODEL");
+    return (klj_val){.l = kl_jni_new_string(m ? m : "")};
+}
+static klj_val mv_DeviceInfo_getOsVersion(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    const char *r = kl_jni_build_string("RELEASE");
+    return (klj_val){.l = kl_jni_new_string(r ? r : "")};
+}
+// The locale list is the one locale Configuration.getLocales holds, in
+// Locale.toString's form, which is how Unity joins them.
+static klj_val mv_DeviceInfo_getLocale(void *env, void *self, const klj_val *a, int n) {
+    return mv_Locale_toString(env, self, a, n);
+}
+// currentTimeMillis() - elapsedRealtime(), as Unity computes it.
+static klj_val mv_DeviceInfo_getSystemBootTime(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    struct timespec rt, up;
+    clock_gettime(CLOCK_REALTIME, &rt);
+    clock_gettime(CLOCK_MONOTONIC, &up);
+    int64_t ms = ((int64_t)rt.tv_sec - (int64_t)up.tv_sec) * 1000
+               + ((int64_t)rt.tv_nsec - (int64_t)up.tv_nsec) / 1000000;
+    return (klj_val){.j = (uint64_t)ms};
+}
+// The cache directory's volume, in KiB rounded through a float to an int as
+// Unity's Java does; -1 when there is no such directory.
+static klj_val mv_DeviceInfo_getTotalSpace(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    char dir[1024], buf[1024];
+    snprintf(dir, sizeof dir, "%s/cache", kl_jni_files_dir());
+    const char *h = kl_guest_path(dir, buf, sizeof buf);
+    struct stat st;
+    if (stat(h, &st) != 0) return (klj_val){.j = (uint64_t)(int64_t)-1};
+    float kib = (float)(mv_space(h, 0) / 1024);
+    return (klj_val){.j = (uint64_t)(int64_t)(int32_t)lroundf(kib)};
+}
+
+''' + "const klj_binding klj_bind_services[] = {\n" + r'''    // metavision: java.io files and Unity's DeviceInfo (step 78)
+    {"java/io/File", "<init>", "(Ljava/lang/String;)V", mv_File_init_s},
+    {"java/io/File", "<init>", "(Ljava/io/File;Ljava/lang/String;)V", mv_File_init_fs},
+    {"java/io/File", "<init>", "(Ljava/lang/String;Ljava/lang/String;)V", mv_File_init_ss},
+    {"java/io/File", "exists",       "()Z", mv_File_exists},
+    {"java/io/File", "isDirectory",  "()Z", mv_File_isDirectory},
+    {"java/io/File", "isFile",       "()Z", mv_File_isFile},
+    {"java/io/File", "canRead",      "()Z", mv_File_canRead},
+    {"java/io/File", "canWrite",     "()Z", mv_File_canWrite},
+    {"java/io/File", "length",       "()J", mv_File_length},
+    {"java/io/File", "lastModified", "()J", mv_File_lastModified},
+    {"java/io/File", "getName",      "()Ljava/lang/String;", mv_File_getName},
+    {"java/io/File", "toString",     "()Ljava/lang/String;", klj_File_getPath},
+    {"java/io/File", "mkdir",        "()Z", mv_File_mkdir},
+    {"java/io/File", "mkdirs",       "()Z", mv_File_mkdirs},
+    {"java/io/File", "delete",       "()Z", mv_File_delete},
+    {"java/io/File", "getTotalSpace",  "()J", mv_File_getTotalSpace},
+    {"java/io/File", "getFreeSpace",   "()J", mv_File_getFreeSpace},
+    {"java/io/File", "getUsableSpace", "()J", mv_File_getUsableSpace},
+    {MV_FOS_CLASS, "<init>", "(Ljava/io/File;)V",      mv_FOS_init_f},
+    {MV_FOS_CLASS, "<init>", "(Ljava/io/File;Z)V",     mv_FOS_init_f},
+    {MV_FOS_CLASS, "<init>", "(Ljava/lang/String;)V",  mv_FOS_init_s},
+    {MV_FOS_CLASS, "<init>", "(Ljava/lang/String;Z)V", mv_FOS_init_s},
+    {MV_FOS_CLASS, "write", "([BII)V", mv_FOS_write_bii},
+    {MV_FOS_CLASS, "write", "([B)V",   mv_FOS_write_b},
+    {MV_FOS_CLASS, "write", "(I)V",    mv_FOS_write_i},
+    {MV_FOS_CLASS, "flush", "()V",     mv_FOS_flush},
+    {MV_FOS_CLASS, "close", "()V",     mv_FOS_close},
+    {"com/unity3d/player/DeviceInfo", "getDeviceModel", "()Ljava/lang/String;", mv_DeviceInfo_getDeviceModel},
+    {"com/unity3d/player/DeviceInfo", "getOsVersion", "()Ljava/lang/String;", mv_DeviceInfo_getOsVersion},
+    {"com/unity3d/player/DeviceInfo", "getSystemLanguage", "()Ljava/lang/String;", mv_DeviceInfo_getLocale},
+    {"com/unity3d/player/DeviceInfo", "getLocaleList", "(Landroid/content/Context;)Ljava/lang/String;", mv_DeviceInfo_getLocale},
+    {"com/unity3d/player/DeviceInfo", "getSystemBootTime", "()J", mv_DeviceInfo_getSystemBootTime},
+    {"com/unity3d/player/DeviceInfo", "getTotalSpace", "(Landroid/content/Context;)J", mv_DeviceInfo_getTotalSpace},
+''')
+    open(p, "w").write(s)
+print("overlay: java.io File/FileOutputStream on the host filesystem, and Unity's DeviceInfo")
+PYEOF
+
+# ...the engine version, for the permission callback's shape.
+python3 - "$K/runtime/guest/kl_guestpoke.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: libunity's version, for the permission callback (step 78)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "// Is [p, p+len) actually mapped?",
+        "// " + marker + ": NULL when libunity is not loaded or carries no stamp.\n"
+        "const char *kl_mv_unity_version(void);\n"
+        "const char *kl_mv_unity_version(void) { return unity_version(); }\n"
+        "\n"
+        "// Is [p, p+len) actually mapped?")
+    open(p, "w").write(s)
+print("overlay: libunity's version readable outside the guest pokes")
+PYEOF
+
+# ...UnityPermissions.requestUserPermissions decides and answers.
+python3 - "$K/runtime/jni/kl_jni_display.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: Unity's permission request answers its callback (step 78)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "static klj_val klj_UnityPermissions_requestUserPermissions(void *env, void *self,\n"
+        "                                                           const klj_val *a, int n) {\n"
+        "    (void)env; (void)self; (void)a; (void)n;\n"
+        "    KLJ_LOG(\"UnityPermissions.requestUserPermissions(...) — no user to ask; \"\n"
+        "            \"state is whatever hasUserAuthorizedPermission reports\");\n"
+        "    return (klj_val){.l = NULL};\n"
+        "}\n",
+        "// " + marker + r'''
+// Each permission is decided by the manifest model, and a callback proxy is
+// told the result as Unity's Java tells it: onPermissionGranted /
+// onPermissionDenied(String) per permission before Unity 2023 (on API 30+ its
+// Java reports every denial as onPermissionDenied), onPermissionResult(String[],
+// int[]) with 1 granted / 2 denied from 2023 on. Called inline, on the thread
+// that asked; without a readable engine version the callback is not called.
+#define MV_PERM_CB "com/unity3d/player/IPermissionRequestCallbacks"
+const char *kl_mv_unity_version(void);
+static klj_val klj_UnityPermissions_requestUserPermissions(void *env, void *self,
+                                                           const klj_val *a, int n) {
+    (void)env; (void)self;
+    klj_array *names = n > 1 && a[1].l ? klj_arr(a[1].l) : NULL;
+    void *cb = n > 2 ? a[2].l : NULL;
+    klj_object *cbo = cb ? klj_as_object(cb) : NULL;
+    if (!names || names->kind != 'L') {
+        KLJ_LOG("UnityPermissions.requestUserPermissions with no permission names — nothing to do");
+        return (klj_val){0};
+    }
+    const char *ver = kl_mv_unity_version();
+    int result_api = ver ? atoi(ver) >= 2023 : -1;
+    int proxy = cbo && strcmp(cbo->cls, KLJ_CLASS_PROXY) == 0;
+    void *results = klj_new_array('I', NULL, names->len);
+    for (int i = 0; i < names->len; i++) {
+        void *name = ((void **)names->data)[i];
+        const char *pn = name ? klj_str(name) : NULL, *why = "";
+        int granted = pn && klj_permission_state(pn, &why);
+        ((int32_t *)klj_arr(results)->data)[i] = granted ? 1 : 2;
+        KLJ_LOG("UnityPermissions.requestUserPermissions(\"%s\") -> %s%s (no user to ask)",
+                pn ? pn : "(null)", granted ? "GRANTED" : "DENIED", why);
+        if (proxy && result_api == 0) {
+            void *args = klj_new_array('L', "java/lang/Object", 1);
+            ((void **)klj_arr(args)->data)[0] = name;
+            klj_proxy_invoke(cb, MV_PERM_CB,
+                             granted ? "onPermissionGranted" : "onPermissionDenied",
+                             "(Ljava/lang/String;)V", args);
+        }
+    }
+    if (proxy && result_api == 1) {
+        void *args = klj_new_array('L', "java/lang/Object", 2);
+        ((void **)klj_arr(args)->data)[0] = a[1].l;
+        ((void **)klj_arr(args)->data)[1] = results;
+        klj_proxy_invoke(cb, MV_PERM_CB, "onPermissionResult", "([Ljava/lang/String;[I)V", args);
+    }
+    if (cb && !proxy)
+        KLJ_LOG("UnityPermissions.requestUserPermissions: the callback is a %s, not a proxy — not called",
+                cbo ? cbo->cls : "(not an object)");
+    else if (proxy && result_api < 0)
+        KLJ_LOG("UnityPermissions.requestUserPermissions: engine version unknown — callback not called");
+    return (klj_val){0};
+}
+''')
+    s = sub(s,
+        "     \"(Lcom.unity3d.player.UnityPlayerActivity;[Ljava/lang/String;Lcom.unity3d.player.IPermissionRequestCallbacks;)V\",\n"
+        "                                                 klj_UnityPermissions_requestUserPermissions},\n",
+        "     \"(Lcom.unity3d.player.UnityPlayerActivity;[Ljava/lang/String;Lcom.unity3d.player.IPermissionRequestCallbacks;)V\",\n"
+        "                                                 klj_UnityPermissions_requestUserPermissions},\n"
+        "    // " + marker + ": the form C# builds for a null callback, and Java's own\n"
+        "    {\"com/unity3d/player/UnityPermissions\", \"requestUserPermissions\",\n"
+        "     \"(Lcom.unity3d.player.UnityPlayerActivity;[Ljava/lang/String;Ljava/lang/Object;)V\",\n"
+        "                                                 klj_UnityPermissions_requestUserPermissions},\n"
+        "    {\"com/unity3d/player/UnityPermissions\", \"requestUserPermissions\",\n"
+        "     \"(Landroid/app/Activity;[Ljava/lang/String;Lcom/unity3d/player/IPermissionRequestCallbacks;)V\",\n"
+        "                                                 klj_UnityPermissions_requestUserPermissions},\n")
+    open(p, "w").write(s)
+print("overlay: UnityPermissions.requestUserPermissions decides each permission and answers its callback")
+PYEOF
+
+# ...and the framework constants, with the platform's values.
+python3 - "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: framework constants (step 78)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    {.cls = NULL},\n};\n\n// The Build.* String constants",
+        "    // " + marker + "\n"
+        "    KLJ_FINT(\"android/content/res/Configuration\", \"fontWeightAdjustment\", 2147483647),   // FONT_WEIGHT_ADJUSTMENT_UNDEFINED\n"
+        "    KLJ_FINT(\"android/view/WindowManager$LayoutParams\", \"FLAG_DIM_BEHIND\", 0x00000002),\n"
+        "    KLJ_FINT(\"android/view/Window\", \"FEATURE_NO_TITLE\", 1),\n"
+        "    KLJ_FINT(\"android/view/View\", \"VISIBLE\",   0),\n"
+        "    KLJ_FINT(\"android/view/View\", \"INVISIBLE\", 4),\n"
+        "    KLJ_FINT(\"android/view/View\", \"GONE\",      8),\n"
+        "    KLJ_FINT(\"android/view/Gravity\", \"TOP\",    48),\n"
+        "    KLJ_FINT(\"android/view/Gravity\", \"BOTTOM\", 80),\n"
+        "    KLJ_FINT(\"android/view/Gravity\", \"LEFT\",   3),\n"
+        "    KLJ_FINT(\"android/view/Gravity\", \"RIGHT\",  5),\n"
+        "    KLJ_FINT(\"android/view/Gravity\", \"CENTER\", 17),\n"
+        "    KLJ_FINT(\"android/graphics/Color\", \"TRANSPARENT\", 0),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyle\",             0x01010077),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyleHorizontal\",   0x01010078),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyleSmall\",        0x01010079),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyleLarge\",        0x0101007a),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyleInverse\",      0x01010287),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyleSmallInverse\", 0x01010288),\n"
+        "    KLJ_FINT(\"android/R$attr\", \"progressBarStyleLargeInverse\", 0x01010289),\n"
+        "    KLJ_FSTR(\"android/provider/Settings$System\", \"SCREEN_OFF_TIMEOUT\", \"screen_off_timeout\"),\n"
+        "    KLJ_FSTR(\"android/provider/Settings$Global\", \"DEVICE_NAME\", \"device_name\"),\n"
+        "    {.cls = NULL},\n};\n\n// The Build.* String constants")
+    open(p, "w").write(s)
+print("overlay: framework constants (layout, window, gravity, progress bar styles, settings keys)")
+PYEOF
+
 # 79 — test runs never tap a control that leaves the title. The presser already
 # skipped controls labelled Quit, Exit and the like, but the scripted trigger
 # and the hands-free "select" tap wherever the pointer rests, and a menu the
