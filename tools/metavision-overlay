@@ -7051,10 +7051,38 @@ if marker not in s:
 // told the result as Unity's Java tells it: onPermissionGranted /
 // onPermissionDenied(String) per permission before Unity 2023 (on API 30+ its
 // Java reports every denial as onPermissionDenied), onPermissionResult(String[],
-// int[]) with 1 granted / 2 denied from 2023 on. Called inline, on the thread
-// that asked; without a readable engine version the callback is not called.
+// int[]) with 1 granted / 2 denied from 2023 on. Delivered on the next drain of
+// the UI queue, as Android posts it, never inside the request itself; without a
+// readable engine version the callback is not called.
 #define MV_PERM_CB "com/unity3d/player/IPermissionRequestCallbacks"
 const char *kl_mv_unity_version(void);
+void kl_mv_ui_later(void (*fn)(void *), void *arg);
+typedef struct { void *cb; int api, n; char **names; int32_t *res; } mv_perm_reply;
+static void mv_perm_deliver(void *arg) {
+    mv_perm_reply *r = arg;
+    if (r->api == 0) {
+        for (int i = 0; i < r->n; i++) {
+            void *args = klj_new_array('L', "java/lang/Object", 1);
+            ((void **)klj_arr(args)->data)[0] = kl_jni_new_string(r->names[i]);
+            klj_proxy_invoke(r->cb, MV_PERM_CB, r->res[i] == 1 ? "onPermissionGranted" : "onPermissionDenied",
+                             "(Ljava/lang/String;)V", args);
+        }
+    } else {
+        void *names = klj_new_array('L', "java/lang/String", r->n);
+        void *res = klj_new_array('I', NULL, r->n);
+        for (int i = 0; i < r->n; i++) {
+            ((void **)klj_arr(names)->data)[i] = kl_jni_new_string(r->names[i]);
+            ((int32_t *)klj_arr(res)->data)[i] = r->res[i];
+        }
+        void *args = klj_new_array('L', "java/lang/Object", 2);
+        ((void **)klj_arr(args)->data)[0] = names;
+        ((void **)klj_arr(args)->data)[1] = res;
+        klj_proxy_invoke(r->cb, MV_PERM_CB, "onPermissionResult", "([Ljava/lang/String;[I)V", args);
+    }
+    KLJ_LOG("UnityPermissions: the callback was answered (%d permission%s)", r->n, r->n == 1 ? "" : "s");
+    for (int i = 0; i < r->n; i++) free(r->names[i]);
+    free(r->names); free(r->res); free(r);
+}
 static klj_val klj_UnityPermissions_requestUserPermissions(void *env, void *self,
                                                            const klj_val *a, int n) {
     (void)env; (void)self;
@@ -7068,27 +7096,24 @@ static klj_val klj_UnityPermissions_requestUserPermissions(void *env, void *self
     const char *ver = kl_mv_unity_version();
     int result_api = ver ? atoi(ver) >= 2023 : -1;
     int proxy = cbo && strcmp(cbo->cls, KLJ_CLASS_PROXY) == 0;
-    void *results = klj_new_array('I', NULL, names->len);
+    mv_perm_reply *r = calloc(1, sizeof *r);
+    if (r) {
+        r->cb = cb; r->api = result_api; r->n = names->len;
+        r->names = calloc((size_t)names->len + 1, sizeof *r->names);
+        r->res = calloc((size_t)names->len + 1, sizeof *r->res);
+    }
     for (int i = 0; i < names->len; i++) {
         void *name = ((void **)names->data)[i];
         const char *pn = name ? klj_str(name) : NULL, *why = "";
         int granted = pn && klj_permission_state(pn, &why);
-        ((int32_t *)klj_arr(results)->data)[i] = granted ? 1 : 2;
+        if (r && r->names && r->res) { r->names[i] = strdup(pn ? pn : ""); r->res[i] = granted ? 1 : 2; }
         KLJ_LOG("UnityPermissions.requestUserPermissions(\"%s\") -> %s%s (no user to ask)",
                 pn ? pn : "(null)", granted ? "GRANTED" : "DENIED", why);
-        if (proxy && result_api == 0) {
-            void *args = klj_new_array('L', "java/lang/Object", 1);
-            ((void **)klj_arr(args)->data)[0] = name;
-            klj_proxy_invoke(cb, MV_PERM_CB,
-                             granted ? "onPermissionGranted" : "onPermissionDenied",
-                             "(Ljava/lang/String;)V", args);
-        }
     }
-    if (proxy && result_api == 1) {
-        void *args = klj_new_array('L', "java/lang/Object", 2);
-        ((void **)klj_arr(args)->data)[0] = a[1].l;
-        ((void **)klj_arr(args)->data)[1] = results;
-        klj_proxy_invoke(cb, MV_PERM_CB, "onPermissionResult", "([Ljava/lang/String;[I)V", args);
+    if (r && r->names && r->res && proxy && result_api >= 0) kl_mv_ui_later(mv_perm_deliver, r);
+    else if (r) {
+        for (int i = 0; i < r->n; i++) if (r->names) free(r->names[i]);
+        free(r->names); free(r->res); free(r);
     }
     if (cb && !proxy)
         KLJ_LOG("UnityPermissions.requestUserPermissions: the callback is a %s, not a proxy — not called",
@@ -7112,6 +7137,47 @@ static klj_val klj_UnityPermissions_requestUserPermissions(void *env, void *self
         "                                                 klj_UnityPermissions_requestUserPermissions},\n")
     open(p, "w").write(s)
 print("overlay: UnityPermissions.requestUserPermissions decides each permission and answers its callback")
+PYEOF
+
+# ...and the hook that delivers it: host work run on the next UI drain.
+python3 - "$K/runtime/jni/kl_jni_bridge.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: host work on the next UI drain (step 78)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "unsigned kl_jni_drain_ui_tasks(void) {\n",
+        "// " + marker + "\n"
+        "#define MV_LATER_N 32\n"
+        "static struct { void (*fn)(void *); void *arg; } mv_later[MV_LATER_N];\n"
+        "static unsigned mv_later_n;\n"
+        "void kl_mv_ui_later(void (*fn)(void *), void *arg) {\n"
+        "    pthread_mutex_lock(&g_lock);\n"
+        "    int ok = mv_later_n < MV_LATER_N;\n"
+        "    if (ok) { mv_later[mv_later_n].fn = fn; mv_later[mv_later_n].arg = arg; mv_later_n++; }\n"
+        "    pthread_mutex_unlock(&g_lock);\n"
+        "    if (!ok) fn(arg);   // full: run it now rather than lose it\n"
+        "}\n"
+        "static void mv_later_drain(void) {\n"
+        "    struct { void (*fn)(void *); void *arg; } b[MV_LATER_N];\n"
+        "    pthread_mutex_lock(&g_lock);\n"
+        "    unsigned n = mv_later_n;\n"
+        "    for (unsigned i = 0; i < n; i++) { b[i].fn = mv_later[i].fn; b[i].arg = mv_later[i].arg; }\n"
+        "    mv_later_n = 0;\n"
+        "    pthread_mutex_unlock(&g_lock);\n"
+        "    for (unsigned i = 0; i < n; i++) b[i].fn(b[i].arg);\n"
+        "}\n"
+        "\n"
+        "unsigned kl_jni_drain_ui_tasks(void) {\n")
+    s = sub(s, "    klj_drain_soft_input();\n",
+        "    klj_drain_soft_input();\n"
+        "    mv_later_drain();   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: host work can run on the next UI drain")
 PYEOF
 
 # ...and the framework constants, with the platform's values.
