@@ -3394,7 +3394,7 @@ if marker not in s:
         '            if (*q == \'L\') { while (*q && *q != \';\') q++; if (*q) q++; } else q++;\n'
         '            if (!str || !argv[i].l) continue;\n'
         '            const char *t = klj_str(argv[i].l);\n'
-        '            if (t && *t && mv_lines++ < 600)\n'
+        '            if (t && *t && mv_lines++ < 5000)   /* a title\'s last words before a quit matter most */\n'
         '                fprintf(stderr, "[jni]   %s arg %d: \\"%.240s\\"\\n", w->name, i, t);\n'
         '        }\n'
         '    }\n'
@@ -6476,4 +6476,43 @@ if marker not in s:
         "    {MV_GMS_AVAIL, \"isGooglePlayServicesAvailable\", \"(Landroid/content/Context;I)I\", mv_GoogleApiAvailability_available},\n")
     open(p, "w").write(s)
 print("overlay: Google Play services report missing")
+PYEOF
+
+# 79 — test runs never tap a control that leaves the title. The presser already
+# skipped controls labelled Quit, Exit and the like, but the scripted trigger
+# and the hands-free "select" tap wherever the pointer rests, and a menu the
+# presser had opened left a Quit button under it: the title quit itself mid-run.
+# During auto-play such a Unity UI control is made non-interactable when the
+# presser first sees it, so no scripted input of any kind can reach it
+# (MV_AUTOPLAY_UI_GUARD=0 leaves it alone).
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: leaving controls guarded during auto-play (step 79)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    mv_release(now, t0, 1);                     // never two presses at once\n",
+        "    mv_release(now, t0, 1);                     // never two presses at once\n"
+        "    // " + marker + "\n"
+        "    static int guard = -1;\n"
+        "    static const MethodInfo *m_set_int;\n"
+        "    if (guard < 0) {\n"
+        "        guard = kl_env_on(\"MV_AUTOPLAY_UI_GUARD\", 1);\n"
+        "        if (guard && k_sel) m_set_int = mv_m(k_sel, \"set_interactable\", 1);\n"
+        "    }\n")
+    s = sub(s,
+        "            mvd[di_].unsafe_ = 1; nskip++;                                                 \\\n",
+        "            if (!mvd[di_].unsafe_ && (fam_) == MVF_UI && m_set_int) {                       \\\n"
+        "                uint8_t no_ = 0; void *an_[1] = { &no_ };                                  \\\n"
+        "                invoke_on(x_->o, m_set_int, an_, \"Selectable.interactable\");               \\\n"
+        "                fprintf(stderr, \"[mv-autoplay-ui] guarded '%s': no scripted tap reaches it\\n\", \\\n"
+        "                        x_->lab[0] ? x_->lab : x_->go);                                     \\\n"
+        "            }                                                                              \\\n"
+        "            mvd[di_].unsafe_ = 1; nskip++;                                                 \\\n")
+    open(p, "w").write(s)
+print("overlay: auto-play guards controls that leave the title")
 PYEOF
