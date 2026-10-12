@@ -13159,3 +13159,3258 @@ static void kl_guard_strike_clear_locked(const char *base) {
     open(p, "w").write(s)
 print("overlay: the load guard refuses a library on the second consecutive killed launch")
 PYEOF
+
+# 145 — Firestore's Java side, as runtime/jni/kl_jni_firestore.c. A Unity title
+# using Cloud Firestore runs the Firebase C++ SDK, which on Android drives the
+# Java SDK over JNI: FirebaseFirestore.getInstance(app, "(default)"), settings,
+# collection/document references, Query (where/orderBy/limit/cursors), get /
+# set / update / delete / add / WriteBatch, each answered with a gms Task the
+# SDK watches through JniResultCallback (whose Java calls the native
+# nativeOnResult it registered); snapshot listeners are its own
+# Document/QueryEventListener with a registered nativeOnEvent; it keeps every
+# Java object in ObjectArena. None of it had a host implementation, so
+# getInstance answered null ("java_firestore.get() != nullptr"), every future
+# was "in an invalid state", and a title that probes Firestore on its first run
+# showed its own "requires internet" panel and went no further. The file is that
+# Java, on the Firestore REST API: documents:batchGet, :runQuery,
+# :runAggregationQuery and :commit (with serverTimestamp/increment/arrayUnion/
+# arrayRemove as transforms and FieldValue.delete as a masked field), the
+# project from the app's FirebaseOptions (step 74, the title's own resource
+# strings; no key is sent, as the Android SDK's Firestore channel sends none, so
+# access is what the project's rules give an unauthenticated client). Values
+# cross as the Java objects the SDK unboxes (String, Long, Double, Boolean,
+# Timestamp, Blob, GeoPoint, DocumentReference, ArrayList, HashMap). Outcomes
+# reach the guest on the UI drain (step 78), the main thread of Android's
+# JniResultCallback. Listeners get the server's snapshot once, and again after
+# this client's own writes to what they watch. Every failure (offline, a rules
+# denial, transactions and bundles, which are not implemented) completes the
+# Task with a FirebaseFirestoreException of the Android code and message.
+# Requests go through mv_net_fetch (URLSession, step 147); without it every
+# request fails as offline.
+python3 - "$K/runtime/jni/kl_jni_firestore.c" <<'PYEOF'
+import os, sys
+p = sys.argv[1]
+src = r'''// metavision: Firestore's Java side (step 145)
+//
+// A Unity title using Cloud Firestore runs the Firebase C++ SDK, and on Android
+// that SDK is a thin layer over the Java one: it calls FirebaseFirestore,
+// CollectionReference, Query, DocumentReference and friends over JNI, gets a
+// gms Task back from every asynchronous call, and learns the outcome through
+// com.google.firebase.app.internal.cpp.JniResultCallback, whose Java half calls
+// the native it registered (nativeOnResult) on the main thread. Snapshot
+// listeners are the SDK's own Document/QueryEventListener classes with a
+// registered nativeOnEvent. Field values cross as plain Java objects (String,
+// Long, Double, Boolean, Timestamp, Blob, GeoPoint, DocumentReference, List,
+// Map), which the C++ side tells apart with IsInstanceOf and unboxes; it keeps
+// every Java object it holds in ObjectArena (a static id -> object map).
+//
+// None of that Java exists here, so this file is it, backed by the Firestore
+// REST API (https://<host>/v1/projects/<project>/databases/<db>/documents...):
+//  - reads: DocumentReference.get is documents:batchGet (found / missing, so a
+//    missing document is a snapshot that does not exist, as on Android);
+//    Query.get is :runQuery with the structured query the where/orderBy/limit/
+//    cursor calls built; Query.count().get is :runAggregationQuery;
+//  - writes: set (overwrite, merge, merge fields), update (map or field paths),
+//    delete, CollectionReference.add and WriteBatch are one :commit each, with
+//    serverTimestamp / increment / arrayUnion / arrayRemove as field transforms
+//    and FieldValue.delete as a masked field;
+//  - snapshot listeners deliver the server's snapshot once, and again after
+//    this client commits a write to what they watch;
+//  - the project comes from the app's FirebaseOptions (step 74, the title's own
+//    resource strings); no key is sent — the Android SDK's Firestore channel
+//    does not send one either — so access is what the project's security rules
+//    allow an unauthenticated client.
+// Requests go through mv_net_fetch, which the app layer provides with
+// URLSession (klepton-overlay/MetavisionNet.swift); a build without it fails
+// every request as offline. Every failure — offline, a rules denial, anything
+// not implemented here (transactions, bundles) — completes the Task with a
+// FirebaseFirestoreException carrying the Android code and message, so the
+// title sees the error it would see on a headset without a connection rather
+// than a crash. Outcomes reach the guest on the UI drain (step 78), which is the
+// main thread JniResultCallback uses on Android.
+//
+// Lifetimes: a host object that keeps another (a snapshot its data, a map its
+// entries, a task its result) holds it (klj_hold), and lets go when it is itself
+// retired (step 146). Values, keys and project ids are never logged.
+
+#if defined(__linux__)
+#define _GNU_SOURCE   // timegm, strndup (syntax checks off the target)
+#endif
+#include <math.h>
+#include <pthread.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "kl_jni.h"
+#include "kl_env.h"
+#include "kl_jni_int.h"
+
+void kl_jni_throw(const char *cls);                          // kl_jni.c
+void kl_mv_ui_later(void (*fn)(void *), void *arg);          // step 78
+void  klj_hold(void *obj);                                   // step 146
+void  klj_release(void *obj);
+void  klj_release_locked(void *obj);
+void *mv_hashmap_new(void);                                  // step 146
+int   mv_is_hashmap(void *obj);
+void  mv_hashmap_put(void *map, void *k, void *v);
+void *mv_hashmap_get(void *map, void *k);
+void *mv_hashmap_get_utf(void *map, const char *key, int *found);
+void  mv_hashmap_remove(void *map, void *k);
+int   mv_hashmap_at(void *map, unsigned i, void **k, void **v);
+
+// The app layer's HTTP request (URLSession). `done` runs once, on any thread:
+// status 0 with `err` when there was no response at all.
+typedef void (*mv_net_done_fn)(void *ctx, int status, const char *body, long len, const char *err);
+__attribute__((weak))
+void mv_net_fetch(const char *method, const char *url, const char *headers,
+                  const char *body, long body_len, double timeout_s,
+                  mv_net_done_fn done, void *ctx) {
+    (void)method; (void)url; (void)headers; (void)body; (void)body_len; (void)timeout_s;
+    done(ctx, 0, NULL, 0, "this build has no network request facility");
+}
+
+#define FS_PKG   "com/google/firebase/firestore/"
+#define C_FF     FS_PKG "FirebaseFirestore"
+#define C_SET    FS_PKG "FirebaseFirestoreSettings"
+#define C_SETB   FS_PKG "FirebaseFirestoreSettings$Builder"
+#define C_COLL   FS_PKG "CollectionReference"
+#define C_DOC    FS_PKG "DocumentReference"
+#define C_QUERY  FS_PKG "Query"
+#define C_DSNAP  FS_PKG "DocumentSnapshot"
+#define C_QDSNAP FS_PKG "QueryDocumentSnapshot"
+#define C_QSNAP  FS_PKG "QuerySnapshot"
+#define C_CHANGE FS_PKG "DocumentChange"
+#define C_META   FS_PKG "SnapshotMetadata"
+#define C_EXC    FS_PKG "FirebaseFirestoreException"
+#define C_CODE   FS_PKG "FirebaseFirestoreException$Code"
+#define C_REG    FS_PKG "ListenerRegistration"
+#define C_PATH   FS_PKG "FieldPath"
+#define C_FV     FS_PKG "FieldValue"
+#define C_SETOPT FS_PKG "SetOptions"
+#define C_BATCH  FS_PKG "WriteBatch"
+#define C_BLOB   FS_PKG "Blob"
+#define C_GEO    FS_PKG "GeoPoint"
+#define C_AGGQ   FS_PKG "AggregateQuery"
+#define C_AGGS   FS_PKG "AggregateQuerySnapshot"
+#define C_LBT    FS_PKG "LoadBundleTask"
+#define C_TXO    FS_PKG "TransactionOptions"
+#define C_TXOB   FS_PKG "TransactionOptions$Builder"
+#define C_CPP    FS_PKG "internal/cpp/"
+#define C_TS     "com/google/firebase/Timestamp"
+#define C_TASK   "com/google/android/gms/tasks/Task"
+#define C_CB     "com/google/firebase/app/internal/cpp/JniResultCallback"
+#define C_LIST   "java/util/ArrayList"
+#define C_DOUBLE "java/lang/Double"
+#define SIG_TASK "Lcom/google/android/gms/tasks/Task;"
+
+// Firestore's error codes (FirebaseFirestoreException.Code, = gRPC's).
+enum { E_OK, E_CANCELLED, E_UNKNOWN, E_INVALID_ARGUMENT, E_DEADLINE_EXCEEDED, E_NOT_FOUND,
+       E_ALREADY_EXISTS, E_PERMISSION_DENIED, E_RESOURCE_EXHAUSTED, E_FAILED_PRECONDITION,
+       E_ABORTED, E_OUT_OF_RANGE, E_UNIMPLEMENTED, E_INTERNAL, E_UNAVAILABLE, E_DATA_LOSS,
+       E_UNAUTHENTICATED, E_N };
+
+// ------------------------------------------------------------- small pieces
+typedef struct { char *p; size_t n, cap; } sb;
+static void sb_put(sb *b, const char *s, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        size_t c = b->cap ? b->cap : 256;
+        while (c < b->n + n + 1) c *= 2;
+        b->p = realloc(b->p, c);
+        b->cap = c;
+    }
+    memcpy(b->p + b->n, s, n);
+    b->n += n;
+    b->p[b->n] = 0;
+}
+static void sb_add(sb *b, const char *s) { sb_put(b, s, strlen(s)); }
+static void sb_addf(sb *b, const char *fmt, ...) {
+    char t[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(t, sizeof t, fmt, ap);
+    va_end(ap);
+    if (k < 0) return;
+    if ((size_t)k < sizeof t) { sb_put(b, t, (size_t)k); return; }
+    char *h = malloc((size_t)k + 1);
+    va_start(ap, fmt);
+    vsnprintf(h, (size_t)k + 1, fmt, ap);
+    va_end(ap);
+    sb_put(b, h, (size_t)k);
+    free(h);
+}
+static void sb_jstr(sb *b, const char *s) {
+    sb_put(b, "\"", 1);
+    for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+        if (*p == '"' || *p == '\\') { char e[2] = {'\\', (char)*p}; sb_put(b, e, 2); }
+        else if (*p < 0x20) sb_addf(b, "\\u%04x", *p);
+        else sb_put(b, (const char *)p, 1);
+    }
+    sb_put(b, "\"", 1);
+}
+static char *sb_take(sb *b) {
+    char *r = b->p ? b->p : strdup("");
+    b->p = NULL; b->n = b->cap = 0;
+    return r;
+}
+static char *fs_strdup(const char *s) { return s ? strdup(s) : NULL; }
+static int32_t fs_hash(const char *s) {
+    uint32_t h = 2166136261u;
+    for (; s && *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+    return (int32_t)h;
+}
+
+// ------------------------------------------------------------- JSON reading
+typedef struct jv { char t; char *s; double n; int len; struct jv **v; char **k; } jv;
+// t: 'o' object, 'a' array, 's' string, 'n' number (s holds its text), 'b' bool, 'z' null
+static jv *jnew(char t) { jv *v = calloc(1, sizeof *v); v->t = t; return v; }
+static void jfree(jv *v) {
+    if (!v) return;
+    for (int i = 0; i < v->len; i++) { jfree(v->v[i]); if (v->k) free(v->k[i]); }
+    free(v->v); free(v->k); free(v->s); free(v);
+}
+static void jws(const char **p) { while (**p == ' ' || **p == '\n' || **p == '\r' || **p == '\t') (*p)++; }
+static int jhex4(const char **p, unsigned *out) {
+    unsigned v = 0;
+    for (int i = 0; i < 4; i++) {
+        char c = (*p)[i];
+        if (c >= '0' && c <= '9') v = v * 16 + (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') v = v * 16 + (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v = v * 16 + (unsigned)(c - 'A' + 10);
+        else return 0;
+    }
+    *p += 4; *out = v;
+    return 1;
+}
+static void jutf8(sb *b, unsigned cp) {
+    char t[4]; size_t n;
+    if (cp < 0x80) { t[0] = (char)cp; n = 1; }
+    else if (cp < 0x800) { t[0] = (char)(0xC0 | cp >> 6); t[1] = (char)(0x80 | (cp & 0x3F)); n = 2; }
+    else if (cp < 0x10000) { t[0] = (char)(0xE0 | cp >> 12); t[1] = (char)(0x80 | ((cp >> 6) & 0x3F)); t[2] = (char)(0x80 | (cp & 0x3F)); n = 3; }
+    else { t[0] = (char)(0xF0 | cp >> 18); t[1] = (char)(0x80 | ((cp >> 12) & 0x3F)); t[2] = (char)(0x80 | ((cp >> 6) & 0x3F)); t[3] = (char)(0x80 | (cp & 0x3F)); n = 4; }
+    sb_put(b, t, n);
+}
+static char *jparse_str(const char **p) {
+    if (**p != '"') return NULL;
+    (*p)++;
+    sb b = {0};
+    sb_put(&b, "", 0);
+    while (**p && **p != '"') {
+        char c = *(*p)++;
+        if (c != '\\') { sb_put(&b, &c, 1); continue; }
+        char e = *(*p)++;
+        unsigned cp;
+        switch (e) {
+        case 'n': sb_put(&b, "\n", 1); break;
+        case 't': sb_put(&b, "\t", 1); break;
+        case 'r': sb_put(&b, "\r", 1); break;
+        case 'b': sb_put(&b, "\b", 1); break;
+        case 'f': sb_put(&b, "\f", 1); break;
+        case 'u':
+            if (!jhex4(p, &cp)) { free(b.p); return NULL; }
+            if (cp >= 0xD800 && cp < 0xDC00 && (*p)[0] == '\\' && (*p)[1] == 'u') {
+                const char *q = *p + 2;
+                unsigned lo;
+                if (jhex4(&q, &lo) && lo >= 0xDC00 && lo < 0xE000) {
+                    *p = q;
+                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                }
+            }
+            jutf8(&b, cp);
+            break;
+        case 0: free(b.p); return NULL;
+        default: sb_put(&b, &e, 1); break;
+        }
+    }
+    if (**p != '"') { free(b.p); return NULL; }
+    (*p)++;
+    return sb_take(&b);
+}
+static jv *jparse(const char **p, int depth) {
+    if (depth > 100) return NULL;
+    jws(p);
+    char c = **p;
+    if (c == '{' || c == '[') {
+        char close = c == '{' ? '}' : ']';
+        jv *v = jnew(c == '{' ? 'o' : 'a');
+        (*p)++;
+        jws(p);
+        if (**p == close) { (*p)++; return v; }
+        for (;;) {
+            char *key = NULL;
+            if (c == '{') {
+                jws(p);
+                key = jparse_str(p);
+                jws(p);
+                if (!key || **p != ':') { free(key); jfree(v); return NULL; }
+                (*p)++;
+            }
+            jv *e = jparse(p, depth + 1);
+            if (!e) { free(key); jfree(v); return NULL; }
+            v->v = realloc(v->v, (size_t)(v->len + 1) * sizeof *v->v);
+            v->v[v->len] = e;
+            if (c == '{') {
+                v->k = realloc(v->k, (size_t)(v->len + 1) * sizeof *v->k);
+                v->k[v->len] = key;
+            }
+            v->len++;
+            jws(p);
+            if (**p == ',') { (*p)++; continue; }
+            if (**p == close) { (*p)++; return v; }
+            jfree(v);
+            return NULL;
+        }
+    }
+    if (c == '"') {
+        char *s = jparse_str(p);
+        if (!s) return NULL;
+        jv *v = jnew('s');
+        v->s = s;
+        return v;
+    }
+    if (!strncmp(*p, "true", 4))  { *p += 4; jv *v = jnew('b'); v->n = 1; return v; }
+    if (!strncmp(*p, "false", 5)) { *p += 5; return jnew('b'); }
+    if (!strncmp(*p, "null", 4))  { *p += 4; return jnew('z'); }
+    if (c == '-' || (c >= '0' && c <= '9')) {
+        char *end;
+        double d = strtod(*p, &end);
+        if (end == *p) return NULL;
+        jv *v = jnew('n');
+        v->n = d;
+        v->s = strndup(*p, (size_t)(end - *p));
+        *p = end;
+        return v;
+    }
+    return NULL;
+}
+static jv *jparse_all(const char *text) {
+    if (!text) return NULL;
+    const char *p = text;
+    return jparse(&p, 0);
+}
+static jv *jget(const jv *o, const char *k) {
+    if (!o || o->t != 'o') return NULL;
+    for (int i = 0; i < o->len; i++) if (!strcmp(o->k[i], k)) return o->v[i];
+    return NULL;
+}
+static const char *jgets(const jv *o, const char *k) {
+    jv *v = jget(o, k);
+    return v && v->t == 's' ? v->s : NULL;
+}
+
+// ------------------------------------------------------------- base64, URLs
+static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void sb_b64(sb *b, const unsigned char *d, size_t n) {
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)d[i] << 16 | (i + 1 < n ? (unsigned)d[i + 1] << 8 : 0) | (i + 2 < n ? d[i + 2] : 0);
+        char t[4] = { b64[v >> 18 & 63], b64[v >> 12 & 63], i + 1 < n ? b64[v >> 6 & 63] : '=', i + 2 < n ? b64[v & 63] : '=' };
+        sb_put(b, t, 4);
+    }
+}
+static unsigned char *unb64(const char *s, size_t *n) {
+    size_t len = strlen(s);
+    unsigned char *out = malloc(len / 4 * 3 + 3);
+    unsigned v = 0; int bits = 0; size_t k = 0;
+    for (; *s; s++) {
+        const char *q = strchr(b64, *s);
+        int c = *s == '-' ? 62 : *s == '_' ? 63 : (q && *s ? (int)(q - b64) : -1);
+        if (c < 0) continue;
+        v = v << 6 | (unsigned)c; bits += 6;
+        if (bits >= 8) { bits -= 8; out[k++] = (unsigned char)(v >> bits); }
+    }
+    *n = k;
+    return out;
+}
+static void sb_urlseg(sb *b, const char *s) {   // a path: '/' and ':' kept, the rest percent-encoded
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+            *p == '-' || *p == '.' || *p == '_' || *p == '~' || *p == '/' || *p == ':')
+            sb_put(b, (const char *)p, 1);
+        else
+            sb_addf(b, "%%%02X", *p);
+    }
+}
+
+// ------------------------------------------------------------- timestamps
+static void sb_ts(sb *b, int64_t sec, int32_t nanos) {
+    time_t t = (time_t)sec;
+    struct tm tm;
+    gmtime_r(&t, &tm);
+    sb_addf(b, "\"%04d-%02d-%02dT%02d:%02d:%02d.%09dZ\"", tm.tm_year + 1900, tm.tm_mon + 1,
+            tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, (int)nanos);
+}
+static int ts_parse(const char *s, int64_t *sec, int32_t *nanos) {
+    int Y, M, D, h, m, x;
+    if (!s || sscanf(s, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &x) != 6) return 0;
+    struct tm tm = {0};
+    tm.tm_year = Y - 1900; tm.tm_mon = M - 1; tm.tm_mday = D;
+    tm.tm_hour = h; tm.tm_min = m; tm.tm_sec = x;
+    int64_t t = (int64_t)timegm(&tm);
+    int32_t ns = 0;
+    const char *f = strchr(s, '.');
+    const char *zone = s + strlen(s);
+    if (f) {
+        f++;
+        int digits = 0;
+        for (; *f >= '0' && *f <= '9'; f++)
+            if (digits < 9) { ns = ns * 10 + (*f - '0'); digits++; }
+        for (; digits < 9; digits++) ns *= 10;
+        zone = f;
+    } else {
+        const char *T = strchr(s, 'T');
+        zone = T ? T + 9 : zone;
+    }
+    if (zone && (*zone == '+' || *zone == '-')) {
+        int zh = 0, zm = 0;
+        if (sscanf(zone + 1, "%d:%d", &zh, &zm) >= 1) t -= (*zone == '+' ? 1 : -1) * (zh * 3600 + zm * 60);
+    }
+    *sec = t; *nanos = ns;
+    return 1;
+}
+
+// ------------------------------------------------------------- host objects
+enum { FS_DB = 1, FS_SETTINGS, FS_SETB, FS_COLL, FS_DOC, FS_QUERY, FS_DSNAP, FS_QSNAP,
+       FS_CHANGE, FS_META, FS_TASK, FS_CB, FS_EXC, FS_ENUM, FS_REG, FS_LISTENER, FS_TS,
+       FS_BLOB, FS_GEO, FS_DOUBLE, FS_PATH, FS_FV, FS_SETOPT, FS_PLAIN, FS_RUNNABLE,
+       FS_BATCH, FS_AGGQ, FS_AGGS, FS_TXO };
+
+// A query's shape, copied and extended by every refinement.
+typedef struct {
+    char *coll;        // the collection path, or the collection id of a group query
+    int   group;
+    char *filters;     // ","-joined filter objects
+    int   nfilters;
+    char *order_paths; // "\n"-joined encoded field paths of the orderBy calls
+    char *order_dirs;  // one 'A' or 'D' per order
+    long long limit;
+    int   last;        // limitToLast
+    char *start, *end; // cursor values (the contents of "values":[...]), or NULL
+    int   start_before, end_before;
+    int   name_order;  // a snapshot cursor carries the document name: order by it too
+} fs_query;
+
+typedef struct {
+    char   *db, *project, *appid, *host;
+    int     ssl, persist, net;
+    int64_t cache;
+} fs_dbinfo;
+
+typedef struct mvfs {
+    int    kind;
+    void  *db;            // the FirebaseFirestore it belongs to (pinned for ever)
+    char  *path;          // DOC, COLL, DSNAP: the path below documents/
+    fs_query q;           // QUERY, COLL, AGGQ
+    fs_dbinfo *dbi;       // DB
+    void **held; int nheld;
+    int64_t a, b;         // CB: fn, data. LISTENER: C++ firestore, listener. TS: seconds, nanos.
+                          // ENUM: ordinal. RUNNABLE: data. AGGS: count. EXC: code. TXO: attempts
+    double  x, y;         // DOUBLE: value. GEO: latitude, longitude
+    int     i, j, k;      // per kind (commented where used)
+    char   *s, *s2;       // per kind
+    unsigned char *bytes; size_t nbytes;   // BLOB; PATH: segments, NUL-separated (k of them)
+    void  *o1, *o2, *o3;  // per kind; always also in held
+    int    state;         // TASK: 0 pending, 1 succeeded, 2 failed, 3 cancelled
+    void **cbs; int ncbs; // TASK: JniResultCallbacks waiting (held)
+    void **deps; int ndeps; // TASK: continuation tasks (held)
+} mvfs;
+
+static pthread_mutex_t fs_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  fs_cond = PTHREAD_COND_INITIALIZER;
+
+static void fs_q_free(fs_query *q) {
+    free(q->coll); free(q->filters); free(q->order_paths);
+    free(q->order_dirs); free(q->start); free(q->end);
+}
+static void fs_free(void *p) {   // the payload, at recycle (its holds went at retire)
+    mvfs *f = p;
+    if (!f) return;
+    free(f->path); fs_q_free(&f->q);
+    free(f->held); free(f->cbs); free(f->deps);
+    free(f->s); free(f->s2); free(f->bytes);
+    free(f);
+}
+// java/util/ArrayList: a klj_list (what List.size/get/iterator read) whose items it holds.
+static void fs_list_free(void *p) {
+    klj_list *l = p;
+    if (!l) return;
+    free(l->items);
+    free(l);
+}
+static void fs_box_free(void *p) { free(p); }
+
+// Step 146 calls this as each object is retired (g_lock held): what a host
+// object of this file held is let go.
+void mv_fs_retire_locked(klj_object *o) {
+    if (!o || !o->data) return;
+    if (o->destroy == fs_free) {
+        mvfs *f = o->data;
+        for (int i = 0; i < f->nheld; i++) klj_release_locked(f->held[i]);
+        for (int i = 0; i < f->ncbs; i++) klj_release_locked(f->cbs[i]);
+        for (int i = 0; i < f->ndeps; i++) klj_release_locked(f->deps[i]);
+        f->nheld = f->ncbs = f->ndeps = 0;
+    } else if (o->destroy == fs_list_free) {
+        // Retired once (its magic is gone), so released once. The items stay
+        // listed: an iterator taken from a list the guest has already deleted
+        // (the SDK iterates map.keySet().iterator() from a temporary) still
+        // walks it, and its elements are still held by whoever else holds them.
+        klj_list *l = o->data;
+        for (int i = 0; i < l->count; i++) klj_release_locked(l->items[i]);
+    }
+}
+
+static void *fs_new(const char *cls, int kind, mvfs **out) {
+    mvfs *f = calloc(1, sizeof *f);
+    f->kind = kind;
+    void *obj = kl_jni_new_object(cls);
+    klj_object *o = klj_as_object(obj);
+    o->data = f;
+    o->destroy = fs_free;
+    if (out) *out = f;
+    return obj;
+}
+static mvfs *fs_of(void *obj, int kind) {
+    klj_object *o = klj_as_object(obj);
+    if (!o || o->destroy != fs_free || !o->data) return NULL;
+    mvfs *f = o->data;
+    return !kind || f->kind == kind ? f : NULL;
+}
+static void fs_hold_in(mvfs *f, void *obj) {   // f keeps obj
+    if (!obj) return;
+    klj_hold(obj);
+    f->held = realloc(f->held, (size_t)(f->nheld + 1) * sizeof *f->held);
+    f->held[f->nheld++] = obj;
+}
+static int fs_is_class_obj(void *self) {
+    klj_object *o = klj_as_object(self);
+    return o && strcmp(o->cls, KLJ_CLASS_CLASS) == 0;
+}
+static const char *fs_cls(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    return o ? o->cls : "";
+}
+static klj_array *fs_arr(void *obj, char kind) {   // a Java array of that kind, or NULL
+    klj_object *o = klj_as_object(obj);
+    klj_array *arr = o && o->cls[0] == '[' ? o->data : NULL;
+    return arr && arr->kind == kind ? arr : NULL;
+}
+
+// --- lists
+static void *fs_list_new(void) {
+    klj_list *l = calloc(1, sizeof *l);
+    void *obj = kl_jni_new_object(C_LIST);
+    klj_object *o = klj_as_object(obj);
+    o->data = l;
+    o->destroy = fs_list_free;
+    return obj;
+}
+static klj_list *fs_list_of(void *obj) {   // ours, or the runtime's fixed java/util/List
+    klj_object *o = klj_as_object(obj);
+    if (!o || !o->data) return NULL;
+    if (o->destroy == fs_list_free) return o->data;
+    if (!strcmp(o->cls, "java/util/List")) return o->data;
+    return NULL;
+}
+static void fs_list_add(void *list, void *item) {
+    klj_object *o = klj_as_object(list);
+    if (!o || o->destroy != fs_list_free) return;
+    klj_list *l = o->data;
+    if (item) klj_hold(item);
+    l->items = realloc(l->items, (size_t)(l->count + 1) * sizeof *l->items);
+    l->items[l->count++] = item;
+}
+
+// --- boxes, in the runtime's own shape (klj_pref), so its accessors unbox them
+static void *fs_box(const char *cls, char kind, int64_t v) {
+    klj_pref *e = calloc(1, sizeof *e);
+    e->kind = kind;
+    e->ival = v;
+    void *obj = kl_jni_new_object(cls);
+    klj_object *o = klj_as_object(obj);
+    o->data = e;
+    o->destroy = fs_box_free;
+    return obj;
+}
+static void *fs_double(double d) {
+    mvfs *f;
+    void *obj = fs_new(C_DOUBLE, FS_DOUBLE, &f);
+    f->x = d;
+    return obj;
+}
+
+// --- enums: one pinned object per constant
+static const struct { const char *cls; const char *names[18]; } fs_enums[] = {
+    {FS_PKG "Source", {"DEFAULT", "SERVER", "CACHE"}},
+    {FS_PKG "DocumentSnapshot$ServerTimestampBehavior", {"NONE", "ESTIMATE", "PREVIOUS"}},
+    {FS_PKG "MetadataChanges", {"EXCLUDE", "INCLUDE"}},
+    {FS_PKG "Query$Direction", {"ASCENDING", "DESCENDING"}},
+    {FS_PKG "AggregateSource", {"SERVER"}},
+    {FS_PKG "DocumentChange$Type", {"ADDED", "MODIFIED", "REMOVED"}},
+    {FS_PKG "LoadBundleTaskProgress$TaskState", {"ERROR", "RUNNING", "SUCCESS"}},
+    {C_CODE, {"OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT", "DEADLINE_EXCEEDED", "NOT_FOUND",
+              "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED", "FAILED_PRECONDITION",
+              "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE", "DATA_LOSS",
+              "UNAUTHENTICATED"}},
+};
+enum { EN_SOURCE, EN_STB, EN_MC, EN_DIR, EN_AGGSRC, EN_CHANGE, EN_LBTS, EN_CODE, EN_N };
+static void *fs_enum_objs[EN_N][18];
+static void *fs_enum(int e, int ord) {
+    if (e < 0 || e >= EN_N || ord < 0 || ord >= 18 || !fs_enums[e].names[ord]) return NULL;
+    pthread_mutex_lock(&fs_lock);
+    void *obj = fs_enum_objs[e][ord];
+    if (!obj) {
+        mvfs *f;
+        obj = fs_new(fs_enums[e].cls, FS_ENUM, &f);
+        f->a = ord;
+        f->i = e;
+        kl_jni_pin_object(obj);
+        fs_enum_objs[e][ord] = obj;
+    }
+    pthread_mutex_unlock(&fs_lock);
+    return obj;
+}
+static int fs_enum_ord(void *obj, int e) {
+    mvfs *f = fs_of(obj, FS_ENUM);
+    return f && f->i == e ? (int)f->a : -1;
+}
+
+static void *fs_setopt_overwrite(void);
+// Static object fields of Firestore's classes (the enum constants,
+// SetOptions.OVERWRITE), answered from kl_jni.c's field lookup (step 146).
+int mv_fs_static_field(const char *cls, const char *name, klj_val *out) {
+    if (!cls || strncmp(cls, FS_PKG, sizeof FS_PKG - 1) != 0) return 0;
+    if (!strcmp(cls, C_SETOPT) && !strcmp(name, "OVERWRITE")) { out->l = fs_setopt_overwrite(); return 1; }
+    for (int e = 0; e < EN_N; e++) {
+        if (strcmp(cls, fs_enums[e].cls)) continue;
+        for (int i = 0; i < 18 && fs_enums[e].names[i]; i++)
+            if (!strcmp(name, fs_enums[e].names[i])) { out->l = fs_enum(e, i); return 1; }
+    }
+    return 0;
+}
+
+// --- exceptions
+static void *fs_exc(int code, const char *msg) {
+    mvfs *f;
+    void *obj = fs_new(C_EXC, FS_EXC, &f);
+    f->a = code;
+    f->s = fs_strdup(msg);
+    return obj;
+}
+// Throwable.getMessage on one of these (step 146 asks before its default).
+void *mv_fs_message(void *obj) {
+    mvfs *f = fs_of(obj, FS_EXC);
+    return f ? kl_jni_new_string(f->s ? f->s : "") : NULL;
+}
+
+// --- snapshot metadata: never from a cache, never with pending writes
+static void *fs_meta(void) {
+    static void *meta;
+    pthread_mutex_lock(&fs_lock);
+    if (!meta) { meta = fs_new(C_META, FS_META, NULL); kl_jni_pin_object(meta); }
+    pthread_mutex_unlock(&fs_lock);
+    return meta;
+}
+
+// ------------------------------------------------------------- paths
+static int fs_segments(const char *path) {   // -1 when not a valid path
+    if (!path || !*path) return -1;
+    int n = 1;
+    for (const char *p = path; *p; p++)
+        if (*p == '/') { if (p[1] == '/' || p[1] == 0 || p == path) return -1; n++; }
+    return n;
+}
+static char *fs_join(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    char *r = malloc(la + lb + 2);
+    memcpy(r, a, la); r[la] = '/'; memcpy(r + la + 1, b, lb + 1);
+    return r;
+}
+static const char *fs_last(const char *path) {
+    const char *s = strrchr(path, '/');
+    return s ? s + 1 : path;
+}
+static char *fs_parent(const char *path) {   // NULL at the root
+    const char *s = strrchr(path, '/');
+    return s ? strndup(path, (size_t)(s - path)) : NULL;
+}
+static fs_dbinfo *fs_dbi(void *db) {
+    mvfs *f = fs_of(db, FS_DB);
+    return f ? f->dbi : NULL;
+}
+static void sb_docname(sb *b, void *db, const char *path) {
+    fs_dbinfo *d = fs_dbi(db);
+    sb_add(b, "projects/");
+    sb_add(b, d && d->project ? d->project : "");
+    sb_add(b, "/databases/");
+    sb_add(b, d ? d->db : "(default)");
+    sb_add(b, "/documents");
+    if (path && *path) { sb_add(b, "/"); sb_add(b, path); }
+}
+static void *fs_ref(void *db, const char *path, int doc) {
+    mvfs *f;
+    void *obj = fs_new(doc ? C_DOC : C_COLL, doc ? FS_DOC : FS_COLL, &f);
+    f->db = db;
+    f->path = strdup(path);
+    if (!doc) f->q.coll = strdup(path);
+    return obj;
+}
+static void *fs_bad_path(const char *what, const char *path) {
+    KLJ_LOG("Firestore: invalid %s path \"%s\" -> IllegalArgumentException", what, path ? path : "(null)");
+    kl_jni_throw("java/lang/IllegalArgumentException");
+    return NULL;
+}
+
+// Field paths: segments, and their encoded form (`quoted` where not a plain identifier).
+static void sb_fieldseg(sb *b, const char *s) {
+    int plain = *s && !(*s >= '0' && *s <= '9');
+    for (const char *p = s; *p && plain; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_')) plain = 0;
+    if (plain) { sb_add(b, s); return; }
+    sb_put(b, "`", 1);
+    for (const char *p = s; *p; p++) {
+        if (*p == '`' || *p == '\\') sb_put(b, "\\", 1);
+        sb_put(b, p, 1);
+    }
+    sb_put(b, "`", 1);
+}
+static char *fs_encode_segs(char **segs, int n) {
+    sb b = {0};
+    sb_put(&b, "", 0);
+    for (int i = 0; i < n; i++) { if (i) sb_put(&b, ".", 1); sb_fieldseg(&b, segs[i]); }
+    return sb_take(&b);
+}
+static void *fs_path_new(char **segs, int n, int docid) {
+    mvfs *f;
+    void *obj = fs_new(C_PATH, FS_PATH, &f);
+    f->i = docid;
+    f->k = n;
+    size_t len = 0;
+    for (int i = 0; i < n; i++) len += strlen(segs[i]) + 1;
+    f->bytes = malloc(len ? len : 1);
+    f->nbytes = len;
+    char *w = (char *)f->bytes;
+    for (int i = 0; i < n; i++) { size_t l = strlen(segs[i]) + 1; memcpy(w, segs[i], l); w += l; }
+    f->s = docid ? strdup("__name__") : fs_encode_segs(segs, n);
+    return obj;
+}
+static char **fs_path_segs(mvfs *f) {   // array of k pointers into f->bytes (free the array only)
+    char **v = calloc((size_t)f->k + 1, sizeof *v);
+    char *p = (char *)f->bytes;
+    for (int i = 0; i < f->k; i++) { v[i] = p; p += strlen(p) + 1; }
+    return v;
+}
+
+// ------------------------------------------------------------- Java -> Firestore JSON
+static int fs_val_json(sb *b, void *obj, void *db);
+static int fs_list_json(sb *b, void *obj, void *db) {   // "values":[...] contents
+    klj_list *l = fs_list_of(obj);
+    klj_array *arr = l ? NULL : fs_arr(obj, 'L');
+    int n = l ? l->count : (arr ? arr->len : -1);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        if (i) sb_put(b, ",", 1);
+        void *e = l ? l->items[i] : ((void **)arr->data)[i];
+        if (fs_val_json(b, e, db) < 0) return -1;
+    }
+    return 0;
+}
+static int fs_val_json(sb *b, void *obj, void *db) {
+    if (!obj) { sb_add(b, "{\"nullValue\":null}"); return 0; }
+    klj_object *o = klj_as_object(obj);
+    if (!o) return -1;
+    const char *cls = o->cls;
+    if (!strcmp(cls, KLJ_CLASS_STRING)) { sb_add(b, "{\"stringValue\":"); sb_jstr(b, o->data); sb_add(b, "}"); return 0; }
+    if (!strcmp(cls, "java/lang/Boolean")) {
+        klj_pref *e = o->data;
+        sb_add(b, e && e->ival ? "{\"booleanValue\":true}" : "{\"booleanValue\":false}");
+        return 0;
+    }
+    if (!strcmp(cls, "java/lang/Long") || !strcmp(cls, "java/lang/Integer") ||
+        !strcmp(cls, "java/lang/Short") || !strcmp(cls, "java/lang/Byte")) {
+        klj_pref *e = o->data;
+        sb_addf(b, "{\"integerValue\":\"%lld\"}", (long long)(e ? e->ival : 0));
+        return 0;
+    }
+    mvfs *f = fs_of(obj, 0);
+    double d;
+    if (!strcmp(cls, "java/lang/Float")) { klj_pref *e = o->data; d = e ? e->fval : 0; goto dbl; }
+    if (f && f->kind == FS_DOUBLE) { d = f->x; goto dbl; }
+    if (f && f->kind == FS_TS) { sb_add(b, "{\"timestampValue\":"); sb_ts(b, f->a, (int32_t)f->b); sb_add(b, "}"); return 0; }
+    if (f && f->kind == FS_BLOB) { sb_add(b, "{\"bytesValue\":\""); sb_b64(b, f->bytes, f->nbytes); sb_add(b, "\"}"); return 0; }
+    if (f && f->kind == FS_GEO) { sb_addf(b, "{\"geoPointValue\":{\"latitude\":%.17g,\"longitude\":%.17g}}", f->x, f->y); return 0; }
+    if (f && f->kind == FS_DOC) {
+        sb_add(b, "{\"referenceValue\":\"");
+        sb_docname(b, f->db ? f->db : db, f->path);
+        sb_add(b, "\"}");
+        return 0;
+    }
+    if (f && f->kind == FS_FV) return -2;   // a sentinel: only a write places these
+    if (mv_is_hashmap(obj)) {
+        sb_add(b, "{\"mapValue\":{\"fields\":{");
+        void *k, *v;
+        for (unsigned i = 0; mv_hashmap_at(obj, i, &k, &v) > 0; i++) {
+            const char *ks = klj_str(k);
+            if (!ks) return -1;
+            if (i) sb_put(b, ",", 1);
+            sb_jstr(b, ks);
+            sb_put(b, ":", 1);
+            if (fs_val_json(b, v, db) < 0) return -1;
+        }
+        sb_add(b, "}}}");
+        return 0;
+    }
+    if (fs_list_of(obj) || fs_arr(obj, 'L')) {
+        sb_add(b, "{\"arrayValue\":{\"values\":[");
+        if (fs_list_json(b, obj, db) < 0) return -1;
+        sb_add(b, "]}}");
+        return 0;
+    }
+    KLJ_LOG("Firestore: a %s is not a value Firestore stores", cls);
+    return -1;
+dbl:
+    if (isnan(d)) sb_add(b, "{\"doubleValue\":\"NaN\"}");
+    else if (isinf(d)) sb_add(b, d > 0 ? "{\"doubleValue\":\"Infinity\"}" : "{\"doubleValue\":\"-Infinity\"}");
+    else sb_addf(b, "{\"doubleValue\":%.17g}", d);
+    return 0;
+}
+
+// ------------------------------------------------------------- Firestore JSON -> Java
+static void *fs_from_fields(void *db, const jv *fields);
+static void *fs_from_value(void *db, const jv *v) {
+    if (!v || v->t != 'o' || v->len < 1) return NULL;
+    const char *k = v->k[0];
+    const jv *x = v->v[0];
+    if (!strcmp(k, "nullValue")) return NULL;
+    if (!strcmp(k, "booleanValue")) return fs_box("java/lang/Boolean", 'Z', x->t == 'b' && x->n != 0);
+    if (!strcmp(k, "integerValue"))
+        return fs_box("java/lang/Long", 'J', x->s ? strtoll(x->s, NULL, 10) : (int64_t)x->n);
+    if (!strcmp(k, "doubleValue")) {
+        double d = x->n;
+        if (x->t == 's') d = !strcmp(x->s, "NaN") ? NAN : !strcmp(x->s, "Infinity") ? INFINITY
+                           : !strcmp(x->s, "-Infinity") ? -INFINITY : strtod(x->s, NULL);
+        return fs_double(d);
+    }
+    if (!strcmp(k, "timestampValue")) {
+        int64_t sec = 0; int32_t ns = 0;
+        ts_parse(x->s, &sec, &ns);
+        mvfs *f;
+        void *obj = fs_new(C_TS, FS_TS, &f);
+        f->a = sec; f->b = ns;
+        return obj;
+    }
+    if (!strcmp(k, "stringValue")) return kl_jni_new_string(x->s ? x->s : "");
+    if (!strcmp(k, "bytesValue")) {
+        mvfs *f;
+        void *obj = fs_new(C_BLOB, FS_BLOB, &f);
+        f->bytes = unb64(x->s ? x->s : "", &f->nbytes);
+        return obj;
+    }
+    if (!strcmp(k, "referenceValue")) {
+        const char *p = x->s ? strstr(x->s, "/documents/") : NULL;
+        return fs_ref(db, p ? p + 11 : "", 1);
+    }
+    if (!strcmp(k, "geoPointValue")) {
+        mvfs *f;
+        void *obj = fs_new(C_GEO, FS_GEO, &f);
+        jv *la = jget(x, "latitude"), *lo = jget(x, "longitude");
+        f->x = la ? la->n : 0; f->y = lo ? lo->n : 0;
+        return obj;
+    }
+    if (!strcmp(k, "arrayValue")) {
+        void *list = fs_list_new();
+        jv *vals = jget(x, "values");
+        for (int i = 0; vals && vals->t == 'a' && i < vals->len; i++) {
+            void *e = fs_from_value(db, vals->v[i]);
+            fs_list_add(list, e);
+        }
+        return list;
+    }
+    if (!strcmp(k, "mapValue")) return fs_from_fields(db, jget(x, "fields"));
+    return NULL;
+}
+static void *fs_from_fields(void *db, const jv *fields) {
+    void *map = mv_hashmap_new();
+    for (int i = 0; fields && fields->t == 'o' && i < fields->len; i++)
+        mv_hashmap_put(map, kl_jni_new_string(fields->k[i]), fs_from_value(db, fields->v[i]));
+    return map;
+}
+
+// ------------------------------------------------------------- snapshots
+static void *fs_snapshot(void *db, const char *path, const jv *doc, int from_query) {
+    mvfs *f;
+    void *obj = fs_new(from_query ? C_QDSNAP : C_DSNAP, FS_DSNAP, &f);
+    f->db = db;
+    f->path = strdup(path);
+    f->i = doc != NULL;   // exists
+    if (doc) {
+        void *data = fs_from_fields(db, jget(doc, "fields"));
+        fs_hold_in(f, data);
+        f->o1 = data;
+    }
+    return obj;
+}
+static const char *fs_rel_name(const char *name) {
+    const char *p = name ? strstr(name, "/documents/") : NULL;
+    return p ? p + 11 : "";
+}
+// A field of a snapshot's data by path segments (found: 0 none, 1 yes).
+static void *fs_walk(mvfs *s, char **segs, int n, int *found) {
+    *found = 0;
+    void *cur = s->o1;
+    for (int i = 0; i < n; i++) {
+        if (!cur || !mv_is_hashmap(cur)) return NULL;
+        int f = 0;
+        cur = mv_hashmap_get_utf(cur, segs[i], &f);
+        if (!f) return NULL;
+    }
+    *found = 1;
+    return cur;
+}
+
+// ------------------------------------------------------------- tasks
+// A task holds itself until it has told a callback its outcome (j: that hold is
+// still on): the SDK registers its JniResultCallback only after the call that
+// made the task returned, and a task that failed at once must still be there.
+static void *fs_task_new(const char *cls) {
+    mvfs *f;
+    void *t = fs_new(cls ? cls : C_TASK, FS_TASK, &f);
+    klj_hold(t);
+    f->j = 1;
+    return t;
+}
+static void fs_task_deliver(void *task);
+static void fs_continue(void *dep, void *src);
+
+static void fs_task_finish(void *task, int state, void *result, void *exc, const char *msg) {
+    mvfs *t = fs_of(task, FS_TASK);
+    if (!t) return;
+    pthread_mutex_lock(&fs_lock);
+    if (t->state) { pthread_mutex_unlock(&fs_lock); return; }
+    t->state = state;
+    if (result) { fs_hold_in(t, result); t->o1 = result; }
+    if (exc) { fs_hold_in(t, exc); t->o2 = exc; }
+    t->s = fs_strdup(msg);
+    void **deps = t->deps; int ndeps = t->ndeps;
+    t->deps = NULL; t->ndeps = 0;
+    pthread_cond_broadcast(&fs_cond);
+    pthread_mutex_unlock(&fs_lock);
+    for (int i = 0; i < ndeps; i++) { fs_continue(deps[i], task); klj_release(deps[i]); }
+    free(deps);
+    klj_hold(task);
+    kl_mv_ui_later(fs_task_deliver, task);
+}
+static void fs_task_fail(void *task, int code, const char *msg) {
+    fs_task_finish(task, 2, NULL, fs_exc(code, msg), msg);
+}
+static void *fs_failed_task(int code, const char *msg) {
+    void *t = fs_task_new(NULL);
+    KLJ_LOG("Firestore: %s", msg);
+    fs_task_fail(t, code, msg);
+    return t;
+}
+static void *fs_done_task(void *result) {
+    void *t = fs_task_new(NULL);
+    fs_task_finish(t, 1, result, NULL, NULL);
+    return t;
+}
+
+typedef void (*fs_on_result_fn)(void *env, void *thiz, void *result, uint8_t success,
+                                uint8_t cancelled, void *msg, int64_t fn, int64_t data);
+static void fs_cb_call(void *cb, int state, void *result, void *exc, const char *msg) {
+    mvfs *c = fs_of(cb, FS_CB);
+    if (!c) return;
+    pthread_mutex_lock(&fs_lock);
+    int was = c->i;
+    c->i = 1;   // delivered (once, whichever of completion and cancel() comes first)
+    pthread_mutex_unlock(&fs_lock);
+    if (was) return;
+    fs_on_result_fn fn = (fs_on_result_fn)kl_jni_native(C_CB, "nativeOnResult",
+                                                        "(Ljava/lang/Object;ZZLjava/lang/String;JJ)V");
+    if (!fn) { KLJ_LOG("Firestore: JniResultCallback.nativeOnResult is not registered"); return; }
+    void *env = kl_jni_env();
+    void *jmsg = state == 2 ? kl_jni_new_string(msg ? msg : "") : state == 3 ? kl_jni_new_string("cancelled") : NULL;
+    fn(env, cb, state == 1 ? result : state == 2 ? exc : NULL, state == 1, state == 3, jmsg, c->a, c->b);
+    if (jmsg) klj_release(jmsg);
+}
+// On the UI drain: every callback registered so far hears the outcome.
+static void fs_task_deliver(void *task) {
+    mvfs *t = fs_of(task, FS_TASK);
+    if (t) {
+        pthread_mutex_lock(&fs_lock);
+        void **cbs = t->cbs; int n = t->ncbs;
+        t->cbs = NULL; t->ncbs = 0;
+        int state = t->state; void *res = t->o1, *exc = t->o2;
+        char *msg = fs_strdup(t->s);
+        pthread_mutex_unlock(&fs_lock);
+        for (int i = 0; i < n; i++) { fs_cb_call(cbs[i], state, res, exc, msg); klj_release(cbs[i]); }
+        free(cbs);
+        free(msg);
+        pthread_mutex_lock(&fs_lock);
+        int self_hold = n > 0 && t->j;
+        if (self_hold) t->j = 0;
+        pthread_mutex_unlock(&fs_lock);
+        if (self_hold) klj_release(task);
+    }
+    klj_release(task);
+}
+// failTaskWhenResultIsNull's continuation: `dep` takes `src`'s outcome.
+static void fs_continue(void *dep, void *src) {
+    mvfs *s = fs_of(src, FS_TASK), *d = fs_of(dep, FS_TASK);
+    if (!s || !d) return;
+    if (s->state == 1 && s->o1) fs_task_finish(dep, 1, s->o1, NULL, NULL);
+    else if (s->state == 1) fs_task_fail(dep, E_NOT_FOUND, d->s2 ? d->s2 : "not found");
+    else if (s->state == 2) fs_task_finish(dep, 2, NULL, s->o2, s->s);
+    else fs_task_finish(dep, 3, NULL, NULL, NULL);
+}
+
+// ------------------------------------------------------------- requests
+enum { OP_GET_DOC, OP_QUERY, OP_COMMIT, OP_COUNT, OP_LISTEN_DOC, OP_LISTEN_QUERY };
+typedef struct {
+    int   what;
+    void *db, *task, *reg, *subject, *result;   // held while the request runs
+    char *path;        // OP_GET_DOC, OP_LISTEN_DOC: the document
+    int   last;        // limitToLast: results come back reversed
+    char *touched;     // OP_COMMIT: "\n"-joined document paths written
+} fs_op;
+
+static void fs_op_free(fs_op *op) {
+    if (op->task) klj_release(op->task);
+    if (op->reg) klj_release(op->reg);
+    if (op->subject) klj_release(op->subject);
+    if (op->result) klj_release(op->result);
+    free(op->path);
+    free(op->touched);
+    free(op);
+}
+static fs_op *fs_op_new(int what, void *db, void *task, void *subject) {
+    fs_op *op = calloc(1, sizeof *op);
+    op->what = what;
+    op->db = db;
+    if (task) { op->task = task; klj_hold(task); }
+    if (subject) { op->subject = subject; klj_hold(subject); }
+    return op;
+}
+
+static void fs_net_done(void *ctx, int status, const char *body, long len, const char *err);
+static void fs_op_error(fs_op *op, int code, const char *msg);
+
+static const char *fs_offline_msg(int what) {
+    return what == OP_COMMIT ? "Failed to commit the write because the client is offline."
+         : what == OP_GET_DOC || what == OP_LISTEN_DOC ? "Failed to get document because the client is offline."
+         : "Failed to get documents because the client is offline.";
+}
+// POST <base><suffix> with `body`. The op is finished (and freed) by fs_net_done.
+static void fs_send(fs_op *op, const char *suffix, const char *body) {
+    fs_dbinfo *d = fs_dbi(op->db);
+    if (!d || !d->project || !*d->project) {
+        fs_op_error(op, E_FAILED_PRECONDITION, "No Firebase project id: the title's FirebaseOptions carry none.");
+        return;
+    }
+    if (!d->net) { fs_op_error(op, E_UNAVAILABLE, fs_offline_msg(op->what)); return; }
+    sb url = {0};
+    sb_add(&url, d->ssl ? "https://" : "http://");
+    sb_add(&url, d->host);
+    sb_add(&url, "/v1/projects/");
+    sb_urlseg(&url, d->project);
+    sb_add(&url, "/databases/");
+    sb_add(&url, d->db);
+    sb_add(&url, "/documents");
+    sb_urlseg(&url, suffix);
+    sb hdr = {0};
+    sb_add(&hdr, "Content-Type: application/json\n");
+    sb_addf(&hdr, "google-cloud-resource-prefix: projects/%s/databases/%s\n", d->project, d->db);
+    if (d->appid) sb_addf(&hdr, "x-firebase-gmpid: %s\n", d->appid);
+    mv_net_fetch("POST", url.p, hdr.p, body, (long)strlen(body), 30.0, fs_net_done, op);
+    free(url.p);
+    free(hdr.p);
+}
+
+// ---- listeners
+static void **fs_regs; static int fs_nregs;   // active registrations (held)
+typedef struct { void *reg, *value, *exc; } fs_event;
+typedef void (*fs_on_event_fn)(void *env, void *clazz, int64_t fs, int64_t listener, void *value, void *exc);
+static void fs_event_deliver(void *p) {
+    fs_event *ev = p;
+    mvfs *r = fs_of(ev->reg, FS_REG);
+    mvfs *l = r ? fs_of(r->o1, FS_LISTENER) : NULL;
+    if (r && l && !r->k && l->a && l->b) {
+        const char *cls = fs_cls(r->o1);
+        fs_on_event_fn fn = (fs_on_event_fn)kl_jni_native(cls, "nativeOnEvent",
+            "(JJLjava/lang/Object;Lcom/google/firebase/firestore/FirebaseFirestoreException;)V");
+        if (fn) fn(kl_jni_env(), kl_jni_class(cls), l->a, l->b, ev->value, ev->exc);
+        else KLJ_LOG("Firestore: %s.nativeOnEvent is not registered", cls);
+    }
+    if (ev->value) klj_release(ev->value);
+    if (ev->exc) klj_release(ev->exc);
+    klj_release(ev->reg);
+    free(ev);
+}
+static void fs_event_post(void *reg, void *value, void *exc) {
+    fs_event *ev = calloc(1, sizeof *ev);
+    ev->reg = reg; klj_hold(reg);
+    if (value) { ev->value = value; klj_hold(value); }
+    if (exc) { ev->exc = exc; klj_hold(exc); }
+    kl_mv_ui_later(fs_event_deliver, ev);
+}
+
+static void fs_op_error(fs_op *op, int code, const char *msg) {
+    KLJ_LOG("Firestore: request failed: %s (code %d)", msg, code);
+    void *exc = fs_exc(code, msg);
+    if (op->task) fs_task_finish(op->task, 2, NULL, exc, msg);
+    else if (op->reg) fs_event_post(op->reg, NULL, exc);
+    else klj_release(exc);
+    fs_op_free(op);
+}
+
+static void fs_query_send(fs_op *op, fs_query *q, int count);
+static void fs_doc_send(fs_op *op);
+
+// Re-read what a registration watches.
+static void fs_reg_fetch(void *reg) {
+    mvfs *r = fs_of(reg, FS_REG);
+    if (!r || r->k) return;
+    mvfs *s = fs_of(r->o2, 0);
+    if (!s) return;
+    fs_op *op = fs_op_new(r->i ? OP_LISTEN_QUERY : OP_LISTEN_DOC, s->db, NULL, r->o2);
+    op->reg = reg; klj_hold(reg);
+    if (r->i) fs_query_send(op, &s->q, 0);
+    else { op->path = strdup(s->path); fs_doc_send(op); }
+}
+// After this client's commit: the listeners on what it wrote hear again.
+static void fs_refresh_after(const char *touched) {
+    pthread_mutex_lock(&fs_lock);
+    int n = fs_nregs;
+    void **regs = malloc((size_t)(n ? n : 1) * sizeof *regs);
+    for (int i = 0; i < n; i++) { regs[i] = fs_regs[i]; klj_hold(regs[i]); }
+    pthread_mutex_unlock(&fs_lock);
+    for (int i = 0; i < n; i++) {
+        mvfs *r = fs_of(regs[i], FS_REG);
+        mvfs *s = r ? fs_of(r->o2, 0) : NULL;
+        int hit = 0;
+        for (const char *t = touched; s && t && *t && !hit; ) {
+            const char *e = strchr(t, '\n');
+            size_t l = e ? (size_t)(e - t) : strlen(t);
+            char *doc = strndup(t, l);
+            if (!r->i) hit = s->path && !strcmp(doc, s->path);
+            else {
+                char *parent = fs_parent(doc);
+                if (s->q.group) hit = parent && !strcmp(fs_last(parent), s->q.coll);
+                else hit = parent && s->q.coll && !strcmp(parent, s->q.coll);
+                free(parent);
+            }
+            free(doc);
+            t = e ? e + 1 : NULL;
+        }
+        if (hit) fs_reg_fetch(regs[i]);
+        klj_release(regs[i]);
+    }
+    free(regs);
+}
+
+// ---- building requests
+static void fs_doc_send(fs_op *op) {
+    sb b = {0};
+    sb_add(&b, "{\"documents\":[\"");
+    sb_docname(&b, op->db, op->path);
+    sb_add(&b, "\"]}");
+    fs_send(op, ":batchGet", b.p);
+    free(b.p);
+}
+static void sb_order(sb *b, const char *path, size_t len, int desc) {
+    char *p = strndup(path, len);
+    sb_add(b, "{\"field\":{\"fieldPath\":");
+    sb_jstr(b, p);
+    sb_add(b, desc ? "},\"direction\":\"DESCENDING\"}" : "},\"direction\":\"ASCENDING\"}");
+    free(p);
+}
+static void sb_cursor(sb *b, const char *key, const char *values, int before) {
+    sb_add(b, key);
+    sb_add(b, "{\"values\":[");
+    sb_add(b, values);
+    sb_add(b, before ? "],\"before\":true}" : "],\"before\":false}");
+}
+// The structuredQuery object for q. limitToLast runs turned around — every
+// order reversed, the cursors swapped (an inclusive end becomes an inclusive
+// start, so "before" flips) — and its results are reversed back on arrival.
+static void sb_query(sb *b, fs_query *q) {
+    int last = q->last && q->limit > 0;
+    sb_add(b, "{\"from\":[{\"collectionId\":");
+    sb_jstr(b, q->group ? q->coll : fs_last(q->coll));
+    sb_add(b, q->group ? ",\"allDescendants\":true}]" : "}]");
+    if (q->filters) {
+        if (q->nfilters > 1) {
+            sb_add(b, ",\"where\":{\"compositeFilter\":{\"op\":\"AND\",\"filters\":[");
+            sb_add(b, q->filters);
+            sb_add(b, "]}}");
+        } else {
+            sb_add(b, ",\"where\":");
+            sb_add(b, q->filters);
+        }
+    }
+    int norders = q->order_dirs ? (int)strlen(q->order_dirs) : 0;
+    if (norders || q->name_order || last) {
+        sb_add(b, ",\"orderBy\":[");
+        const char *p = q->order_paths ? q->order_paths : "";
+        int has_name = 0;
+        for (int i = 0; i < norders; i++) {
+            const char *e = strchr(p, '\n');
+            size_t l = e ? (size_t)(e - p) : strlen(p);
+            if (l == 8 && !strncmp(p, "__name__", 8)) has_name = 1;
+            if (i) sb_put(b, ",", 1);
+            sb_order(b, p, l, (q->order_dirs[i] == 'D') != last);
+            p = e ? e + 1 : p + l;
+        }
+        if (!has_name && (q->name_order || last)) {
+            if (norders) sb_put(b, ",", 1);
+            sb_order(b, "__name__", 8, (norders && q->order_dirs[norders - 1] == 'D') != last);
+        }
+        sb_add(b, "]");
+    }
+    if (!last) {
+        if (q->start) sb_cursor(b, ",\"startAt\":", q->start, q->start_before);
+        if (q->end) sb_cursor(b, ",\"endAt\":", q->end, q->end_before);
+    } else {
+        if (q->end) sb_cursor(b, ",\"startAt\":", q->end, !q->end_before);
+        if (q->start) sb_cursor(b, ",\"endAt\":", q->start, !q->start_before);
+    }
+    if (q->limit > 0) sb_addf(b, ",\"limit\":%lld", q->limit);
+    sb_add(b, "}");
+}
+static void fs_query_send(fs_op *op, fs_query *q, int count) {
+    op->last = q->last && q->limit > 0;
+    sb b = {0};
+    if (count) sb_add(&b, "{\"structuredAggregationQuery\":{\"structuredQuery\":");
+    else sb_add(&b, "{\"structuredQuery\":");
+    sb_query(&b, q);
+    if (count) sb_add(&b, ",\"aggregations\":[{\"alias\":\"count\",\"count\":{}}]}}");
+    else sb_add(&b, "}");
+    sb suffix = {0};
+    sb_put(&suffix, "", 0);
+    char *parent = q->group ? NULL : fs_parent(q->coll);
+    if (parent) { sb_add(&suffix, "/"); sb_add(&suffix, parent); free(parent); }
+    sb_add(&suffix, count ? ":runAggregationQuery" : ":runQuery");
+    fs_send(op, suffix.p, b.p);
+    free(suffix.p);
+    free(b.p);
+}
+
+// ---- answers
+static int fs_status_code(const char *status, int http) {
+    static const char *const names[E_N] = {"OK", "CANCELLED", "UNKNOWN", "INVALID_ARGUMENT",
+        "DEADLINE_EXCEEDED", "NOT_FOUND", "ALREADY_EXISTS", "PERMISSION_DENIED", "RESOURCE_EXHAUSTED",
+        "FAILED_PRECONDITION", "ABORTED", "OUT_OF_RANGE", "UNIMPLEMENTED", "INTERNAL", "UNAVAILABLE",
+        "DATA_LOSS", "UNAUTHENTICATED"};
+    for (int i = 0; status && i < E_N; i++) if (!strcmp(status, names[i])) return i;
+    switch (http) {
+    case 400: return E_INVALID_ARGUMENT;   case 401: return E_UNAUTHENTICATED;
+    case 403: return E_PERMISSION_DENIED;  case 404: return E_NOT_FOUND;
+    case 409: return E_ABORTED;            case 412: return E_FAILED_PRECONDITION;
+    case 429: return E_RESOURCE_EXHAUSTED; case 499: return E_CANCELLED;
+    case 501: return E_UNIMPLEMENTED;      case 503: return E_UNAVAILABLE;
+    case 504: return E_DEADLINE_EXCEEDED;  default: return http >= 500 ? E_INTERNAL : E_UNKNOWN;
+    }
+}
+// An {"error":{...}} anywhere at the top (an object, or the first element of a stream).
+static const jv *fs_error_of(const jv *r) {
+    if (!r) return NULL;
+    if (r->t == 'o') return jget(r, "error");
+    for (int i = 0; r->t == 'a' && i < r->len; i++) { const jv *e = jget(r->v[i], "error"); if (e) return e; }
+    return NULL;
+}
+
+static void fs_net_done(void *ctx, int status, const char *body, long len, const char *err) {
+    (void)len;
+    fs_op *op = ctx;
+    if (status == 0) {
+        KLJ_LOG("Firestore: no response (%s)", err ? err : "offline");
+        fs_op_error(op, E_UNAVAILABLE, fs_offline_msg(op->what));
+        return;
+    }
+    jv *r = jparse_all(body);
+    const jv *e = fs_error_of(r);
+    if (status >= 300 || e) {
+        const char *m = e ? jgets(e, "message") : NULL;
+        int code = fs_status_code(e ? jgets(e, "status") : NULL, status);
+        char msg[512];
+        snprintf(msg, sizeof msg, "%s", m ? m : "The Firestore request failed.");
+        KLJ_LOG("Firestore: HTTP %d", status);
+        jfree(r);
+        fs_op_error(op, code, msg);
+        return;
+    }
+    if (!r) { fs_op_error(op, E_INTERNAL, "The Firestore response was not JSON."); return; }
+    void *value = NULL;
+    switch (op->what) {
+    case OP_GET_DOC: case OP_LISTEN_DOC: {
+        const jv *found = NULL;
+        for (int i = 0; r->t == 'a' && i < r->len; i++)
+            if ((found = jget(r->v[i], "found"))) break;
+        value = fs_snapshot(op->db, op->path, found, 0);
+        KLJ_LOG("Firestore: get \"%s\" -> %s", op->path, found ? "exists" : "does not exist");
+        break;
+    }
+    case OP_QUERY: case OP_LISTEN_QUERY: {
+        mvfs *qs;
+        value = fs_new(C_QSNAP, FS_QSNAP, &qs);
+        qs->db = op->db;
+        fs_hold_in(qs, op->subject);
+        qs->o1 = op->subject;
+        void *docs = fs_list_new();
+        fs_hold_in(qs, docs);
+        qs->o2 = docs;
+        int n = 0;
+        for (int i = 0; r->t == 'a' && i < r->len; i++) {
+            int k = op->last ? r->len - 1 - i : i;
+            const jv *doc = jget(r->v[k], "document");
+            if (!doc) continue;
+            fs_list_add(docs, fs_snapshot(op->db, fs_rel_name(jgets(doc, "name")), doc, 1));
+            n++;
+        }
+        KLJ_LOG("Firestore: query -> %d document%s", n, n == 1 ? "" : "s");
+        break;
+    }
+    case OP_COUNT: {
+        int64_t count = 0;
+        for (int i = 0; r->t == 'a' && i < r->len; i++) {
+            const jv *v = jget(jget(jget(r->v[i], "result"), "aggregateFields"), "count");
+            const char *s = jgets(v, "integerValue");
+            if (s) count = strtoll(s, NULL, 10);
+        }
+        mvfs *a;
+        value = fs_new(C_AGGS, FS_AGGS, &a);
+        a->a = count;
+        fs_hold_in(a, op->subject);
+        a->o1 = op->subject;
+        break;
+    }
+    case OP_COMMIT:
+        value = op->result;   // add(): the new document's reference; else null
+        KLJ_LOG("Firestore: commit -> ok");
+        break;
+    }
+    jfree(r);
+    if (op->task) fs_task_finish(op->task, 1, value, NULL, NULL);   // the task holds the value
+    else if (op->reg) fs_event_post(op->reg, value, NULL);          // ...or the event does
+    char *touched = op->what == OP_COMMIT ? fs_strdup(op->touched) : NULL;
+    fs_op_free(op);
+    if (touched) { fs_refresh_after(touched); free(touched); }
+}
+
+// ------------------------------------------------------------- writes
+// A write's fields as a tree, so dotted update keys and nested maps merge.
+typedef struct wn { char *name; char *json; struct wn **kids; int nk; } wn;
+static void wn_clear(wn *n) {   // its value and children go; its name stays
+    for (int i = 0; i < n->nk; i++) { wn_clear(n->kids[i]); free(n->kids[i]->name); free(n->kids[i]); }
+    free(n->kids); free(n->json);
+    n->kids = NULL; n->nk = 0; n->json = NULL;
+}
+static wn *wn_child(wn *n, const char *name) {
+    for (int i = 0; i < n->nk; i++) if (!strcmp(n->kids[i]->name, name)) return n->kids[i];
+    wn *c = calloc(1, sizeof *c);
+    c->name = strdup(name);
+    n->kids = realloc(n->kids, (size_t)(n->nk + 1) * sizeof *n->kids);
+    n->kids[n->nk++] = c;
+    return c;
+}
+static void wn_set(wn *root, char **segs, int n, const char *json) {
+    wn *cur = root;
+    for (int i = 0; i < n; i++) {
+        if (cur->json) { free(cur->json); cur->json = NULL; }
+        cur = wn_child(cur, segs[i]);
+    }
+    wn_clear(cur);
+    cur->json = strdup(json);
+}
+static void wn_emit(sb *b, wn *n) {
+    sb_put(b, "{", 1);
+    for (int i = 0; i < n->nk; i++) {
+        if (i) sb_put(b, ",", 1);
+        sb_jstr(b, n->kids[i]->name);
+        sb_put(b, ":", 1);
+        if (n->kids[i]->json) sb_add(b, n->kids[i]->json);
+        else { sb_add(b, "{\"mapValue\":{\"fields\":"); wn_emit(b, n->kids[i]); sb_add(b, "}}"); }
+    }
+    sb_put(b, "}", 1);
+}
+
+enum { W_SET, W_MERGE, W_MERGE_FIELDS, W_UPDATE };
+typedef struct {
+    int mode;
+    void *db;
+    wn root;
+    sb transforms; int ntransforms;
+    sb mask; int nmask;
+    int err;
+} fs_w;
+
+static void fs_w_mask(fs_w *w, char **segs, int n) {
+    char *p = fs_encode_segs(segs, n);
+    if (w->nmask++) sb_put(&w->mask, ",", 1);
+    sb_jstr(&w->mask, p);
+    free(p);
+}
+// One value at a field path: sentinels become transforms or masked deletes,
+// maps are walked, everything else is a leaf.
+static void fs_w_value(fs_w *w, char **segs, int n, void *v, int depth) {
+    if (w->err || depth > 64) { w->err = 1; return; }
+    mvfs *f = fs_of(v, FS_FV);
+    if (f) {
+        if (f->i == 1) {   // delete: masked, with no value (an update masks its keys itself)
+            if (w->mode == W_SET || (w->mode == W_UPDATE && depth > 0)) { w->err = 1; return; }
+            if (w->mode == W_MERGE) fs_w_mask(w, segs, n);
+            return;
+        }
+        char *p = fs_encode_segs(segs, n);
+        if (w->ntransforms++) sb_put(&w->transforms, ",", 1);
+        sb_add(&w->transforms, "{\"fieldPath\":");
+        sb_jstr(&w->transforms, p);
+        free(p);
+        switch (f->i) {
+        case 2: sb_add(&w->transforms, ",\"setToServerValue\":\"REQUEST_TIME\"}"); break;
+        case 3: case 4: sb_add(&w->transforms, ",\"increment\":"); sb_add(&w->transforms, f->s); sb_add(&w->transforms, "}"); break;
+        case 5: sb_add(&w->transforms, ",\"appendMissingElements\":{\"values\":["); sb_add(&w->transforms, f->s); sb_add(&w->transforms, "]}}"); break;
+        default: sb_add(&w->transforms, ",\"removeAllFromArray\":{\"values\":["); sb_add(&w->transforms, f->s); sb_add(&w->transforms, "]}}"); break;
+        }
+        return;
+    }
+    if (mv_is_hashmap(v)) {
+        void *k, *x;
+        int any = 0;
+        for (unsigned i = 0; mv_hashmap_at(v, i, &k, &x) > 0; i++) {
+            const char *ks = klj_str(k);
+            if (!ks) { w->err = 1; return; }
+            char **s2 = malloc((size_t)(n + 1) * sizeof *s2);
+            if (n) memcpy(s2, segs, (size_t)n * sizeof *s2);
+            s2[n] = (char *)ks;
+            fs_w_value(w, s2, n + 1, x, depth + 1);
+            free(s2);
+            any = 1;
+        }
+        if (any || n == 0) return;
+        // an empty map is a value of its own
+    }
+    sb b = {0};
+    if (fs_val_json(&b, v, w->db) < 0) { free(b.p); w->err = 1; return; }
+    if (n == 0) { free(b.p); w->err = 1; return; }   // the document itself must be a map
+    wn_set(&w->root, segs, n, b.p);
+    if (w->mode == W_MERGE) fs_w_mask(w, segs, n);
+    free(b.p);
+}
+// The write object for one document; NULL (and *code) when the data cannot be written.
+static char *fs_write_json(fs_w *w, const char *path, int exists_precondition) {
+    if (w->err) return NULL;
+    sb b = {0};
+    sb_add(&b, "{\"update\":{\"name\":\"");
+    sb_docname(&b, w->db, path);
+    sb_add(&b, "\",\"fields\":");
+    wn_emit(&b, &w->root);
+    sb_add(&b, "}");
+    if (w->mode != W_SET) {
+        sb_add(&b, ",\"updateMask\":{\"fieldPaths\":[");
+        if (w->mask.p) sb_add(&b, w->mask.p);
+        sb_add(&b, "]}");
+    }
+    if (w->ntransforms) { sb_add(&b, ",\"updateTransforms\":["); sb_add(&b, w->transforms.p); sb_add(&b, "]"); }
+    if (exists_precondition) sb_add(&b, ",\"currentDocument\":{\"exists\":true}");
+    sb_add(&b, "}");
+    return sb_take(&b);
+}
+static void fs_w_done(fs_w *w) { wn_clear(&w->root); free(w->transforms.p); free(w->mask.p); }
+
+// set(data, options): NULL when the data cannot be written.
+static char *fs_set_write(void *db, const char *path, void *data, void *options) {
+    fs_w w = {0};
+    w.db = db;
+    mvfs *o = fs_of(options, FS_SETOPT);
+    w.mode = !o || o->i == 0 ? W_SET : o->i == 1 ? W_MERGE : W_MERGE_FIELDS;
+    if (w.mode == W_MERGE_FIELDS && o->s) { sb_add(&w.mask, o->s); w.nmask = 1; }
+    if (!mv_is_hashmap(data)) w.err = 1;
+    else fs_w_value(&w, NULL, 0, data, 0);
+    char *r = fs_write_json(&w, path, 0);
+    fs_w_done(&w);
+    return r;
+}
+// update(Map): the keys are dotted field paths.
+static char *fs_update_map_write(void *db, const char *path, void *data) {
+    fs_w w = {0};
+    w.db = db;
+    w.mode = W_UPDATE;
+    void *k, *v;
+    if (!mv_is_hashmap(data)) w.err = 1;
+    for (unsigned i = 0; !w.err && mv_hashmap_at(data, i, &k, &v) > 0; i++) {
+        const char *ks = klj_str(k);
+        if (!ks || !*ks) { w.err = 1; break; }
+        char *copy = strdup(ks), *segs[64];
+        int n = 0;
+        for (char *save = NULL, *t = strtok_r(copy, ".", &save); t && n < 64; t = strtok_r(NULL, ".", &save)) segs[n++] = t;
+        mvfs *fv = fs_of(v, FS_FV);
+        if (!fv || fv->i == 1) fs_w_mask(&w, segs, n);
+        fs_w_value(&w, segs, n, v, 0);
+        free(copy);
+    }
+    char *r = fs_write_json(&w, path, 1);
+    fs_w_done(&w);
+    return r;
+}
+// update(FieldPath, value, Object... moreFieldsAndValues)
+static char *fs_update_pairs_write(void *db, const char *path, void *fp, void *val, void *more) {
+    fs_w w = {0};
+    w.db = db;
+    w.mode = W_UPDATE;
+    klj_array *arr = fs_arr(more, 'L');
+    int extra = arr ? arr->len : 0;
+    if (extra % 2) w.err = 1;
+    for (int i = -1; !w.err && i < extra / 2; i++) {
+        void *p = i < 0 ? fp : ((void **)arr->data)[2 * i];
+        void *v = i < 0 ? val : ((void **)arr->data)[2 * i + 1];
+        mvfs *pf = fs_of(p, FS_PATH);
+        if (!pf || pf->i) { w.err = 1; break; }
+        char **segs = fs_path_segs(pf);
+        mvfs *fv = fs_of(v, FS_FV);
+        if (!fv || fv->i == 1) fs_w_mask(&w, segs, pf->k);
+        fs_w_value(&w, segs, pf->k, v, 0);
+        free(segs);
+    }
+    char *r = fs_write_json(&w, path, 1);
+    fs_w_done(&w);
+    return r;
+}
+static char *fs_delete_write(void *db, const char *path) {
+    sb b = {0};
+    sb_add(&b, "{\"delete\":\"");
+    sb_docname(&b, db, path);
+    sb_add(&b, "\"}");
+    return sb_take(&b);
+}
+// One :commit of `writes` ("," joined); `result` is what the task succeeds with.
+static void *fs_commit(void *db, const char *writes, const char *touched, void *result) {
+    void *task = fs_task_new(NULL);
+    fs_op *op = fs_op_new(OP_COMMIT, db, task, NULL);
+    if (result) { op->result = result; klj_hold(result); }
+    op->touched = fs_strdup(touched);
+    sb b = {0};
+    sb_add(&b, "{\"writes\":[");
+    sb_add(&b, writes);
+    sb_add(&b, "]}");
+    fs_send(op, ":commit", b.p);
+    free(b.p);
+    return task;
+}
+static void *fs_write_task(void *db, char *write, const char *path, void *result) {
+    if (!write) return fs_failed_task(E_INVALID_ARGUMENT, "Invalid data: a value Firestore cannot store, "
+                                      "or FieldValue.delete() where it is not allowed.");
+    void *t = fs_commit(db, write, path, result);
+    free(write);
+    return t;
+}
+
+// ------------------------------------------------------------- bindings: FirebaseFirestore
+#define B(name) static klj_val name(void *env, void *self, const klj_val *a, int n)
+#define ARG(i) (n > (i) ? a[i].l : NULL)
+#define RET(x) return (klj_val){.l = (x)}
+#define RETJ(x) return (klj_val){.j = (uint64_t)(int64_t)(x)}
+
+#define FS_DB_MAX 8
+static void *fs_dbs[FS_DB_MAX];
+static void *fs_dbs_app[FS_DB_MAX];
+
+B(fs_FF_getInstance) {
+    (void)env; (void)self;
+    void *app = ARG(0);
+    const char *dbid = ARG(1) ? klj_str(ARG(1)) : NULL;
+    if (!dbid || !*dbid) dbid = "(default)";
+    if (!app) { KLJ_LOG("FirebaseFirestore.getInstance: no FirebaseApp"); RET(NULL); }
+    pthread_mutex_lock(&fs_lock);
+    for (int i = 0; i < FS_DB_MAX; i++)
+        if (fs_dbs[i] && fs_dbs_app[i] == app && !strcmp(fs_dbi(fs_dbs[i])->db, dbid)) {
+            void *found = fs_dbs[i];
+            pthread_mutex_unlock(&fs_lock);
+            RET(found);
+        }
+    pthread_mutex_unlock(&fs_lock);
+    void *opts = klj_call_binding(app, "getOptions", "()Lcom/google/firebase/FirebaseOptions;", NULL, 0).l;
+    void *proj = opts ? klj_call_binding(opts, "getProjectId", "()Ljava/lang/String;", NULL, 0).l : NULL;
+    void *appid = opts ? klj_call_binding(opts, "getApplicationId", "()Ljava/lang/String;", NULL, 0).l : NULL;
+    fs_dbinfo *d = calloc(1, sizeof *d);
+    d->db = strdup(dbid);
+    d->project = proj && klj_str(proj) && *klj_str(proj) ? strdup(klj_str(proj)) : NULL;
+    d->appid = appid && klj_str(appid) ? strdup(klj_str(appid)) : NULL;
+    d->host = strdup("firestore.googleapis.com");
+    d->ssl = 1; d->persist = 1; d->net = 1; d->cache = 100 * 1024 * 1024;
+    if (proj) klj_release(proj);
+    if (appid) klj_release(appid);
+    mvfs *f;
+    void *db = fs_new(C_FF, FS_DB, &f);
+    f->dbi = d;
+    f->db = db;
+    kl_jni_pin_object(db);
+    pthread_mutex_lock(&fs_lock);
+    for (int i = 0; i < FS_DB_MAX; i++) if (!fs_dbs[i]) { fs_dbs[i] = db; fs_dbs_app[i] = app; break; }
+    pthread_mutex_unlock(&fs_lock);
+    KLJ_LOG("FirebaseFirestore.getInstance(\"%s\") -> an instance on the Firestore REST API%s", dbid,
+            d->project ? "" : " (no project id among the app's options: every request will fail)");
+    RET(db);
+}
+B(fs_noop) { (void)env; (void)self; (void)a; (void)n; return (klj_val){0}; }
+B(fs_FF_collection) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DB);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!f || fs_segments(p) < 0 || fs_segments(p) % 2 == 0) RET(fs_bad_path("collection", p));
+    RET(fs_ref(self, p, 0));
+}
+B(fs_FF_document) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DB);
+    const char *p = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!f || fs_segments(p) < 0 || fs_segments(p) % 2 != 0) RET(fs_bad_path("document", p));
+    RET(fs_ref(self, p, 1));
+}
+B(fs_FF_collectionGroup) {
+    (void)env;
+    const char *id = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!fs_of(self, FS_DB) || !id || !*id || strchr(id, '/')) RET(fs_bad_path("collection group", id));
+    mvfs *q;
+    void *obj = fs_new(C_QUERY, FS_QUERY, &q);
+    q->db = self;
+    q->q.coll = strdup(id);
+    q->q.group = 1;
+    RET(obj);
+}
+static void *fs_settings_new(const char *cls, int kind, fs_dbinfo *from) {
+    mvfs *s;
+    void *obj = fs_new(cls, kind, &s);
+    s->s = strdup(from && from->host ? from->host : "firestore.googleapis.com");
+    s->i = from ? from->ssl : 1;
+    s->j = from ? from->persist : 1;
+    s->a = from ? from->cache : 100 * 1024 * 1024;
+    return obj;
+}
+B(fs_FF_getSettings) { (void)env; (void)a; (void)n; RET(fs_settings_new(C_SET, FS_SETTINGS, fs_dbi(self))); }
+B(fs_FF_setSettings) {
+    (void)env;
+    fs_dbinfo *d = fs_dbi(self);
+    mvfs *s = fs_of(ARG(0), FS_SETTINGS);
+    if (d && s) {
+        pthread_mutex_lock(&fs_lock);
+        free(d->host);
+        d->host = strdup(s->s && *s->s ? s->s : "firestore.googleapis.com");
+        d->ssl = s->i; d->persist = s->j; d->cache = s->a;
+        pthread_mutex_unlock(&fs_lock);
+        if (strcmp(d->host, "firestore.googleapis.com")) KLJ_LOG("Firestore: host set to %s (ssl %d)", d->host, d->ssl);
+    }
+    return (klj_val){0};
+}
+B(fs_FF_batch) {
+    (void)env; (void)a; (void)n;
+    mvfs *b;
+    void *obj = fs_new(C_BATCH, FS_BATCH, &b);
+    b->db = self;
+    RET(obj);
+}
+B(fs_FF_runTransaction) {
+    (void)env; (void)self; (void)a; (void)n;
+    RET(fs_failed_task(E_UNIMPLEMENTED, "Transactions are not available in this runtime."));
+}
+// disableNetwork: every request fails as offline until enableNetwork.
+B(fs_FF_enableNetwork) { (void)env; (void)a; (void)n; fs_dbinfo *d = fs_dbi(self); if (d) d->net = 1; RET(fs_done_task(NULL)); }
+B(fs_FF_disableNetwork) { (void)env; (void)a; (void)n; fs_dbinfo *d = fs_dbi(self); if (d) d->net = 0; RET(fs_done_task(NULL)); }
+B(fs_ok_task) { (void)env; (void)self; (void)a; (void)n; RET(fs_done_task(NULL)); }
+B(fs_FF_getNamedQuery) { (void)env; (void)self; (void)a; (void)n; RET(fs_done_task(NULL)); }   // no bundles: null
+B(fs_FF_loadBundle) {
+    (void)env; (void)self; (void)a; (void)n;
+    void *t = fs_task_new(C_LBT);
+    fs_task_fail(t, E_UNIMPLEMENTED, "Loading bundles is not available in this runtime.");
+    RET(t);
+}
+B(fs_self) { (void)env; (void)a; (void)n; RET(self); }
+
+static void *fs_reg_new(void *listener, void *subject, int query) {
+    mvfs *r;
+    void *reg = fs_new(C_REG, FS_REG, &r);
+    fs_hold_in(r, listener); r->o1 = listener;
+    fs_hold_in(r, subject); r->o2 = subject;
+    r->i = query;
+    pthread_mutex_lock(&fs_lock);
+    fs_regs = realloc(fs_regs, (size_t)(fs_nregs + 1) * sizeof *fs_regs);
+    fs_regs[fs_nregs++] = reg;
+    pthread_mutex_unlock(&fs_lock);
+    klj_hold(reg);   // the active list's
+    return reg;
+}
+typedef void (*fs_on_void_fn)(void *env, void *clazz, int64_t listener);
+static void fs_sync_deliver(void *reg) {
+    mvfs *r = fs_of(reg, FS_REG);
+    mvfs *l = r ? fs_of(r->o1, FS_LISTENER) : NULL;
+    if (r && l && !r->k && l->b) {
+        const char *cls = fs_cls(r->o1);
+        fs_on_void_fn fn = (fs_on_void_fn)kl_jni_native(cls, "nativeOnEvent", "(J)V");
+        if (fn) fn(kl_jni_env(), kl_jni_class(cls), l->b);
+    }
+    klj_release(reg);
+}
+B(fs_FF_addSnapshotsInSyncListener) {
+    (void)env; (void)n;
+    mvfs *r;
+    void *reg = fs_new(C_REG, FS_REG, &r);   // not in the active list: nothing re-fires it
+    fs_hold_in(r, ARG(1)); r->o1 = ARG(1);
+    r->i = 2;
+    (void)self;
+    klj_hold(reg);
+    kl_mv_ui_later(fs_sync_deliver, reg);   // every (one-shot) listener is in sync at once
+    RET(reg);
+}
+
+// ---- settings
+B(fs_Set_getHost) { (void)env; (void)a; (void)n; mvfs *s = fs_of(self, 0); RET(kl_jni_new_string(s && s->s ? s->s : "firestore.googleapis.com")); }
+B(fs_Set_isSsl) { (void)env; (void)a; (void)n; mvfs *s = fs_of(self, 0); RETJ(s ? s->i : 1); }
+B(fs_Set_isPersist) { (void)env; (void)a; (void)n; mvfs *s = fs_of(self, 0); RETJ(s ? s->j : 1); }
+B(fs_Set_getCache) { (void)env; (void)a; (void)n; mvfs *s = fs_of(self, 0); RETJ(s ? s->a : 0); }
+B(fs_SetB_init) { (void)env; (void)self; (void)a; (void)n; RET(fs_settings_new(C_SETB, FS_SETB, NULL)); }
+B(fs_SetB_setHost) {
+    (void)env;
+    mvfs *s = fs_of(self, FS_SETB);
+    const char *h = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (s && h) { free(s->s); s->s = strdup(h); }
+    RET(self);
+}
+B(fs_SetB_setSsl) { (void)env; mvfs *s = fs_of(self, FS_SETB); if (s && n > 0) s->i = (uint8_t)a[0].j != 0; RET(self); }
+B(fs_SetB_setPersist) { (void)env; mvfs *s = fs_of(self, FS_SETB); if (s && n > 0) s->j = (uint8_t)a[0].j != 0; RET(self); }
+B(fs_SetB_setCache) { (void)env; mvfs *s = fs_of(self, FS_SETB); if (s && n > 0) s->a = (int64_t)a[0].j; RET(self); }
+B(fs_SetB_build) {
+    (void)env; (void)a; (void)n;
+    mvfs *b = fs_of(self, FS_SETB);
+    mvfs *s;
+    void *obj = fs_new(C_SET, FS_SETTINGS, &s);
+    s->s = strdup(b && b->s ? b->s : "firestore.googleapis.com");
+    s->i = b ? b->i : 1; s->j = b ? b->j : 1; s->a = b ? b->a : 100 * 1024 * 1024;
+    RET(obj);
+}
+
+// ---- references
+static char *fs_auto_id(void) {
+    static const char al[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    char *id = malloc(21);
+    for (int i = 0; i < 20; i++) id[i] = al[arc4random_uniform(sizeof al - 1)];
+    id[20] = 0;
+    return id;
+}
+B(fs_Ref_getId) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, 0); RET(kl_jni_new_string(f && f->path ? fs_last(f->path) : "")); }
+B(fs_Ref_getPath) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, 0); RET(kl_jni_new_string(f && f->path ? f->path : "")); }
+B(fs_Ref_getFirestore) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, 0); RET(f ? f->db : NULL); }
+B(fs_Coll_getParent) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_COLL);
+    char *p = f ? fs_parent(f->path) : NULL;
+    void *r = p ? fs_ref(f->db, p, 1) : NULL;
+    free(p);
+    RET(r);
+}
+B(fs_Doc_getParent) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_DOC);
+    char *p = f ? fs_parent(f->path) : NULL;
+    void *r = p ? fs_ref(f->db, p, 0) : NULL;
+    free(p);
+    RET(r);
+}
+B(fs_Coll_documentAuto) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_COLL);
+    if (!f) RET(NULL);
+    char *id = fs_auto_id(), *p = fs_join(f->path, id);
+    void *r = fs_ref(f->db, p, 1);
+    free(id); free(p);
+    RET(r);
+}
+B(fs_Coll_document) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_COLL);
+    const char *sub = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!f || fs_segments(sub) < 0 || fs_segments(sub) % 2 == 0) RET(fs_bad_path("document", sub));
+    char *p = fs_join(f->path, sub);
+    void *r = fs_ref(f->db, p, 1);
+    free(p);
+    RET(r);
+}
+B(fs_Doc_collection) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DOC);
+    const char *sub = ARG(0) ? klj_str(ARG(0)) : NULL;
+    if (!f || fs_segments(sub) < 0 || fs_segments(sub) % 2 == 0) RET(fs_bad_path("collection", sub));
+    char *p = fs_join(f->path, sub);
+    void *r = fs_ref(f->db, p, 0);
+    free(p);
+    RET(r);
+}
+B(fs_Coll_add) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_COLL);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "add() on something that is not a collection"));
+    char *id = fs_auto_id(), *p = fs_join(f->path, id);
+    void *ref = fs_ref(f->db, p, 1);
+    KLJ_LOG("Firestore: add to \"%s\"", f->path);
+    char *w = fs_set_write(f->db, p, ARG(0), NULL);
+    int ok = w != NULL;
+    void *t = fs_write_task(f->db, w, p, ref);   // the request holds ref until it is the result
+    if (!ok) klj_release(ref);                    // nothing does: let it go
+    free(id); free(p);
+    RET(t);
+}
+B(fs_Doc_get) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DOC);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "get() on something that is not a document"));
+    if (fs_enum_ord(ARG(0), EN_SOURCE) == 2)
+        RET(fs_failed_task(E_UNAVAILABLE, "Failed to get document from cache. (However, this document may exist on "
+                           "the server. Run again without setting source to CACHE to attempt to retrieve the "
+                           "document from the server.)"));
+    void *task = fs_task_new(NULL);
+    fs_op *op = fs_op_new(OP_GET_DOC, f->db, task, self);
+    op->path = strdup(f->path);
+    fs_doc_send(op);
+    RET(task);
+}
+B(fs_Doc_set) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DOC);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "set() on something that is not a document"));
+    KLJ_LOG("Firestore: set \"%s\"", f->path);
+    RET(fs_write_task(f->db, fs_set_write(f->db, f->path, ARG(0), ARG(1)), f->path, NULL));
+}
+B(fs_Doc_updateMap) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DOC);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "update() on something that is not a document"));
+    KLJ_LOG("Firestore: update \"%s\"", f->path);
+    RET(fs_write_task(f->db, fs_update_map_write(f->db, f->path, ARG(0)), f->path, NULL));
+}
+B(fs_Doc_updatePairs) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DOC);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "update() on something that is not a document"));
+    KLJ_LOG("Firestore: update \"%s\"", f->path);
+    RET(fs_write_task(f->db, fs_update_pairs_write(f->db, f->path, ARG(0), ARG(1), ARG(2)), f->path, NULL));
+}
+B(fs_Doc_delete) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_DOC);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "delete() on something that is not a document"));
+    KLJ_LOG("Firestore: delete \"%s\"", f->path);
+    RET(fs_write_task(f->db, fs_delete_write(f->db, f->path), f->path, NULL));
+}
+B(fs_Doc_addSnapshotListener) {
+    (void)env;
+    mvfs *f = fs_of(self, FS_DOC);
+    if (!f || !fs_of(ARG(2), FS_LISTENER)) RET(NULL);
+    void *reg = fs_reg_new(ARG(2), self, 0);
+    KLJ_LOG("Firestore: listen to \"%s\" (delivered once, and after this client's writes to it)", f->path);
+    fs_reg_fetch(reg);
+    RET(reg);
+}
+B(fs_Reg_remove) {
+    (void)env; (void)a; (void)n;
+    mvfs *r = fs_of(self, FS_REG);
+    if (!r || r->k) return (klj_val){0};
+    r->k = 1;
+    int found = 0;
+    pthread_mutex_lock(&fs_lock);
+    for (int i = 0; i < fs_nregs; i++)
+        if (fs_regs[i] == self) { fs_regs[i] = fs_regs[--fs_nregs]; found = 1; break; }
+    pthread_mutex_unlock(&fs_lock);
+    if (found) klj_release(self);
+    return (klj_val){0};
+}
+
+// ---- queries
+static fs_query *fs_q_of(void *obj) {
+    mvfs *f = fs_of(obj, 0);
+    return f && (f->kind == FS_QUERY || f->kind == FS_COLL || f->kind == FS_AGGQ) ? &f->q : NULL;
+}
+static void fs_q_copy(fs_query *d, const fs_query *s) {
+    d->coll = fs_strdup(s->coll); d->group = s->group;
+    d->filters = fs_strdup(s->filters); d->nfilters = s->nfilters;
+    d->order_paths = fs_strdup(s->order_paths); d->order_dirs = fs_strdup(s->order_dirs);
+    d->limit = s->limit; d->last = s->last;
+    d->start = fs_strdup(s->start); d->end = fs_strdup(s->end);
+    d->start_before = s->start_before; d->end_before = s->end_before;
+    d->name_order = s->name_order;
+}
+static void *fs_q_derive(void *from, mvfs **out) {
+    mvfs *src = fs_of(from, 0);
+    mvfs *f;
+    void *obj = fs_new(C_QUERY, FS_QUERY, &f);
+    f->db = src ? src->db : NULL;
+    fs_query *q = fs_q_of(from);
+    if (q) fs_q_copy(&f->q, q);
+    *out = f;
+    return obj;
+}
+static void fs_append(char **list, const char *sep, const char *item) {
+    sb b = {0};
+    if (*list) { sb_add(&b, *list); sb_add(&b, sep); }
+    sb_add(&b, item);
+    free(*list);
+    *list = sb_take(&b);
+}
+// A where-clause value: a document id string against __name__ means that document.
+static int fs_filter_value(sb *b, fs_query *q, mvfs *path, void *v, void *db) {
+    if (path->i && v && !strcmp(fs_cls(v), KLJ_CLASS_STRING) && !q->group) {
+        char *p = fs_join(q->coll, klj_str(v));
+        sb_add(b, "{\"referenceValue\":\"");
+        sb_docname(b, db, p);
+        sb_add(b, "\"}");
+        free(p);
+        return 0;
+    }
+    return fs_val_json(b, v, db);
+}
+static klj_val fs_where(void *self, void *fp, void *v, const char *op, int list) {
+    fs_query *q = fs_q_of(self);
+    mvfs *path = fs_of(fp, FS_PATH);
+    if (!q || !path) { kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    mvfs *f;
+    void *obj = fs_q_derive(self, &f);
+    sb b = {0};
+    int isnull = !v, isnan = 0;
+    mvfs *dv = fs_of(v, FS_DOUBLE);
+    if (dv && isnan(dv->x)) isnan = 1;
+    int eq = !strcmp(op, "EQUAL"), ne = !strcmp(op, "NOT_EQUAL");
+    if (!list && (isnull || isnan) && (eq || ne)) {
+        sb_add(&b, "{\"unaryFilter\":{\"op\":\"");
+        sb_add(&b, isnull ? (eq ? "IS_NULL" : "IS_NOT_NULL") : (eq ? "IS_NAN" : "IS_NOT_NAN"));
+        sb_add(&b, "\",\"field\":{\"fieldPath\":");
+        sb_jstr(&b, path->s);
+        sb_add(&b, "}}}");
+    } else {
+        sb_add(&b, "{\"fieldFilter\":{\"field\":{\"fieldPath\":");
+        sb_jstr(&b, path->s);
+        sb_add(&b, "},\"op\":\"");
+        sb_add(&b, op);
+        sb_add(&b, "\",\"value\":");
+        int bad;
+        if (list) {
+            sb_add(&b, "{\"arrayValue\":{\"values\":[");
+            klj_list *l = fs_list_of(v);
+            bad = !l;
+            for (int i = 0; l && i < l->count && !bad; i++) {
+                if (i) sb_put(&b, ",", 1);
+                bad = fs_filter_value(&b, q, path, l->items[i], f->db) < 0;
+            }
+            sb_add(&b, "]}}");
+        } else bad = fs_filter_value(&b, q, path, v, f->db) < 0;
+        sb_add(&b, "}}");
+        if (bad) {
+            free(b.p);
+            KLJ_LOG("Firestore: where() with a value Firestore cannot compare -> IllegalArgumentException");
+            kl_jni_throw("java/lang/IllegalArgumentException");
+            RET(NULL);
+        }
+    }
+    fs_append(&f->q.filters, ",", b.p);
+    f->q.nfilters++;
+    free(b.p);
+    RET(obj);
+}
+#define WHERE(fn, op, list) B(fn) { (void)env; return fs_where(self, ARG(0), ARG(1), op, list); }
+WHERE(fs_Q_whereEqualTo, "EQUAL", 0)
+WHERE(fs_Q_whereNotEqualTo, "NOT_EQUAL", 0)
+WHERE(fs_Q_whereLessThan, "LESS_THAN", 0)
+WHERE(fs_Q_whereLessThanOrEqualTo, "LESS_THAN_OR_EQUAL", 0)
+WHERE(fs_Q_whereGreaterThan, "GREATER_THAN", 0)
+WHERE(fs_Q_whereGreaterThanOrEqualTo, "GREATER_THAN_OR_EQUAL", 0)
+WHERE(fs_Q_whereArrayContains, "ARRAY_CONTAINS", 0)
+WHERE(fs_Q_whereArrayContainsAny, "ARRAY_CONTAINS_ANY", 1)
+WHERE(fs_Q_whereIn, "IN", 1)
+WHERE(fs_Q_whereNotIn, "NOT_IN", 1)
+B(fs_Q_orderBy) {
+    (void)env;
+    mvfs *path = fs_of(ARG(0), FS_PATH);
+    if (!fs_q_of(self) || !path) { kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    int desc = fs_enum_ord(ARG(1), EN_DIR) == 1;
+    mvfs *f;
+    void *obj = fs_q_derive(self, &f);
+    fs_append(&f->q.order_paths, "\n", path->s);
+    fs_append(&f->q.order_dirs, "", desc ? "D" : "A");
+    RET(obj);
+}
+static klj_val fs_limit(void *self, int64_t lim, int last) {
+    if (!fs_q_of(self) || lim <= 0) { kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    mvfs *f;
+    void *obj = fs_q_derive(self, &f);
+    f->q.limit = lim;
+    f->q.last = last;
+    RET(obj);
+}
+B(fs_Q_limit) { (void)env; return fs_limit(self, n > 0 ? (int64_t)a[0].j : 0, 0); }
+B(fs_Q_limitToLast) { (void)env; return fs_limit(self, n > 0 ? (int64_t)a[0].j : 0, 1); }
+// Cursors: from values, or from a snapshot (its values for the query's orders, then its name).
+static klj_val fs_cursor(void *self, void *arg, int end, int before) {
+    fs_query *q = fs_q_of(self);
+    if (!q) { kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    mvfs *f;
+    void *obj = fs_q_derive(self, &f);
+    sb b = {0};
+    sb_put(&b, "", 0);
+    mvfs *snap = fs_of(arg, FS_DSNAP);
+    int bad = 0;
+    if (snap) {
+        int k = 0;
+        for (const char *p = q->order_paths; p && *p && !bad; k++) {
+            const char *e = strchr(p, '\n');
+            char *one = strndup(p, e ? (size_t)(e - p) : strlen(p));
+            if (k) sb_put(&b, ",", 1);
+            if (!strcmp(one, "__name__")) {
+                sb_add(&b, "{\"referenceValue\":\"");
+                sb_docname(&b, f->db, snap->path);
+                sb_add(&b, "\"}");
+            } else {
+                // a plain dotted path (quoted segments are not split here)
+                char *copy = strdup(one), *segs[64];
+                int ns = 0;
+                for (char *save = NULL, *t = strtok_r(copy, ".", &save); t && ns < 64; t = strtok_r(NULL, ".", &save)) segs[ns++] = t;
+                int found;
+                void *v = fs_walk(snap, segs, ns, &found);
+                bad = fs_val_json(&b, v, f->db) < 0;
+                free(copy);
+            }
+            free(one);
+            p = e ? e + 1 : NULL;
+        }
+        if (!q->order_paths || !strstr(q->order_paths, "__name__")) {
+            if (k) sb_put(&b, ",", 1);
+            sb_add(&b, "{\"referenceValue\":\"");
+            sb_docname(&b, f->db, snap->path);
+            sb_add(&b, "\"}");
+            f->q.name_order = 1;
+        }
+    } else {
+        bad = fs_list_json(&b, arg, f->db) < 0;
+    }
+    if (bad) { free(b.p); kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    char **slot = end ? &f->q.end : &f->q.start;
+    free(*slot);
+    *slot = sb_take(&b);
+    if (end) f->q.end_before = before; else f->q.start_before = before;
+    RET(obj);
+}
+B(fs_Q_startAt) { (void)env; return fs_cursor(self, ARG(0), 0, 1); }
+B(fs_Q_startAfter) { (void)env; return fs_cursor(self, ARG(0), 0, 0); }
+B(fs_Q_endBefore) { (void)env; return fs_cursor(self, ARG(0), 1, 1); }
+B(fs_Q_endAt) { (void)env; return fs_cursor(self, ARG(0), 1, 0); }
+B(fs_Q_get) {
+    (void)env;
+    fs_query *q = fs_q_of(self);
+    mvfs *f = fs_of(self, 0);
+    if (!q) RET(fs_failed_task(E_INVALID_ARGUMENT, "get() on something that is not a query"));
+    if (fs_enum_ord(ARG(0), EN_SOURCE) == 2)
+        RET(fs_failed_task(E_UNAVAILABLE, "Failed to get documents from cache: this runtime keeps no cache."));
+    void *task = fs_task_new(NULL);
+    fs_op *op = fs_op_new(OP_QUERY, f->db, task, self);
+    KLJ_LOG("Firestore: query \"%s\"%s", q->coll, q->group ? " (collection group)" : "");
+    fs_query_send(op, q, 0);
+    RET(task);
+}
+B(fs_Q_addSnapshotListener) {
+    (void)env;
+    fs_query *q = fs_q_of(self);
+    if (!q || !fs_of(ARG(2), FS_LISTENER)) RET(NULL);
+    void *reg = fs_reg_new(ARG(2), self, 1);
+    KLJ_LOG("Firestore: listen to a query on \"%s\" (delivered once, and after this client's writes to it)", q->coll);
+    fs_reg_fetch(reg);
+    RET(reg);
+}
+static int32_t fs_q_hash(fs_query *q) {
+    sb b = {0};
+    if (q) sb_query(&b, q);
+    int32_t h = fs_hash(b.p) ^ (q && q->coll ? fs_hash(q->coll) : 0);
+    free(b.p);
+    return h;
+}
+B(fs_Q_hashCode) { (void)env; (void)a; (void)n; RETJ(fs_q_hash(fs_q_of(self))); }
+B(fs_Q_count) {
+    (void)env; (void)a; (void)n;
+    fs_query *q = fs_q_of(self);
+    if (!q) RET(NULL);
+    mvfs *f;
+    void *obj = fs_new(C_AGGQ, FS_AGGQ, &f);
+    f->db = fs_of(self, 0)->db;
+    fs_q_copy(&f->q, q);
+    fs_hold_in(f, self);
+    f->o1 = self;
+    RET(obj);
+}
+B(fs_AggQ_get) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_AGGQ);
+    if (!f) RET(fs_failed_task(E_INVALID_ARGUMENT, "not an aggregate query"));
+    void *task = fs_task_new(NULL);
+    fs_op *op = fs_op_new(OP_COUNT, f->db, task, self);
+    fs_query_send(op, &f->q, 1);
+    RET(task);
+}
+B(fs_AggQ_getQuery) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_AGGQ); RET(f ? f->o1 : NULL); }
+B(fs_AggS_getCount) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_AGGS); RETJ(f ? f->a : 0); }
+B(fs_AggS_getQuery) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_AGGS); RET(f ? f->o1 : NULL); }
+B(fs_AggS_hashCode) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_AGGS);
+    mvfs *q = f ? fs_of(f->o1, FS_AGGQ) : NULL;
+    RETJ((q ? fs_q_hash(&q->q) : 0) * 31 + (int32_t)(f ? f->a : 0));
+}
+B(fs_AggS_createWithCount) {
+    (void)env; (void)self;
+    mvfs *f;
+    void *obj = fs_new(C_AGGS, FS_AGGS, &f);
+    f->a = n > 1 ? (int64_t)a[1].j : 0;
+    fs_hold_in(f, ARG(0));
+    f->o1 = ARG(0);
+    RET(obj);
+}
+
+// ---- snapshots
+B(fs_DS_getId) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_DSNAP); RET(kl_jni_new_string(f ? fs_last(f->path) : "")); }
+B(fs_DS_getReference) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_DSNAP); RET(f ? fs_ref(f->db, f->path, 1) : NULL); }
+B(fs_getMetadata) { (void)env; (void)self; (void)a; (void)n; RET(fs_meta()); }
+B(fs_DS_exists) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_DSNAP); RETJ(f && f->i); }
+B(fs_DS_getData) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_DSNAP); RET(f && f->i ? f->o1 : NULL); }
+static void *fs_DS_field(void *self, void *fp, int *found) {
+    mvfs *f = fs_of(self, FS_DSNAP), *p = fs_of(fp, FS_PATH);
+    *found = 0;
+    if (!f || !p || !f->i) return NULL;
+    if (p->i) { *found = 1; return kl_jni_new_string(fs_last(f->path)); }
+    char **segs = fs_path_segs(p);
+    void *v = fs_walk(f, segs, p->k, found);
+    free(segs);
+    return v;
+}
+B(fs_DS_contains) { (void)env; int found; fs_DS_field(self, ARG(0), &found); RETJ(found); }
+B(fs_DS_get) { (void)env; int found; RET(fs_DS_field(self, ARG(0), &found)); }
+B(fs_DS_hashCode) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_DSNAP); RETJ(f ? fs_hash(f->path) * 31 + f->i : 0); }
+B(fs_Meta_false) { (void)env; (void)self; (void)a; (void)n; RETJ(0); }
+B(fs_QS_getQuery) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_QSNAP); RET(f ? f->o1 : NULL); }
+B(fs_QS_getDocuments) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_QSNAP); RET(f ? f->o2 : NULL); }
+B(fs_QS_size) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_QSNAP); klj_list *l = f ? fs_list_of(f->o2) : NULL; RETJ(l ? l->count : 0); }
+B(fs_QS_hashCode) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_QSNAP);
+    klj_list *l = f ? fs_list_of(f->o2) : NULL;
+    int32_t h = f ? fs_q_hash(fs_q_of(f->o1)) : 0;
+    for (int i = 0; l && i < l->count; i++) { mvfs *d = fs_of(l->items[i], FS_DSNAP); h = h * 31 + (d ? fs_hash(d->path) : 0); }
+    RETJ(h);
+}
+// Every snapshot here is a first one: each document was ADDED, at its index.
+B(fs_QS_getDocumentChanges) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_QSNAP);
+    if (!f) RET(NULL);
+    pthread_mutex_lock(&fs_lock);
+    void *have = f->o3;
+    pthread_mutex_unlock(&fs_lock);
+    if (have) RET(have);
+    void *changes = fs_list_new();
+    klj_list *l = fs_list_of(f->o2);
+    for (int i = 0; l && i < l->count; i++) {
+        mvfs *c;
+        void *ch = fs_new(C_CHANGE, FS_CHANGE, &c);
+        fs_hold_in(c, l->items[i]);
+        c->o1 = l->items[i];
+        c->i = i;
+        fs_list_add(changes, ch);
+    }
+    pthread_mutex_lock(&fs_lock);
+    if (!f->o3) { fs_hold_in(f, changes); f->o3 = changes; }
+    void *r = f->o3;
+    pthread_mutex_unlock(&fs_lock);
+    if (r != changes) klj_release(changes);
+    RET(r);
+}
+B(fs_DC_getType) { (void)env; (void)self; (void)a; (void)n; RET(fs_enum(EN_CHANGE, 0)); }
+B(fs_DC_getDocument) { (void)env; (void)a; (void)n; mvfs *c = fs_of(self, FS_CHANGE); RET(c ? c->o1 : NULL); }
+B(fs_DC_getOldIndex) { (void)env; (void)self; (void)a; (void)n; RETJ(-1); }
+B(fs_DC_getNewIndex) { (void)env; (void)a; (void)n; mvfs *c = fs_of(self, FS_CHANGE); RETJ(c ? c->i : -1); }
+B(fs_DC_hashCode) {
+    (void)env; (void)a; (void)n;
+    mvfs *c = fs_of(self, FS_CHANGE);
+    mvfs *d = c ? fs_of(c->o1, FS_DSNAP) : NULL;
+    RETJ(d ? fs_hash(d->path) * 31 + c->i : 0);
+}
+
+// ---- enums and exceptions
+B(fs_Enum_ordinal) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_ENUM); RETJ(f ? f->a : 0); }
+B(fs_Enum_name) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_ENUM);
+    RET(f ? kl_jni_new_string(fs_enums[f->i].names[f->a]) : NULL);
+}
+B(fs_Code_fromValue) { (void)env; (void)self; int v = n > 0 ? (int)a[0].j : E_UNKNOWN; RET(fs_enum(EN_CODE, v >= 0 && v < E_N ? v : E_UNKNOWN)); }
+B(fs_Exc_init) {
+    (void)env; (void)self;
+    const char *m = ARG(0) ? klj_str(ARG(0)) : NULL;
+    int code = fs_enum_ord(ARG(1), EN_CODE);
+    RET(fs_exc(code < 0 ? E_UNKNOWN : code, m));
+}
+B(fs_Exc_getCode) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_EXC); RET(fs_enum(EN_CODE, f ? (int)f->a : E_UNKNOWN)); }
+
+// ---- tasks and their callbacks
+B(fs_CB_init) {
+    (void)env; (void)self;
+    void *task = ARG(0);
+    mvfs *c;
+    void *cb = fs_new(C_CB, FS_CB, &c);
+    c->a = n > 1 ? (int64_t)a[1].j : 0;
+    c->b = n > 2 ? (int64_t)a[2].j : 0;
+    mvfs *t = fs_of(task, FS_TASK);
+    if (!t) {
+        KLJ_LOG("JniResultCallback on a Task this runtime did not make (%s): it never completes", fs_cls(task));
+        RET(cb);
+    }
+    klj_hold(cb);   // the task's list
+    pthread_mutex_lock(&fs_lock);
+    t->cbs = realloc(t->cbs, (size_t)(t->ncbs + 1) * sizeof *t->cbs);
+    t->cbs[t->ncbs++] = cb;
+    int done = t->state != 0;
+    pthread_mutex_unlock(&fs_lock);
+    if (done) { klj_hold(task); kl_mv_ui_later(fs_task_deliver, task); }
+    RET(cb);
+}
+B(fs_CB_cancel) { (void)env; (void)a; (void)n; fs_cb_call(self, 3, NULL, NULL, NULL); return (klj_val){0}; }
+B(fs_Task_getResult) {
+    (void)env; (void)a; (void)n;
+    mvfs *t = fs_of(self, FS_TASK);
+    if (!t || t->state == 0) { kl_jni_throw("java/lang/IllegalStateException"); RET(NULL); }
+    if (t->state != 1) { kl_jni_throw("com/google/android/gms/tasks/RuntimeExecutionException"); RET(NULL); }
+    RET(t->o1);
+}
+B(fs_Task_getException) { (void)env; (void)a; (void)n; mvfs *t = fs_of(self, FS_TASK); RET(t && t->state == 2 ? t->o2 : NULL); }
+B(fs_Task_isComplete) { (void)env; (void)a; (void)n; mvfs *t = fs_of(self, FS_TASK); RETJ(t && t->state != 0); }
+B(fs_Task_isSuccessful) { (void)env; (void)a; (void)n; mvfs *t = fs_of(self, FS_TASK); RETJ(t && t->state == 1); }
+B(fs_Task_isCanceled) { (void)env; (void)a; (void)n; mvfs *t = fs_of(self, FS_TASK); RETJ(t && t->state == 3); }
+B(fs_Tasks_awaitCompletion) {
+    (void)env; (void)self; (void)n;
+    mvfs *t = fs_of(ARG(0), FS_TASK);
+    if (!t) return (klj_val){0};
+    pthread_mutex_lock(&fs_lock);
+    while (t->state == 0) pthread_cond_wait(&fs_cond, &fs_lock);
+    pthread_mutex_unlock(&fs_lock);
+    return (klj_val){0};
+}
+B(fs_Tasks_failWhenNull) {
+    (void)env; (void)self;
+    void *src = ARG(0);
+    mvfs *s = fs_of(src, FS_TASK);
+    void *dep = fs_task_new(NULL);
+    mvfs *d = fs_of(dep, FS_TASK);
+    d->s2 = fs_strdup(ARG(1) ? klj_str(ARG(1)) : NULL);
+    if (!s) { fs_task_fail(dep, E_INTERNAL, "not a task"); RET(dep); }
+    pthread_mutex_lock(&fs_lock);
+    int done = s->state != 0;
+    if (!done) {
+        klj_hold(dep);
+        s->deps = realloc(s->deps, (size_t)(s->ndeps + 1) * sizeof *s->deps);
+        s->deps[s->ndeps++] = dep;
+    }
+    pthread_mutex_unlock(&fs_lock);
+    if (done) fs_continue(dep, src);
+    RET(dep);
+}
+
+// ---- the C++ SDK's own helper classes
+B(fs_plain_init) { (void)env; (void)a; (void)n; RET(fs_new(fs_is_class_obj(self) ? klj_class_name(self) : fs_cls(self), FS_PLAIN, NULL)); }
+B(fs_Listener_init2) {   // Document/QueryEventListener(long firestore, long listener)
+    (void)env;
+    mvfs *l;
+    void *obj = fs_new(klj_class_name(self), FS_LISTENER, &l);
+    l->a = n > 0 ? (int64_t)a[0].j : 0;
+    l->b = n > 1 ? (int64_t)a[1].j : 0;
+    RET(obj);
+}
+B(fs_Listener_init1) {   // VoidEventListener(long listener)
+    (void)env;
+    mvfs *l;
+    void *obj = fs_new(klj_class_name(self), FS_LISTENER, &l);
+    l->a = 1;
+    l->b = n > 0 ? (int64_t)a[0].j : 0;
+    RET(obj);
+}
+B(fs_Listener_discard) {
+    (void)env; (void)a; (void)n;
+    mvfs *l = fs_of(self, FS_LISTENER);
+    if (l) { pthread_mutex_lock(&fs_lock); l->a = l->b = 0; pthread_mutex_unlock(&fs_lock); }
+    return (klj_val){0};
+}
+B(fs_Runnable_init) {
+    (void)env;
+    if (n < 1 || !a[0].j) { kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    mvfs *r;
+    void *obj = fs_new(C_CPP "JniRunnable", FS_RUNNABLE, &r);
+    r->a = (int64_t)a[0].j;
+    RET(obj);
+}
+B(fs_Runnable_detach) {
+    (void)env; (void)a; (void)n;
+    mvfs *r = fs_of(self, FS_RUNNABLE);
+    if (r) { pthread_mutex_lock(&fs_lock); r->a = 0; pthread_mutex_unlock(&fs_lock); }
+    return (klj_val){0};
+}
+typedef void (*fs_on_run_fn)(void *env, void *clazz, int64_t data);
+static void fs_runnable_run(void *task) {
+    mvfs *t = fs_of(task, FS_TASK);
+    mvfs *r = t ? fs_of(t->o3, FS_RUNNABLE) : NULL;
+    pthread_mutex_lock(&fs_lock);
+    int64_t data = r ? r->a : 0;
+    pthread_mutex_unlock(&fs_lock);
+    if (data) {
+        fs_on_run_fn fn = (fs_on_run_fn)kl_jni_native(C_CPP "JniRunnable", "nativeRun", "(J)V");
+        if (fn) fn(kl_jni_env(), kl_jni_class(C_CPP "JniRunnable"), data);
+    }
+    fs_task_finish(task, 1, NULL, NULL, NULL);
+    klj_release(task);
+}
+static void *fs_runnable_thread(void *task) { kl_jni_env(); fs_runnable_run(task); return NULL; }
+static klj_val fs_runnable_start(void *self, int new_thread) {
+    void *task = fs_task_new(NULL);
+    mvfs *t = fs_of(task, FS_TASK);
+    fs_hold_in(t, self);
+    t->o3 = self;
+    klj_hold(task);
+    pthread_t th;
+    if (new_thread && pthread_create(&th, NULL, fs_runnable_thread, task) == 0) pthread_detach(th);
+    else kl_mv_ui_later(fs_runnable_run, task);
+    RET(task);
+}
+B(fs_Runnable_runOnMainThread) { (void)env; (void)a; (void)n; return fs_runnable_start(self, 0); }
+B(fs_Runnable_runOnNewThread) { (void)env; (void)a; (void)n; return fs_runnable_start(self, 1); }
+// ObjectArena: the C++ SDK's id -> object map. An entry holds its object.
+typedef struct { int64_t id; void *obj; } fs_arena_e;
+static fs_arena_e *fs_arena;
+static size_t fs_arena_cap, fs_arena_n;
+static pthread_mutex_t fs_arena_lock = PTHREAD_MUTEX_INITIALIZER;
+static size_t fs_arena_slot(int64_t id) {   // linear probing; id 0 marks a free slot
+    size_t i = (size_t)((uint64_t)id * 0x9E3779B97F4A7C15ull >> 20) & (fs_arena_cap - 1);
+    while (fs_arena[i].id && fs_arena[i].id != id) i = (i + 1) & (fs_arena_cap - 1);
+    return i;
+}
+static void fs_arena_grow(void) {
+    size_t oc = fs_arena_cap;
+    fs_arena_e *old = fs_arena;
+    fs_arena_cap = oc ? oc * 2 : 1024;
+    fs_arena = calloc(fs_arena_cap, sizeof *fs_arena);
+    for (size_t i = 0; i < oc; i++)
+        if (old[i].id) fs_arena[fs_arena_slot(old[i].id)] = old[i];
+    free(old);
+}
+B(fs_Arena_set) {
+    (void)env; (void)self;
+    int64_t id = n > 0 ? (int64_t)a[0].j : 0;
+    void *obj = ARG(1), *old = NULL;
+    if (!id) return (klj_val){0};
+    if (obj) klj_hold(obj);
+    pthread_mutex_lock(&fs_arena_lock);
+    if ((fs_arena_n + 1) * 2 > fs_arena_cap) fs_arena_grow();
+    size_t s = fs_arena_slot(id);
+    if (fs_arena[s].id) old = fs_arena[s].obj; else fs_arena_n++;
+    fs_arena[s].id = id;
+    fs_arena[s].obj = obj;
+    pthread_mutex_unlock(&fs_arena_lock);
+    if (old) klj_release(old);
+    return (klj_val){0};
+}
+B(fs_Arena_get) {
+    (void)env; (void)self;
+    int64_t id = n > 0 ? (int64_t)a[0].j : 0;
+    void *obj = NULL;
+    pthread_mutex_lock(&fs_arena_lock);
+    if (id && fs_arena_cap) { size_t s = fs_arena_slot(id); if (fs_arena[s].id) obj = fs_arena[s].obj; }
+    pthread_mutex_unlock(&fs_arena_lock);
+    RET(obj);
+}
+B(fs_Arena_remove) {
+    (void)env; (void)self;
+    int64_t id = n > 0 ? (int64_t)a[0].j : 0;
+    void *obj = NULL;
+    pthread_mutex_lock(&fs_arena_lock);
+    if (id && fs_arena_cap) {
+        size_t s = fs_arena_slot(id);
+        if (fs_arena[s].id) {
+            obj = fs_arena[s].obj;
+            // backward-shift deletion keeps every probe chain intact
+            size_t i = s, j = s;
+            for (;;) {
+                j = (j + 1) & (fs_arena_cap - 1);
+                if (!fs_arena[j].id) break;
+                size_t k = (size_t)((uint64_t)fs_arena[j].id * 0x9E3779B97F4A7C15ull >> 20) & (fs_arena_cap - 1);
+                if ((j > i && (k <= i || k > j)) || (j < i && k <= i && k > j)) { fs_arena[i] = fs_arena[j]; i = j; }
+            }
+            fs_arena[i].id = 0;
+            fs_arena[i].obj = NULL;
+            fs_arena_n--;
+        }
+    }
+    pthread_mutex_unlock(&fs_arena_lock);
+    if (obj) klj_release(obj);
+    return (klj_val){0};
+}
+
+// ---- values
+B(fs_TS_init) {
+    (void)env; (void)self;
+    mvfs *f;
+    void *obj = fs_new(C_TS, FS_TS, &f);
+    f->a = n > 0 ? (int64_t)a[0].j : 0;
+    f->b = n > 1 ? (int32_t)a[1].j : 0;
+    RET(obj);
+}
+B(fs_TS_getSeconds) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_TS); RETJ(f ? f->a : 0); }
+B(fs_TS_getNanos) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_TS); RETJ(f ? f->b : 0); }
+B(fs_Geo_init) {
+    (void)env; (void)self;
+    mvfs *f;
+    void *obj = fs_new(C_GEO, FS_GEO, &f);
+    f->x = n > 0 ? a[0].d : 0;
+    f->y = n > 1 ? a[1].d : 0;
+    RET(obj);
+}
+B(fs_Geo_lat) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_GEO); return (klj_val){.d = f ? f->x : 0}; }
+B(fs_Geo_lng) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_GEO); return (klj_val){.d = f ? f->y : 0}; }
+B(fs_Blob_fromBytes) {
+    (void)env; (void)self;
+    klj_array *arr = fs_arr(ARG(0), 'B');
+    mvfs *f;
+    void *obj = fs_new(C_BLOB, FS_BLOB, &f);
+    f->nbytes = arr ? (size_t)arr->len : 0;
+    f->bytes = malloc(f->nbytes ? f->nbytes : 1);
+    if (f->nbytes) memcpy(f->bytes, arr->data, f->nbytes);
+    RET(obj);
+}
+B(fs_Blob_toBytes) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_BLOB);
+    void *arr = klj_new_array('B', NULL, f ? (int)f->nbytes : 0);
+    if (f && f->nbytes) memcpy(klj_arr(arr)->data, f->bytes, f->nbytes);
+    RET(arr);
+}
+B(fs_Double_init) { (void)env; (void)self; RET(fs_double(n > 0 ? a[0].d : 0)); }
+B(fs_Double_value) {
+    (void)env; (void)a; (void)n;
+    mvfs *f = fs_of(self, FS_DOUBLE);
+    if (f) return (klj_val){.d = f->x};
+    klj_object *o = klj_as_object(self);
+    klj_pref *e = o && o->destroy != fs_free ? o->data : NULL;   // a Float or Long box
+    return (klj_val){.d = !e ? 0 : e->kind == 'F' ? (double)e->fval : (double)e->ival};
+}
+B(fs_Path_of) {
+    (void)env; (void)self;
+    klj_array *arr = fs_arr(ARG(0), 'L');
+    int k = arr ? arr->len : 0;
+    char **segs = calloc((size_t)k + 1, sizeof *segs);
+    for (int i = 0; i < k; i++) {
+        const char *s = klj_str(((void **)arr->data)[i]);
+        if (!s || !*s) { free(segs); kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+        segs[i] = (char *)s;
+    }
+    if (!k) { free(segs); kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    void *p = fs_path_new(segs, k, 0);
+    free(segs);
+    RET(p);
+}
+B(fs_Path_documentId) {
+    (void)env; (void)self; (void)a; (void)n;
+    char *seg = "__name__";
+    RET(fs_path_new(&seg, 1, 1));
+}
+static void *fs_fv_new(int kind, const char *json) {
+    mvfs *f;
+    void *obj = fs_new(C_FV, FS_FV, &f);
+    f->i = kind;
+    f->s = fs_strdup(json);
+    return obj;
+}
+B(fs_FV_delete) { (void)env; (void)self; (void)a; (void)n; RET(fs_fv_new(1, NULL)); }
+B(fs_FV_serverTimestamp) { (void)env; (void)self; (void)a; (void)n; RET(fs_fv_new(2, NULL)); }
+B(fs_FV_incrementJ) {
+    (void)env; (void)self;
+    char t[64];
+    snprintf(t, sizeof t, "{\"integerValue\":\"%lld\"}", n > 0 ? (long long)a[0].j : 0LL);
+    RET(fs_fv_new(3, t));
+}
+B(fs_FV_incrementD) {
+    (void)env; (void)self;
+    sb b = {0};
+    void *d = fs_double(n > 0 ? a[0].d : 0);
+    fs_val_json(&b, d, NULL);
+    klj_release(d);
+    void *r = fs_fv_new(4, b.p);
+    free(b.p);
+    RET(r);
+}
+static klj_val fs_fv_array(void *arr, int kind) {
+    sb b = {0};
+    sb_put(&b, "", 0);
+    if (fs_list_json(&b, arr, NULL) < 0) { free(b.p); kl_jni_throw("java/lang/IllegalArgumentException"); RET(NULL); }
+    void *r = fs_fv_new(kind, b.p);
+    free(b.p);
+    RET(r);
+}
+B(fs_FV_arrayUnion) { (void)env; (void)self; return fs_fv_array(ARG(0), 5); }
+B(fs_FV_arrayRemove) { (void)env; (void)self; return fs_fv_array(ARG(0), 6); }
+static void *fs_setopt(int kind, const char *mask) {
+    mvfs *f;
+    void *obj = fs_new(C_SETOPT, FS_SETOPT, &f);
+    f->i = kind;
+    f->s = fs_strdup(mask);
+    return obj;
+}
+static void *fs_setopt_overwrite(void) {
+    static void *o;
+    pthread_mutex_lock(&fs_lock);
+    if (!o) { o = fs_setopt(0, NULL); kl_jni_pin_object(o); }
+    pthread_mutex_unlock(&fs_lock);
+    return o;
+}
+B(fs_SetOpt_merge) {
+    (void)env; (void)self; (void)a; (void)n;
+    static void *o;
+    pthread_mutex_lock(&fs_lock);
+    if (!o) { o = fs_setopt(1, NULL); kl_jni_pin_object(o); }
+    pthread_mutex_unlock(&fs_lock);
+    RET(o);
+}
+B(fs_SetOpt_mergeFieldPaths) {
+    (void)env; (void)self;
+    klj_list *l = fs_list_of(ARG(0));
+    sb b = {0};
+    sb_put(&b, "", 0);
+    for (int i = 0; l && i < l->count; i++) {
+        mvfs *p = fs_of(l->items[i], FS_PATH);
+        if (!p) continue;
+        if (b.n) sb_put(&b, ",", 1);
+        sb_jstr(&b, p->s);
+    }
+    void *r = fs_setopt(2, b.p);
+    free(b.p);
+    RET(r);
+}
+
+// ---- write batches
+static void fs_batch_add(void *self, char *write, const char *path) {
+    mvfs *b = fs_of(self, FS_BATCH);
+    if (!b) { free(write); return; }
+    if (!write) { b->i = 1; return; }   // fails at commit, as invalid data
+    fs_append(&b->s, ",", write);
+    fs_append(&b->s2, "\n", path);
+    b->k++;
+    free(write);
+}
+static mvfs *fs_doc_arg(void *obj) { return fs_of(obj, FS_DOC); }
+B(fs_Batch_set) {
+    (void)env;
+    mvfs *b = fs_of(self, FS_BATCH), *d = fs_doc_arg(ARG(0));
+    if (!b || !d) { if (b) b->i = 1; RET(self); }
+    fs_batch_add(self, fs_set_write(b->db, d->path, ARG(1), ARG(2)), d->path);
+    RET(self);
+}
+B(fs_Batch_updateMap) {
+    (void)env;
+    mvfs *b = fs_of(self, FS_BATCH), *d = fs_doc_arg(ARG(0));
+    if (!b || !d) { if (b) b->i = 1; RET(self); }
+    fs_batch_add(self, fs_update_map_write(b->db, d->path, ARG(1)), d->path);
+    RET(self);
+}
+B(fs_Batch_updatePairs) {
+    (void)env;
+    mvfs *b = fs_of(self, FS_BATCH), *d = fs_doc_arg(ARG(0));
+    if (!b || !d) { if (b) b->i = 1; RET(self); }
+    fs_batch_add(self, fs_update_pairs_write(b->db, d->path, ARG(1), ARG(2), ARG(3)), d->path);
+    RET(self);
+}
+B(fs_Batch_delete) {
+    (void)env;
+    mvfs *b = fs_of(self, FS_BATCH), *d = fs_doc_arg(ARG(0));
+    if (!b || !d) { if (b) b->i = 1; RET(self); }
+    fs_batch_add(self, fs_delete_write(b->db, d->path), d->path);
+    RET(self);
+}
+B(fs_Batch_commit) {
+    (void)env; (void)a; (void)n;
+    mvfs *b = fs_of(self, FS_BATCH);
+    if (!b || b->i) RET(fs_failed_task(E_INVALID_ARGUMENT, "Invalid data in a write batch."));
+    if (!b->k) RET(fs_done_task(NULL));
+    KLJ_LOG("Firestore: commit a batch of %d write%s", b->k, b->k == 1 ? "" : "s");
+    RET(fs_commit(b->db, b->s, b->s2, NULL));
+}
+B(fs_TxOB_init) { (void)env; (void)self; (void)a; (void)n; mvfs *f; void *o = fs_new(C_TXOB, FS_TXO, &f); f->a = 5; RET(o); }
+B(fs_TxOB_setMax) { (void)env; mvfs *f = fs_of(self, FS_TXO); if (f && n > 0) f->a = (int32_t)a[0].j; RET(self); }
+B(fs_TxOB_build) {
+    (void)env; (void)a; (void)n;
+    mvfs *b = fs_of(self, FS_TXO), *f;
+    void *o = fs_new(C_TXO, FS_TXO, &f);
+    f->a = b ? b->a : 5;
+    RET(o);
+}
+B(fs_TxO_getMax) { (void)env; (void)a; (void)n; mvfs *f = fs_of(self, FS_TXO); RETJ(f ? f->a : 5); }
+
+// ---- java.util, as the SDK drives it
+B(fs_List_init) { (void)env; (void)self; (void)a; (void)n; RET(fs_list_new()); }
+B(fs_List_add) {
+    (void)env;
+    klj_object *o = klj_as_object(self);
+    if (!o || o->destroy != fs_list_free) { KLJ_LOG("Collection.add on a %s: not a list this runtime can grow", fs_cls(self)); RETJ(0); }
+    fs_list_add(self, ARG(0));
+    RETJ(1);
+}
+B(fs_List_set) {
+    (void)env;
+    klj_object *o = klj_as_object(self);
+    int i = n > 0 ? (int)a[0].j : -1;
+    if (!o || o->destroy != fs_list_free) RET(NULL);
+    klj_list *l = o->data;
+    if (i < 0 || i >= l->count) { kl_jni_throw("java/lang/IndexOutOfBoundsException"); RET(NULL); }
+    void *old = l->items[i];
+    if (ARG(1)) klj_hold(ARG(1));
+    l->items[i] = ARG(1);
+    if (old) klj_release(old);
+    RET(NULL);   // the old element is no longer held here
+}
+B(fs_Coll_size) { (void)env; (void)a; (void)n; klj_list *l = fs_list_of(self); RETJ(l ? l->count : 0); }
+B(fs_Coll_iterator) {
+    (void)env; (void)a; (void)n;
+    if (!fs_list_of(self)) { KLJ_LOG("Collection.iterator on a %s: not a list", fs_cls(self)); RET(NULL); }
+    // java/util/List's own iterator, which reads the same klj_list (an
+    // ArrayList reaches it through its superclass edge; step 146 also makes
+    // the iterator's next() answer the elements themselves)
+    return klj_call_binding(self, "iterator", "()Ljava/util/Iterator;", NULL, 0);
+}
+B(fs_HashMap_entrySet) {
+    (void)env; (void)self; (void)a; (void)n;
+    KLJ_LOG("HashMap.entrySet: not implemented for a HashMap -> null");
+    RET(NULL);
+}
+B(fs_Map_get) { (void)env; RET(mv_is_hashmap(self) ? mv_hashmap_get(self, ARG(0)) : NULL); }
+B(fs_Map_put) {
+    (void)env;
+    if (!mv_is_hashmap(self)) { KLJ_LOG("Map.put on a %s: not a map this runtime can write", fs_cls(self)); RET(NULL); }
+    mv_hashmap_put(self, ARG(0), ARG(1));
+    RET(NULL);   // the replaced value (if any) is no longer held here
+}
+B(fs_Map_remove) { (void)env; if (mv_is_hashmap(self)) mv_hashmap_remove(self, ARG(0)); RET(NULL); }
+B(fs_Map_keySet) {   // a snapshot of the keys, as a list (the SDK only iterates it)
+    (void)env; (void)a; (void)n;
+    void *list = fs_list_new();
+    void *k, *v;
+    for (unsigned i = 0; mv_is_hashmap(self) && mv_hashmap_at(self, i, &k, &v) > 0; i++) fs_list_add(list, k);
+    RET(list);
+}
+// Object.equals: identity, or equal value for strings, boxes and this file's values.
+B(fs_Object_equals) {
+    (void)env;
+    void *other = ARG(0);
+    if (self == other) RETJ(1);
+    klj_object *x = klj_as_object(self), *y = klj_as_object(other);
+    if (!x || !y || strcmp(x->cls, y->cls)) RETJ(0);
+    if (!strcmp(x->cls, KLJ_CLASS_STRING)) RETJ(x->data && y->data && !strcmp(x->data, y->data));
+    static const char *const boxes[] = {"java/lang/Boolean", "java/lang/Integer", "java/lang/Long",
+                                        "java/lang/Float", "java/lang/Short", "java/lang/Byte", NULL};
+    int box = 0;
+    for (int i = 0; boxes[i]; i++) if (!strcmp(x->cls, boxes[i])) box = 1;
+    if (box && x->data && y->data) {
+        klj_pref *p = x->data, *q = y->data;   // the runtime's boxes
+        RETJ(p->kind == q->kind && p->ival == q->ival && p->fval == q->fval);
+    }
+    mvfs *f = fs_of(self, 0), *g = fs_of(other, 0);
+    if (!f || !g || f->kind != g->kind) RETJ(0);
+    switch (f->kind) {
+    case FS_DOC: case FS_COLL: RETJ(f->db == g->db && !strcmp(f->path, g->path));
+    case FS_TS: RETJ(f->a == g->a && f->b == g->b);
+    case FS_DOUBLE: RETJ(f->x == g->x || (isnan(f->x) && isnan(g->x)));
+    case FS_GEO: RETJ(f->x == g->x && f->y == g->y);
+    case FS_BLOB: RETJ(f->nbytes == g->nbytes && !memcmp(f->bytes, g->bytes, f->nbytes));
+    case FS_PATH: RETJ(!strcmp(f->s, g->s));
+    case FS_QUERY: RETJ(f->db == g->db && fs_q_hash(&f->q) == fs_q_hash(&g->q));
+    default: RETJ(0);
+    }
+}
+
+#undef B
+#define FB(cls, name, sig, fn) {cls, name, sig, fn}
+const klj_binding klj_bind_firestore[] = {
+    // FirebaseFirestore
+    FB(C_FF, "getInstance", "(Lcom/google/firebase/FirebaseApp;Ljava/lang/String;)L" C_FF ";", fs_FF_getInstance),
+    FB(C_FF, "setLoggingEnabled", "(Z)V", fs_noop),
+    FB(C_FF, "setClientLanguage", "(Ljava/lang/String;)V", fs_noop),
+    FB(C_FF, "collection", "(Ljava/lang/String;)L" C_COLL ";", fs_FF_collection),
+    FB(C_FF, "document", "(Ljava/lang/String;)L" C_DOC ";", fs_FF_document),
+    FB(C_FF, "collectionGroup", "(Ljava/lang/String;)L" C_QUERY ";", fs_FF_collectionGroup),
+    FB(C_FF, "getFirestoreSettings", "()L" C_SET ";", fs_FF_getSettings),
+    FB(C_FF, "setFirestoreSettings", "(L" C_SET ";)V", fs_FF_setSettings),
+    FB(C_FF, "batch", "()L" C_BATCH ";", fs_FF_batch),
+    FB(C_FF, "runTransaction", "(L" C_TXO ";L" FS_PKG "Transaction$Function;)" SIG_TASK, fs_FF_runTransaction),
+    FB(C_FF, "enableNetwork", "()" SIG_TASK, fs_FF_enableNetwork),
+    FB(C_FF, "disableNetwork", "()" SIG_TASK, fs_FF_disableNetwork),
+    FB(C_FF, "terminate", "()" SIG_TASK, fs_ok_task),
+    FB(C_FF, "waitForPendingWrites", "()" SIG_TASK, fs_ok_task),
+    FB(C_FF, "clearPersistence", "()" SIG_TASK, fs_ok_task),
+    FB(C_FF, "addSnapshotsInSyncListener", "(Ljava/util/concurrent/Executor;Ljava/lang/Runnable;)L" C_REG ";", fs_FF_addSnapshotsInSyncListener),
+    FB(C_FF, "getNamedQuery", "(Ljava/lang/String;)" SIG_TASK, fs_FF_getNamedQuery),
+    FB(C_FF, "loadBundle", "([B)L" C_LBT ";", fs_FF_loadBundle),
+    FB(C_LBT, "addOnProgressListener", "(Ljava/util/concurrent/Executor;L" FS_PKG "OnProgressListener;)L" C_LBT ";", fs_self),
+    // settings
+    FB(C_SET, "getHost", "()Ljava/lang/String;", fs_Set_getHost),
+    FB(C_SET, "isSslEnabled", "()Z", fs_Set_isSsl),
+    FB(C_SET, "isPersistenceEnabled", "()Z", fs_Set_isPersist),
+    FB(C_SET, "getCacheSizeBytes", "()J", fs_Set_getCache),
+    FB(C_SETB, "<init>", "()V", fs_SetB_init),
+    FB(C_SETB, "setHost", "(Ljava/lang/String;)L" C_SETB ";", fs_SetB_setHost),
+    FB(C_SETB, "setSslEnabled", "(Z)L" C_SETB ";", fs_SetB_setSsl),
+    FB(C_SETB, "setPersistenceEnabled", "(Z)L" C_SETB ";", fs_SetB_setPersist),
+    FB(C_SETB, "setCacheSizeBytes", "(J)L" C_SETB ";", fs_SetB_setCache),
+    FB(C_SETB, "build", "()L" C_SET ";", fs_SetB_build),
+    // references
+    FB(C_COLL, "getId", "()Ljava/lang/String;", fs_Ref_getId),
+    FB(C_COLL, "getPath", "()Ljava/lang/String;", fs_Ref_getPath),
+    FB(C_COLL, "getParent", "()L" C_DOC ";", fs_Coll_getParent),
+    FB(C_COLL, "document", "()L" C_DOC ";", fs_Coll_documentAuto),
+    FB(C_COLL, "document", "(Ljava/lang/String;)L" C_DOC ";", fs_Coll_document),
+    FB(C_COLL, "add", "(Ljava/lang/Object;)" SIG_TASK, fs_Coll_add),
+    FB(C_DOC, "getFirestore", "()L" C_FF ";", fs_Ref_getFirestore),
+    FB(C_DOC, "getId", "()Ljava/lang/String;", fs_Ref_getId),
+    FB(C_DOC, "getPath", "()Ljava/lang/String;", fs_Ref_getPath),
+    FB(C_DOC, "getParent", "()L" C_COLL ";", fs_Doc_getParent),
+    FB(C_DOC, "collection", "(Ljava/lang/String;)L" C_COLL ";", fs_Doc_collection),
+    FB(C_DOC, "get", "(L" FS_PKG "Source;)" SIG_TASK, fs_Doc_get),
+    FB(C_DOC, "set", "(Ljava/lang/Object;L" C_SETOPT ";)" SIG_TASK, fs_Doc_set),
+    FB(C_DOC, "update", "(Ljava/util/Map;)" SIG_TASK, fs_Doc_updateMap),
+    FB(C_DOC, "update", "(L" C_PATH ";Ljava/lang/Object;[Ljava/lang/Object;)" SIG_TASK, fs_Doc_updatePairs),
+    FB(C_DOC, "delete", "()" SIG_TASK, fs_Doc_delete),
+    FB(C_DOC, "addSnapshotListener", "(Ljava/util/concurrent/Executor;L" FS_PKG "MetadataChanges;L" FS_PKG "EventListener;)L" C_REG ";", fs_Doc_addSnapshotListener),
+    FB(C_REG, "remove", "()V", fs_Reg_remove),
+    // queries (a CollectionReference is one too)
+    FB(C_QUERY, "count", "()L" C_AGGQ ";", fs_Q_count),
+    FB(C_QUERY, "whereEqualTo", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereEqualTo),
+    FB(C_QUERY, "whereNotEqualTo", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereNotEqualTo),
+    FB(C_QUERY, "whereLessThan", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereLessThan),
+    FB(C_QUERY, "whereLessThanOrEqualTo", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereLessThanOrEqualTo),
+    FB(C_QUERY, "whereGreaterThan", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereGreaterThan),
+    FB(C_QUERY, "whereGreaterThanOrEqualTo", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereGreaterThanOrEqualTo),
+    FB(C_QUERY, "whereArrayContains", "(L" C_PATH ";Ljava/lang/Object;)L" C_QUERY ";", fs_Q_whereArrayContains),
+    FB(C_QUERY, "whereArrayContainsAny", "(L" C_PATH ";Ljava/util/List;)L" C_QUERY ";", fs_Q_whereArrayContainsAny),
+    FB(C_QUERY, "whereIn", "(L" C_PATH ";Ljava/util/List;)L" C_QUERY ";", fs_Q_whereIn),
+    FB(C_QUERY, "whereNotIn", "(L" C_PATH ";Ljava/util/List;)L" C_QUERY ";", fs_Q_whereNotIn),
+    FB(C_QUERY, "orderBy", "(L" C_PATH ";L" FS_PKG "Query$Direction;)L" C_QUERY ";", fs_Q_orderBy),
+    FB(C_QUERY, "limit", "(J)L" C_QUERY ";", fs_Q_limit),
+    FB(C_QUERY, "limitToLast", "(J)L" C_QUERY ";", fs_Q_limitToLast),
+    FB(C_QUERY, "startAt", "(L" C_DSNAP ";)L" C_QUERY ";", fs_Q_startAt),
+    FB(C_QUERY, "startAt", "([Ljava/lang/Object;)L" C_QUERY ";", fs_Q_startAt),
+    FB(C_QUERY, "startAfter", "(L" C_DSNAP ";)L" C_QUERY ";", fs_Q_startAfter),
+    FB(C_QUERY, "startAfter", "([Ljava/lang/Object;)L" C_QUERY ";", fs_Q_startAfter),
+    FB(C_QUERY, "endBefore", "(L" C_DSNAP ";)L" C_QUERY ";", fs_Q_endBefore),
+    FB(C_QUERY, "endBefore", "([Ljava/lang/Object;)L" C_QUERY ";", fs_Q_endBefore),
+    FB(C_QUERY, "endAt", "(L" C_DSNAP ";)L" C_QUERY ";", fs_Q_endAt),
+    FB(C_QUERY, "endAt", "([Ljava/lang/Object;)L" C_QUERY ";", fs_Q_endAt),
+    FB(C_QUERY, "get", "(L" FS_PKG "Source;)" SIG_TASK, fs_Q_get),
+    FB(C_QUERY, "addSnapshotListener", "(Ljava/util/concurrent/Executor;L" FS_PKG "MetadataChanges;L" FS_PKG "EventListener;)L" C_REG ";", fs_Q_addSnapshotListener),
+    FB(C_QUERY, "hashCode", "()I", fs_Q_hashCode),
+    FB(C_AGGQ, "get", "(L" FS_PKG "AggregateSource;)" SIG_TASK, fs_AggQ_get),
+    FB(C_AGGQ, "getQuery", "()L" C_QUERY ";", fs_AggQ_getQuery),
+    FB(C_AGGQ, "hashCode", "()I", fs_Q_hashCode),
+    FB(C_AGGS, "getCount", "()J", fs_AggS_getCount),
+    FB(C_AGGS, "getQuery", "()L" C_AGGQ ";", fs_AggS_getQuery),
+    FB(C_AGGS, "hashCode", "()I", fs_AggS_hashCode),
+    FB(C_AGGS, "createWithCount", "(L" C_AGGQ ";J)L" C_AGGS ";", fs_AggS_createWithCount),
+    // snapshots
+    FB(C_DSNAP, "getId", "()Ljava/lang/String;", fs_DS_getId),
+    FB(C_DSNAP, "getReference", "()L" C_DOC ";", fs_DS_getReference),
+    FB(C_DSNAP, "getMetadata", "()L" C_META ";", fs_getMetadata),
+    FB(C_DSNAP, "exists", "()Z", fs_DS_exists),
+    FB(C_DSNAP, "getData", "(L" FS_PKG "DocumentSnapshot$ServerTimestampBehavior;)Ljava/util/Map;", fs_DS_getData),
+    FB(C_DSNAP, "contains", "(L" C_PATH ";)Z", fs_DS_contains),
+    FB(C_DSNAP, "get", "(L" C_PATH ";L" FS_PKG "DocumentSnapshot$ServerTimestampBehavior;)Ljava/lang/Object;", fs_DS_get),
+    FB(C_DSNAP, "hashCode", "()I", fs_DS_hashCode),
+    FB(C_META, "hasPendingWrites", "()Z", fs_Meta_false),
+    FB(C_META, "isFromCache", "()Z", fs_Meta_false),
+    FB(C_QSNAP, "getQuery", "()L" C_QUERY ";", fs_QS_getQuery),
+    FB(C_QSNAP, "getMetadata", "()L" C_META ";", fs_getMetadata),
+    FB(C_QSNAP, "getDocumentChanges", "(L" FS_PKG "MetadataChanges;)Ljava/util/List;", fs_QS_getDocumentChanges),
+    FB(C_QSNAP, "getDocuments", "()Ljava/util/List;", fs_QS_getDocuments),
+    FB(C_QSNAP, "size", "()I", fs_QS_size),
+    FB(C_QSNAP, "hashCode", "()I", fs_QS_hashCode),
+    FB(C_CHANGE, "getType", "()L" FS_PKG "DocumentChange$Type;", fs_DC_getType),
+    FB(C_CHANGE, "getDocument", "()L" C_QDSNAP ";", fs_DC_getDocument),
+    FB(C_CHANGE, "getOldIndex", "()I", fs_DC_getOldIndex),
+    FB(C_CHANGE, "getNewIndex", "()I", fs_DC_getNewIndex),
+    FB(C_CHANGE, "hashCode", "()I", fs_DC_hashCode),
+    // enums, exceptions
+    FB(FS_PKG "DocumentChange$Type", "ordinal", "()I", fs_Enum_ordinal),
+    FB("java/lang/Enum", "ordinal", "()I", fs_Enum_ordinal),
+    FB("java/lang/Enum", "name", "()Ljava/lang/String;", fs_Enum_name),
+    FB("java/lang/Enum", "equals", "(Ljava/lang/Object;)Z", fs_Object_equals),
+    FB(C_CODE, "value", "()I", fs_Enum_ordinal),
+    FB(C_CODE, "fromValue", "(I)L" C_CODE ";", fs_Code_fromValue),
+    FB(C_EXC, "<init>", "(Ljava/lang/String;L" C_CODE ";)V", fs_Exc_init),
+    FB(C_EXC, "getCode", "()L" C_CODE ";", fs_Exc_getCode),
+    // tasks
+    FB(C_CB, "<init>", "(" SIG_TASK "JJ)V", fs_CB_init),
+    FB(C_CB, "cancel", "()V", fs_CB_cancel),
+    FB(C_TASK, "getResult", "()Ljava/lang/Object;", fs_Task_getResult),
+    FB(C_TASK, "getException", "()Ljava/lang/Exception;", fs_Task_getException),
+    FB(C_TASK, "isComplete", "()Z", fs_Task_isComplete),
+    FB(C_TASK, "isSuccessful", "()Z", fs_Task_isSuccessful),
+    FB(C_TASK, "isCanceled", "()Z", fs_Task_isCanceled),
+    FB(C_CPP "FirestoreTasks", "awaitCompletion", "(" SIG_TASK ")V", fs_Tasks_awaitCompletion),
+    FB(C_CPP "FirestoreTasks", "failTaskWhenResultIsNull", "(" SIG_TASK "Ljava/lang/String;)" SIG_TASK, fs_Tasks_failWhenNull),
+    // the C++ SDK's helper classes
+    FB(C_CPP "ObjectArena", "set", "(JLjava/lang/Object;)V", fs_Arena_set),
+    FB(C_CPP "ObjectArena", "get", "(J)Ljava/lang/Object;", fs_Arena_get),
+    FB(C_CPP "ObjectArena", "remove", "(J)V", fs_Arena_remove),
+    FB(C_CPP "SilentRejectionSingleThreadExecutor", "<init>", "()V", fs_plain_init),
+    FB(C_CPP "SilentRejectionSingleThreadExecutor", "shutdown", "()V", fs_noop),
+    FB(C_CPP "DocumentEventListener", "<init>", "(JJ)V", fs_Listener_init2),
+    FB(C_CPP "QueryEventListener", "<init>", "(JJ)V", fs_Listener_init2),
+    FB(C_CPP "VoidEventListener", "<init>", "(J)V", fs_Listener_init1),
+    FB(C_CPP "CppEventListener", "discardPointers", "()V", fs_Listener_discard),
+    FB(C_CPP "JniRunnable", "<init>", "(J)V", fs_Runnable_init),
+    FB(C_CPP "JniRunnable", "detach", "()V", fs_Runnable_detach),
+    FB(C_CPP "JniRunnable", "runOnMainThread", "()" SIG_TASK, fs_Runnable_runOnMainThread),
+    FB(C_CPP "JniRunnable", "runOnNewThread", "()" SIG_TASK, fs_Runnable_runOnNewThread),
+    // values
+    FB(C_TS, "<init>", "(JI)V", fs_TS_init),
+    FB(C_TS, "getSeconds", "()J", fs_TS_getSeconds),
+    FB(C_TS, "getNanoseconds", "()I", fs_TS_getNanos),
+    FB(C_GEO, "<init>", "(DD)V", fs_Geo_init),
+    FB(C_GEO, "getLatitude", "()D", fs_Geo_lat),
+    FB(C_GEO, "getLongitude", "()D", fs_Geo_lng),
+    FB(C_BLOB, "fromBytes", "([B)L" C_BLOB ";", fs_Blob_fromBytes),
+    FB(C_BLOB, "toBytes", "()[B", fs_Blob_toBytes),
+    FB(C_DOUBLE, "<init>", "(D)V", fs_Double_init),
+    FB(C_DOUBLE, "doubleValue", "()D", fs_Double_value),
+    FB(C_PATH, "of", "([Ljava/lang/String;)L" C_PATH ";", fs_Path_of),
+    FB(C_PATH, "documentId", "()L" C_PATH ";", fs_Path_documentId),
+    FB(C_FV, "delete", "()L" C_FV ";", fs_FV_delete),
+    FB(C_FV, "serverTimestamp", "()L" C_FV ";", fs_FV_serverTimestamp),
+    FB(C_FV, "increment", "(J)L" C_FV ";", fs_FV_incrementJ),
+    FB(C_FV, "increment", "(D)L" C_FV ";", fs_FV_incrementD),
+    FB(C_FV, "arrayUnion", "([Ljava/lang/Object;)L" C_FV ";", fs_FV_arrayUnion),
+    FB(C_FV, "arrayRemove", "([Ljava/lang/Object;)L" C_FV ";", fs_FV_arrayRemove),
+    FB(C_SETOPT, "merge", "()L" C_SETOPT ";", fs_SetOpt_merge),
+    FB(C_SETOPT, "mergeFieldPaths", "(Ljava/util/List;)L" C_SETOPT ";", fs_SetOpt_mergeFieldPaths),
+    // write batches, transaction options
+    FB(C_BATCH, "set", "(L" C_DOC ";Ljava/lang/Object;L" C_SETOPT ";)L" C_BATCH ";", fs_Batch_set),
+    FB(C_BATCH, "update", "(L" C_DOC ";Ljava/util/Map;)L" C_BATCH ";", fs_Batch_updateMap),
+    FB(C_BATCH, "update", "(L" C_DOC ";L" C_PATH ";Ljava/lang/Object;[Ljava/lang/Object;)L" C_BATCH ";", fs_Batch_updatePairs),
+    FB(C_BATCH, "delete", "(L" C_DOC ";)L" C_BATCH ";", fs_Batch_delete),
+    FB(C_BATCH, "commit", "()" SIG_TASK, fs_Batch_commit),
+    FB(C_TXOB, "<init>", "()V", fs_TxOB_init),
+    FB(C_TXOB, "setMaxAttempts", "(I)L" C_TXOB ";", fs_TxOB_setMax),
+    FB(C_TXOB, "build", "()L" C_TXO ";", fs_TxOB_build),
+    FB(C_TXO, "getMaxAttempts", "()I", fs_TxO_getMax),
+    // java.util and java.lang, as the SDK drives them
+    FB(C_LIST, "<init>", "()V", fs_List_init),
+    FB(C_LIST, "<init>", "(I)V", fs_List_init),
+    FB(C_LIST, "add", "(Ljava/lang/Object;)Z", fs_List_add),
+    FB("java/util/Collection", "add", "(Ljava/lang/Object;)Z", fs_List_add),
+    FB("java/util/Collection", "size", "()I", fs_Coll_size),
+    FB("java/util/Collection", "iterator", "()Ljava/util/Iterator;", fs_Coll_iterator),
+    FB("java/lang/Iterable", "iterator", "()Ljava/util/Iterator;", fs_Coll_iterator),
+    FB("java/util/List", "set", "(ILjava/lang/Object;)Ljava/lang/Object;", fs_List_set),
+    FB("java/util/Map", "get", "(Ljava/lang/Object;)Ljava/lang/Object;", fs_Map_get),
+    FB("java/util/Map", "put", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", fs_Map_put),
+    FB("java/util/Map", "remove", "(Ljava/lang/Object;)Ljava/lang/Object;", fs_Map_remove),
+    FB("java/util/Map", "keySet", "()Ljava/util/Set;", fs_Map_keySet),
+    FB("java/util/HashMap", "entrySet", "()Ljava/util/Set;", fs_HashMap_entrySet),
+    FB("java/lang/Object", "equals", "(Ljava/lang/Object;)Z", fs_Object_equals),
+    {NULL, NULL, NULL, NULL},
+};
+'''
+if not os.path.exists(p) or open(p).read() != src:
+    open(p, "w").write(src)
+print("overlay: Firestore's Java side on the REST API (runtime/jni/kl_jni_firestore.c)")
+PYEOF
+
+# 146 — step 145's file joins the runtime, and what its Java needs of the
+# runtime's own surface:
+#  - references are held. An object array keeps what SetObjectArrayElement
+#    (or NewObjectArray's initial element) stored in it, a HashMap what put
+#    stored, and a host object of step 145 what it keeps; each lets go when it
+#    is itself retired (DeleteLocalRef, PopLocalFrame), not before. Until now a
+#    container kept a bare pointer, so a guest that built a String[] or a map
+#    of fresh strings and deleted its local references (correct JNI, and what
+#    the Firebase C++ SDK does for every FieldPath and map key) left the
+#    container holding retired objects: "expected a java/lang/String, got an
+#    untagged pointer". klj_hold / klj_release are the C NewGlobalRef /
+#    DeleteGlobalRef, the release retiring an object no one holds any more.
+#  - `new HashMap()` made no map: NewObject hands a constructor its jclass, and
+#    HashMap.<init> stored the map's payload in the class object and returned
+#    the class, so every HashMap was one object and the interned class lost its
+#    name. It now builds a fresh map, whose payload is freed with it.
+#  - HashMap is a java.util.Map and ArrayList a java.util.List to IsInstanceOf
+#    and to binding resolution (the C++ SDK tells a Firestore map or array
+#    value apart with IsInstanceOf(Map) / IsInstanceOf(List)); HashMap.entrySet
+#    keeps answering null (step 145) rather than the preferences map's.
+#  - a list's Iterator.next answers the element; it wrapped every element in a
+#    Map.Entry, which only a preferences map's entry set means.
+#  - Throwable.getMessage on a FirebaseFirestoreException is its message.
+#  - the enum constants and SetOptions.OVERWRITE of Firestore's classes are
+#    static fields with a host value.
+#  - the file is in RUNTIME_JNI and its binding table in the list resolution
+#    walks.
+python3 - "$K/runtime/jni/kl_jni_int.h" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: references are held (step 146)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s, "    void  *data;    // void** when kind=='L', else a raw buffer\n} klj_array;\n",
+        "    void  *data;    // void** when kind=='L', else a raw buffer\n"
+        "    unsigned char *held;   // " + marker + ": element i is held when held[i]\n"
+        "} klj_array;\n")
+    s = sub(s, "extern const klj_binding *const klj_binding_tables[];\n",
+        "extern const klj_binding klj_bind_firestore[];   // metavision: Firestore's Java side (step 146)\n"
+        "extern const klj_binding *const klj_binding_tables[];\n"
+        "// " + marker + ": the C NewGlobalRef / DeleteGlobalRef. A release that\n"
+        "// leaves no holder retires the object (an object nobody held is retired).\n"
+        "void klj_hold(void *obj);\n"
+        "void klj_release(void *obj);\n"
+        "void klj_release_locked(void *obj);   // caller holds g_lock\n")
+    open(p, "w").write(s)
+print("overlay: kl_jni_int.h: an array's held elements; klj_hold / klj_release")
+PYEOF
+
+python3 - "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: references are held (step 146)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    # retiring an object lets go of what it held
+    s = sub(s,
+        "    o->magic = 0;\n"
+        "    g_retired[g_retired_tail] = (unsigned)(o - g_objects);\n"
+        "    g_retired_tail = (g_retired_tail + 1) % KLJ_MAX_OBJECTS;\n"
+        "    g_retired_n++;\n"
+        "}\n",
+        "    o->magic = 0;\n"
+        "    g_retired[g_retired_tail] = (unsigned)(o - g_objects);\n"
+        "    g_retired_tail = (g_retired_tail + 1) % KLJ_MAX_OBJECTS;\n"
+        "    g_retired_n++;\n"
+        "    klj_drop_holds_locked(o);   // " + marker + "\n"
+        "}\n"
+        "\n"
+        "// " + marker + "\n"
+        "void klj_release_locked(void *obj) {\n"
+        "    klj_object *o = klj_as_object(obj);\n"
+        "    if (!o) return;\n"
+        "    if (o->pinned) o->pinned--;\n"
+        "    if (!o->pinned) klj_retire_object_locked(o);\n"
+        "}\n"
+        "void klj_hold(void *obj) {\n"
+        "    pthread_mutex_lock(&g_lock);\n"
+        "    klj_object *o = klj_as_object(obj);\n"
+        "    if (o) o->pinned++;\n"
+        "    pthread_mutex_unlock(&g_lock);\n"
+        "}\n"
+        "void klj_release(void *obj) {\n"
+        "    pthread_mutex_lock(&g_lock);\n"
+        "    klj_release_locked(obj);\n"
+        "    pthread_mutex_unlock(&g_lock);\n"
+        "}\n")
+    s = sub(s,
+        "// Caller holds g_lock. Pinned objects, class objects, and non-objects are\n"
+        "// left alone.\n",
+        "// " + marker + ": what a retired object held is let go — an object\n"
+        "// array's stored elements, a HashMap's entries, a Firestore host object's\n"
+        "// references. (Its magic is already gone, so this reads the struct directly.)\n"
+        "void mv_fs_retire_locked(klj_object *o);\n"
+        "void mv_hashmap_retire_locked(klj_object *o);\n"
+        "static void klj_drop_holds_locked(klj_object *o) {\n"
+        "    if (o->cls && o->cls[0] == '[' && o->data) {\n"
+        "        klj_array *arr = o->data;\n"
+        "        for (int i = 0; arr->held && arr->kind == 'L' && i < arr->len; i++)\n"
+        "            if (arr->held[i]) { arr->held[i] = 0; klj_release_locked(((void **)arr->data)[i]); }\n"
+        "    }\n"
+        "    mv_fs_retire_locked(o);\n"
+        "    mv_hashmap_retire_locked(o);\n"
+        "}\n"
+        "\n"
+        "// Caller holds g_lock. Pinned objects, class objects, and non-objects are\n"
+        "// left alone.\n")
+    s = sub(s,
+        "    klj_array *arr = p;\n"
+        "    if (!arr) return;\n"
+        "    free(arr->data);\n"
+        "    free(arr);\n",
+        "    klj_array *arr = p;\n"
+        "    if (!arr) return;\n"
+        "    free(arr->data);\n"
+        "    free(arr->held);   // " + marker + "\n"
+        "    free(arr);\n")
+    s = sub(s,
+        "    void      *obj = klj_new_array('L', klj_class_name(elemClass), len);\n"
+        "    klj_array *arr = klj_arr(obj);\n"
+        "    if (init)\n"
+        "        for (int i = 0; i < arr->len; i++) ((void **)arr->data)[i] = init;\n"
+        "    return obj;\n",
+        "    void      *obj = klj_new_array('L', klj_class_name(elemClass), len);\n"
+        "    klj_array *arr = klj_arr(obj);\n"
+        "    if (init && klj_as_object(init) && arr->len > 0) {   // " + marker + "\n"
+        "        arr->held = calloc((size_t)arr->len, 1);\n"
+        "        for (int i = 0; i < arr->len; i++) { ((void **)arr->data)[i] = init; arr->held[i] = 1; klj_hold(init); }\n"
+        "    } else if (init)\n"
+        "        for (int i = 0; i < arr->len; i++) ((void **)arr->data)[i] = init;\n"
+        "    return obj;\n")
+    s = sub(s,
+        "    klj_array *arr = klj_arr(a);\n"
+        "    if (!arr || arr->kind != 'L' || i < 0 || i >= arr->len) return;\n"
+        "    ((void **)arr->data)[i] = v;\n"
+        "}\n",
+        "    klj_array *arr = klj_arr(a);\n"
+        "    if (!arr || arr->kind != 'L' || i < 0 || i >= arr->len) return;\n"
+        "    // " + marker + ": the array holds what is stored in it\n"
+        "    void *old = ((void **)arr->data)[i];\n"
+        "    int had = arr->held && arr->held[i];\n"
+        "    if (v && klj_as_object(v)) {\n"
+        "        if (!arr->held) arr->held = calloc((size_t)arr->len, 1);\n"
+        "        klj_hold(v);\n"
+        "        arr->held[i] = 1;\n"
+        "    } else if (arr->held) arr->held[i] = 0;\n"
+        "    ((void **)arr->data)[i] = v;\n"
+        "    if (had && old) klj_release(old);\n"
+        "}\n")
+    # HashMap is a Map, ArrayList a List
+    s = sub(s,
+        "    {\"java/security/cert/X509Certificate\",     \"java/security/cert/Certificate\"},\n",
+        "    {\"java/security/cert/X509Certificate\",     \"java/security/cert/Certificate\"},\n"
+        "    // " + marker + ": the collections the Firebase C++ SDK builds and\n"
+        "    // tells apart with IsInstanceOf(java/util/Map) / (java/util/List)\n"
+        "    {\"java/util/HashMap\",                      \"java/util/Map\"},\n"
+        "    {\"java/util/ArrayList\",                    \"java/util/List\"},\n")
+    # Firestore's static constants
+    s = sub(s,
+        "    KLJ_LOG(\"no host value for field %s.%s %s\", w->cls, w->name, w->sig);\n",
+        "    {   // " + marker + ": Firestore's enum constants and SetOptions.OVERWRITE\n"
+        "        int mv_fs_static_field(const char *cls, const char *name, klj_val *out);\n"
+        "        klj_val mv_v;\n"
+        "        if (want == 'L' && mv_fs_static_field(w->cls, w->name, &mv_v)) return mv_v;\n"
+        "    }\n"
+        "    KLJ_LOG(\"no host value for field %s.%s %s\", w->cls, w->name, w->sig);\n")
+    # the binding table
+    s = sub(s,
+        "    NULL,\n"
+        "};\n"
+        "\n"
+        "// ---------------------------------------------------------------- JavaVM impl\n",
+        "    klj_bind_firestore,   // metavision: Firestore's Java side (step 146)\n"
+        "    NULL,\n"
+        "};\n"
+        "\n"
+        "// ---------------------------------------------------------------- JavaVM impl\n")
+    open(p, "w").write(s)
+print("overlay: kl_jni.c: arrays hold their elements, retiring lets go; HashMap/ArrayList edges; Firestore's constants and table")
+PYEOF
+
+python3 - "$K/runtime/jni/kl_jni_android.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: references are held (step 146)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "    const char *sa = a ? klj_str(a) : NULL, *sb = b ? klj_str(b) : NULL;\n",
+        "    // " + marker + ": only two strings compare by content (klj_str logs\n"
+        "    // every other key, and an object-keyed map looks one up per call)\n"
+        "    klj_object *oa = klj_as_object(a), *ob = klj_as_object(b);\n"
+        "    const char *sa = oa && strcmp(oa->cls, KLJ_CLASS_STRING) == 0 ? oa->data : NULL;\n"
+        "    const char *sb = ob && strcmp(ob->cls, KLJ_CLASS_STRING) == 0 ? ob->data : NULL;\n")
+    s = sub(s,
+        "static klj_val klj_HashMap_init(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)a; (void)n;\n"
+        "    if (self) klj_as_object(self)->data = calloc(1, sizeof(klj_map));\n"
+        "    return (klj_val){.l = self};\n"
+        "}\n",
+        "// " + marker + ": a map holds its keys and values (until it is retired),\n"
+        "// and NewObject hands <init> the jclass: the map is a new object, never the class.\n"
+        "static void klj_map_free(void *p) {\n"
+        "    klj_map *m = p;\n"
+        "    if (!m) return;\n"
+        "    free(m->e);\n"
+        "    free(m);\n"
+        "}\n"
+        "static klj_val klj_HashMap_init(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)a; (void)n;\n"
+        "    klj_object *so = klj_as_object(self);\n"
+        "    if (so && strcmp(so->cls, KLJ_CLASS_CLASS) == 0) self = kl_jni_new_object(klj_class_name(self));\n"
+        "    klj_object *o = klj_as_object(self);\n"
+        "    if (o && !o->data) { o->data = calloc(1, sizeof(klj_map)); o->destroy = klj_map_free; }\n"
+        "    return (klj_val){.l = self};\n"
+        "}\n")
+    s = sub(s,
+        "    for (unsigned i = 0; i < m->n; i++)\n"
+        "        if (klj_map_key_eq(m->e[i].k, a[0].l)) {\n"
+        "            void *old = m->e[i].v; m->e[i].v = a[1].l;\n"
+        "            return (klj_val){.l = old};\n"
+        "        }\n"
+        "    if (m->n == m->cap) {\n"
+        "        m->cap = m->cap ? m->cap * 2 : 8;\n"
+        "        m->e = realloc(m->e, m->cap * sizeof *m->e);\n"
+        "    }\n"
+        "    m->e[m->n].k = a[0].l; m->e[m->n].v = a[1].l; m->n++;\n"
+        "    return (klj_val){.l = NULL};\n",
+        "    for (unsigned i = 0; i < m->n; i++)\n"
+        "        if (klj_map_key_eq(m->e[i].k, a[0].l)) {\n"
+        "            void *old = m->e[i].v; m->e[i].v = a[1].l;\n"
+        "            if (a[1].l) klj_hold(a[1].l);   // " + marker + "\n"
+        "            if (old) klj_release(old);      // no longer held here: not handed back\n"
+        "            return (klj_val){.l = NULL};\n"
+        "        }\n"
+        "    if (m->n == m->cap) {\n"
+        "        m->cap = m->cap ? m->cap * 2 : 8;\n"
+        "        m->e = realloc(m->e, m->cap * sizeof *m->e);\n"
+        "    }\n"
+        "    m->e[m->n].k = a[0].l; m->e[m->n].v = a[1].l; m->n++;\n"
+        "    if (a[0].l) klj_hold(a[0].l);   // " + marker + "\n"
+        "    if (a[1].l) klj_hold(a[1].l);\n"
+        "    return (klj_val){.l = NULL};\n")
+    s = sub(s,
+        "static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {\n",
+        "// " + marker + ": the HashMap as the host's own code reaches it (step 145).\n"
+        "int mv_is_hashmap(void *obj) {\n"
+        "    klj_object *o = klj_as_object(obj);\n"
+        "    return o && o->destroy == klj_map_free && o->data;\n"
+        "}\n"
+        "void *mv_hashmap_new(void) {\n"
+        "    void *obj = kl_jni_new_object(\"java/util/HashMap\");\n"
+        "    klj_HashMap_init(NULL, obj, NULL, 0);\n"
+        "    return obj;\n"
+        "}\n"
+        "void mv_hashmap_put(void *map, void *k, void *v) {\n"
+        "    if (!mv_is_hashmap(map)) return;\n"
+        "    klj_val args[2] = {{.l = k}, {.l = v}};\n"
+        "    klj_HashMap_put(NULL, map, args, 2);\n"
+        "}\n"
+        "void *mv_hashmap_get(void *map, void *k) {\n"
+        "    if (!mv_is_hashmap(map)) return NULL;\n"
+        "    klj_val arg = {.l = k};\n"
+        "    return klj_HashMap_get(NULL, map, &arg, 1).l;\n"
+        "}\n"
+        "void *mv_hashmap_get_utf(void *map, const char *key, int *found) {\n"
+        "    klj_map *m = mv_is_hashmap(map) ? klj_map_of(map) : NULL;\n"
+        "    *found = 0;\n"
+        "    for (unsigned i = 0; m && key && i < m->n; i++) {\n"
+        "        klj_object *ko = klj_as_object(m->e[i].k);\n"
+        "        if (ko && strcmp(ko->cls, KLJ_CLASS_STRING) == 0 && ko->data && !strcmp(ko->data, key)) {\n"
+        "            *found = 1;\n"
+        "            return m->e[i].v;\n"
+        "        }\n"
+        "    }\n"
+        "    return NULL;\n"
+        "}\n"
+        "void mv_hashmap_remove(void *map, void *k) {\n"
+        "    klj_map *m = mv_is_hashmap(map) ? klj_map_of(map) : NULL;\n"
+        "    for (unsigned i = 0; m && i < m->n; i++)\n"
+        "        if (klj_map_key_eq(m->e[i].k, k)) {\n"
+        "            void *ok = m->e[i].k, *ov = m->e[i].v;\n"
+        "            memmove(&m->e[i], &m->e[i + 1], (m->n - i - 1) * sizeof *m->e);\n"
+        "            m->n--;\n"
+        "            if (ok) klj_release(ok);\n"
+        "            if (ov) klj_release(ov);\n"
+        "            return;\n"
+        "        }\n"
+        "}\n"
+        "int mv_hashmap_at(void *map, unsigned i, void **k, void **v) {   // 1, or 0 past the end\n"
+        "    klj_map *m = mv_is_hashmap(map) ? klj_map_of(map) : NULL;\n"
+        "    if (!m || i >= m->n) return 0;\n"
+        "    *k = m->e[i].k;\n"
+        "    *v = m->e[i].v;\n"
+        "    return 1;\n"
+        "}\n"
+        "void mv_hashmap_retire_locked(klj_object *o) {   // g_lock held; o is already retired\n"
+        "    if (!o || o->destroy != klj_map_free || !o->data) return;\n"
+        "    klj_map *m = o->data;\n"
+        "    unsigned n = m->n;\n"
+        "    m->n = 0;\n"
+        "    for (unsigned i = 0; i < n; i++) {\n"
+        "        if (m->e[i].k) klj_release_locked(m->e[i].k);\n"
+        "        if (m->e[i].v) klj_release_locked(m->e[i].v);\n"
+        "    }\n"
+        "}\n"
+        "static klj_val klj_HashMap_size(void *env, void *self, const klj_val *a, int n) {\n")
+    s = sub(s,
+        "static klj_val mv_Object_toString(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)a; (void)n;\n"
+        "    klj_object *o = klj_as_object(self);\n",
+        "void *mv_fs_message(void *obj);   // metavision: a FirebaseFirestoreException's message (step 146)\n"
+        "static klj_val mv_Object_toString(void *env, void *self, const klj_val *a, int n) {\n"
+        "    (void)env; (void)a; (void)n;\n"
+        "    { void *mv_m = mv_fs_message(self); if (mv_m) return (klj_val){.l = mv_m}; }\n"
+        "    klj_object *o = klj_as_object(self);\n")
+    open(p, "w").write(s)
+print("overlay: HashMap: a new map per new HashMap(), entries held; the host's own map access")
+PYEOF
+
+python3 - "$K/runtime/jni/kl_jni_prefs.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a list's iterator answers its elements (step 146)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "    if (!it || it->pos >= klj_iter_len(it)) return (klj_val){.l = NULL};\n"
+        "    void *obj = kl_jni_new_object(\"java/util/Map$Entry\");\n",
+        "    if (!it || it->pos >= klj_iter_len(it)) return (klj_val){.l = NULL};\n"
+        "    if (!it->is_set) return (klj_val){.l = klj_iter_at(it, it->pos++)};   // " + marker + "\n"
+        "    void *obj = kl_jni_new_object(\"java/util/Map$Entry\");\n")
+    open(p, "w").write(s)
+print("overlay: a list's Iterator.next answers the element")
+PYEOF
+
+python3 - "$K/Makefile" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if "runtime/jni/kl_jni_firestore.c" not in s:
+    s = sub(s, "\nRUNTIME_SHIP := ",
+        "\nRUNTIME_JNI += runtime/jni/kl_jni_firestore.c   # metavision: Firestore's Java side (step 146)\n"
+        "RUNTIME_SHIP := ")
+    open(p, "w").write(s)
+print("overlay: Makefile RUNTIME_JNI += runtime/jni/kl_jni_firestore.c")
+PYEOF
+
+# 147 — the network request step 145 makes: klepton-overlay/MetavisionNet.swift
+# defines mv_net_fetch on URLSession (an ephemeral session: no cookies, no disk
+# cache, no waiting for connectivity, so offline fails at once as on a headset)
+# over the runtime's weak default, which fails every request as offline. Copied
+# into visionos/Sources and listed in the Xcode project's Swift sources.
+cp "$ROOT/klepton-overlay/MetavisionNet.swift" "$K/visionos/Sources/"
+python3 - "$K/visionos/gen_xcodeproj.py" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if '"MetavisionNet.swift"' not in s:
+    s = sub(s, '"MetavisionTargets.swift"]', '"MetavisionTargets.swift", "MetavisionNet.swift"]')
+    open(p, "w").write(s)
+print("overlay: MetavisionNet.swift (mv_net_fetch on URLSession) is in the app")
+PYEOF
