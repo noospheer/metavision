@@ -7254,6 +7254,24 @@ if marker not in s:
         "                        x_->lab[0] ? x_->lab : x_->go);                                     \\\n"
         "            }                                                                              \\\n"
         "            mvd[di_].unsafe_ = 1; nskip++;                                                 \\\n")
+    # A press can open a menu with a Quit in it: look again 0.6 s later, for
+    # guarding only, rather than wait for the next press's scan.
+    s = sub(s,
+        "    if (bound) mv_release(now, t0, 0);          // every frame: a release is due _HOLD_MS after its press\n"
+        "    if (now < next) return;\n"
+        "    next = now + every;\n",
+        "    if (bound) mv_release(now, t0, 0);          // every frame: a release is due _HOLD_MS after its press\n"
+        "    static double guard_at;                     // " + marker + "\n"
+        "    int guard_only = now < next;\n"
+        "    if (guard_only && !(guard_at && now >= guard_at)) return;\n"
+        "    guard_at = 0;\n"
+        "    if (!guard_only) next = now + every;\n")
+    s = sub(s, "    #undef ADD\n",
+        "    #undef ADD\n"
+        "    if (guard_only) return;                     // a look for new leaving controls only\n")
+    s = sub(s, "    mv_coverage(t);\n}\n\nvoid kl_mprobe_tick",
+        "    guard_at = now + 0.6;                       // " + marker + "\n"
+        "    mv_coverage(t);\n}\n\nvoid kl_mprobe_tick")
     open(p, "w").write(s)
 print("overlay: auto-play guards controls that leave the title")
 PYEOF
