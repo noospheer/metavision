@@ -39,6 +39,11 @@ PLAY = re.compile(r"\[mv-autoplay\] (t=\S+ step \d+: .*)")
 # The presser (overlay step 66): elements pressed / found, by family.
 COVER = re.compile(r"\[mv-autoplay-ui\] coverage (\d+)/(\d+) \(([^)]*)\)")
 PRESSER_ON = "[mv-autoplay-ui] on"
+# Why it is not on (overlay step 120), and when it can list only Unity UI.
+PRESSER_OFF = re.compile(r"\[mv-autoplay-ui\] off: ([^\n]*)")
+PRESSER_NOSCAN = "[mv-autoplay-ui] no scene search"
+AUTOPLAY_T = re.compile(r"\[mv-autoplay\] t=([\d.]+)s")
+PRESSER_FROM = 10          # MV_AUTOPLAY_UI_FROM's default: the presser's first look, in seconds
 UNITY_E = re.compile(r"^E/Unity: (.*)", re.M)
 QUIT = re.compile(r"^\[guest\] the title quit:", re.M)
 HANDS = "[mv-hands] the title reads hand state"
@@ -343,7 +348,10 @@ def triage(d: Path):
         notes.append("mode cycle reached " + " > ".join(["auto (start)"] + cyc))
     if cov := coverage(text):
         n, m, detail = cov
-        notes.append(f"UI coverage {n}/{'?' if m is None else m}" + (f" ({detail})" if detail else ""))
+        notes.append(f"UI coverage {n}/{'?' if m is None else m}" + (f" ({detail})" if detail else "")
+                     + ("; no scene search, Unity UI only" if PRESSER_NOSCAN in text else ""))
+    elif why := presser_absent(text):
+        notes.append(f"UI coverage none, presser {why[0]}: {why[1]}")
     plays = PLAY.findall(text)
     if plays:
         notes.append(f"auto-play reached {plays[-1]}")
@@ -389,6 +397,29 @@ def coverage(text: str):
     pressed = set(re.findall(r"\[mv-autoplay-ui\] t=\S+ pressed '([^']*)' \(\S+ go=(\S+)", text))
     return (len(pressed), None, "pre-step-66 log: found count not logged") if pressed else \
            (0, 0, "nothing selectable found")
+
+
+def presser_absent(text: str):
+    """Why a run has no coverage line, as (kind, detail): "off" (the presser
+    ran and switched itself off), "not reached" (the run ended before its
+    first look), "not attached" (not a Unity IL2CPP title, or auto-play off)
+    or "silent" (none of these: it never reported). None when it reported."""
+    if coverage(text):
+        return None
+    if m := PRESSER_OFF.search(text):
+        return "off", m.group(1).strip()
+    if "libUE4" in text:
+        return "not attached", "an Unreal title (the presser is for Unity IL2CPP)"
+    if "libunity" not in text:
+        return "not attached", "not a Unity title"
+    if "libil2cpp" not in text:
+        return "not attached", "a Unity title without IL2CPP"
+    if "[mv-autoplay] on" not in text:
+        return "not attached", "auto-play was off"
+    end = max((float(t) for t in AUTOPLAY_T.findall(text)), default=0.0)
+    if end < PRESSER_FROM:
+        return "not reached", f"the run ended at {end:.0f} s, before the presser's first look ({PRESSER_FROM} s)"
+    return "silent", "the presser never reported"
 
 
 def healthy_so_far(text: str, shipped=None, expect_sound=True):
@@ -516,14 +547,20 @@ def main():
         print(f"{label:{w}}  {v['verdict'].upper():8} {v['summary']}")
         for n in notes:
             print(f"{'':{w}}  {'':8} {n}")
-    covs = [c for _, d in rows_under(base) if (b := d / "klepton-boot.log").is_file()
-            and (c := coverage(b.read_text(errors="replace")))]
-    if covs:
+    texts = [b.read_text(errors="replace") for _, d in rows_under(base) if (b := d / "klepton-boot.log").is_file()]
+    covs = [c for t in texts if (c := coverage(t))]
+    absent = [a for t in texts if (a := presser_absent(t))]
+    if covs or absent:
         known = sum(c[1] for c in covs if c[1] is not None)
+        kinds = {}
+        for k, _ in absent:
+            kinds[k] = kinds.get(k, 0) + 1
         print(f"\nUI coverage: {sum(c[0] for c in covs)}/{known}{'+?' if any(c[1] is None for c in covs) else ''} "
               f"elements pressed; "
-              f"{sum(1 for c in covs if c[0])}/{len(covs)} runs pressed something, "
-              f"{sum(1 for c in covs if c[1] == 0)} found nothing selectable")
+              f"{sum(1 for c in covs if c[0])}/{len(covs)} attached runs pressed something, "
+              f"{sum(1 for c in covs if c[1] == 0)} found nothing selectable"
+              + (f"; {len(absent)} runs without the presser ("
+                 + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + ")" if absent else ""))
     counts = {}
     for _, v, _ in rows:
         counts[v["verdict"]] = counts.get(v["verdict"], 0) + 1

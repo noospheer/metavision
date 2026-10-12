@@ -11623,3 +11623,405 @@ static klj_val mv_MP14_frame_into_texture(klj_media *m, uint32_t tex) {
     open(p, "w").write(s)
 print("overlay: MediaPlayer14.getVideoLastFrame writes the frame into the guest's GLES texture")
 PYEOF
+
+# 120 — the presser attaches in every IL2CPP title it can, and says so when it
+# cannot. A build with managed code stripping keeps only the FindObjects
+# overloads its own scripts call: in nine titles neither FindObjectsOfType(Type)
+# nor FindObjectsByType(Type, SortMode) was left (only the three-argument
+# FindObjectsByType and FindObjectsOfType(Type, bool)), so step 66 switched the
+# whole presser off ("off: no FindObjectsOfType") and the run printed no
+# coverage at all. Those overloads are used now; a build that kept none still
+# presses Unity UI (Selectable's own list needs no search) and says "no scene
+# search". Every other way the presser stays off is logged as
+# "[mv-autoplay-ui] off: <why>", so triage can tell "not attached" from
+# "nothing found", and each scan that changes logs how many active behaviours
+# it saw. Also: three more families, filled by steps 121-123 (pointable, call,
+# touch; on by default in MV_AUTOPLAY_UI_FAMILIES), and the class name joins
+# the leaving-words check for them.
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the presser attaches wherever it can, and says why not (step 120)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "metavision: every selectable, every framework (step 66)" not in s:
+        sys.exit("overlay: step 120 needs step 66")
+    s = sub(s, "enum { MVF_UI, MVF_ISDK, MVF_XRI, MVF_CLICK, MVF_EVENT, MVF_N };\n",
+        "// " + marker + ": pointable, call and touch are steps 121-123\n"
+        "enum { MVF_UI, MVF_ISDK, MVF_XRI, MVF_CLICK, MVF_EVENT, MVF_PTR, MVF_CALL, MVF_TOUCH, MVF_N };\n")
+    s = sub(s, 'static const char *const mvf_name[MVF_N] = { "ui", "isdk", "xri", "click", "event" };\n',
+        'static const char *const mvf_name[MVF_N] = { "ui", "isdk", "xri", "click", "event", "pointable", "call", "touch" };\n')
+    s = sub(s, "enum { KF_IW = 1, KF_PW = 2, KF_XRI = 4, KF_CLICK = 8, KF_EVENT = 16, KF_TRIG = 32, KF_SEL = 64 };\n",
+        "enum { KF_IW = 1, KF_PW = 2, KF_XRI = 4, KF_CLICK = 8, KF_EVENT = 16, KF_TRIG = 32, KF_SEL = 64,\n"
+        "       KF_PTR = 128, KF_CALL = 256 };   // step 120\n")
+    s = sub(s, "typedef struct { Il2CppClass *k; uint8_t f, nev; uint16_t off[4]; char ev[4][32]; } mv_kinfo;\n",
+        "typedef struct { Il2CppClass *k; uint16_t f; uint8_t nev; uint16_t off[4]; char ev[4][32];\n"
+        "                 const MethodInfo *pm; } mv_kinfo;   // pm: the call family's method (step 122)\n")
+    s = sub(s, "    char d[200]; size_t o = 0;\n", "    char d[320]; size_t o = 0;\n")
+    s = sub(s, "#define MV_CAND 192\n", "#define MV_CAND 384   // step 120: room for the touch family's many volumes\n")
+    # The overloads a stripped build keeps.
+    s = sub(s, "static Il2CppObject *mv_find(Il2CppObject *type) {   // active objects of a type; by instance ID where Unity can\n",
+        "static const MethodInfo *m_by3, *m_find2;   // " + marker + "\n"
+        "static int mv_noscan;                       // no FindObjects overload at all: Unity UI only\n"
+        "static Il2CppObject *mv_find(Il2CppObject *type) {   // active objects of a type; by instance ID where Unity can\n")
+    s = sub(s, '    return m_by ? invoke(m_by, a2, "FindObjectsByType") : invoke(m_find, a1, "FindObjectsOfType");\n}\n',
+        '    if (!m_by && !m_find) {   // step 120: a stripped build keeps only the overloads its own scripts call\n'
+        '        int32_t excl = 0; uint8_t no = 0;   // FindObjectsInactive.Exclude; includeInactive: false\n'
+        '        void *a3[3] = { type, &excl, &by_id }, *b2[2] = { type, &no };\n'
+        '        return m_by3 ? invoke(m_by3, a3, "FindObjectsByType/3") :\n'
+        '               m_find2 ? invoke(m_find2, b2, "FindObjectsOfType/2") : NULL;\n'
+        '    }\n'
+        '    return m_by ? invoke(m_by, a2, "FindObjectsByType") : invoke(m_find, a1, "FindObjectsOfType");\n}\n')
+    s = sub(s, "    if (!mvx.parent || !mvx.ns) return 0;\n",
+        "    if (!mvx.parent || !mvx.ns) {   // " + marker + "\n"
+        "        fprintf(stderr, \"[mv-autoplay-ui] off: libil2cpp lacks il2cpp_class_get_parent or _get_namespace\\n\");\n"
+        "        return 0;\n"
+        "    }\n")
+    s = sub(s, '    if (!m_find && !m_by) { fprintf(stderr, "[mv-autoplay-ui] off: no FindObjectsOfType\\n"); return 0; }\n',
+        '    // ' + marker + ': other overloads, or none; with none, Unity UI\'s own list still works\n'
+        '    m_by3 = mv_m1(obj, "FindObjectsByType", 3); m_find2 = mv_m1(obj, "FindObjectsOfType", 2);\n'
+        '    mv_noscan = !m_find && !m_by && !m_by3 && !m_find2;\n'
+        '    if (mv_noscan)\n'
+        '        fprintf(stderr, "[mv-autoplay-ui] no scene search: the build stripped every FindObjects overload; "\n'
+        '                "Unity UI only\\n");\n')
+    s = sub(s, '    const char *fs = kl_env_str("MV_AUTOPLAY_UI_FAMILIES", "ui,isdk,xri,click,event");\n',
+        '    const char *fs = kl_env_str("MV_AUTOPLAY_UI_FAMILIES", "ui,isdk,xri,click,event,pointable,call,touch");   // step 120\n')
+    s = sub(s, '            k_click && k_ped ? "y" : "-", k_ue && t_mb ? "y" : "-", m_by ? "FindObjectsByType" : "FindObjectsOfType");\n',
+        '            k_click && k_ped ? "y" : "-", k_ue && t_mb ? "y" : "-",\n'
+        '            m_by ? "FindObjectsByType" : m_find ? "FindObjectsOfType" : m_by3 ? "FindObjectsByType/3" :\n'
+        '            m_find2 ? "FindObjectsOfType/2" : "no scene search");   // step 120\n')
+    s = sub(s, "    if (!mprobe_init()) { on = 0; return; }\n"
+               "    if (!bound) { bound = 1; if (!mv_press_bind()) { on = 0; return; } }\n",
+        "    if (!mprobe_init()) {   // " + marker + "\n"
+        "        fprintf(stderr, \"[mv-autoplay-ui] off: IL2CPP not reachable (no libil2cpp.so image, or no embedding API)\\n\");\n"
+        "        on = 0; return;\n"
+        "    }\n"
+        "    if (!bound) { bound = 1; if (!mv_press_bind()) { on = 0; return; } }\n")
+    s = sub(s, "        if (mv_unsafe(x_->lab) || mv_unsafe(x_->go)) {                                     \\\n",
+        "        if (mv_unsafe(x_->lab) || mv_unsafe(x_->go) ||                                     \\\n"
+        "            ((fam_) >= MVF_PTR && mv_unsafe(x_->kind))) {   /* step 120: a class name */   \\\n")
+    s = sub(s, "    if (guard_only) return;                     // a look for new leaving controls only\n"
+               "    mv_trig_seen = trig;\n",
+        "    if (guard_only) return;                     // a look for new leaving controls only\n"
+        "    mv_trig_seen = trig;\n"
+        "    {   // " + marker + ": what the scan saw, whenever that changes\n"
+        "        static unsigned l_nm = ~0u, l_f[3] = { ~0u, ~0u, ~0u };\n"
+        "        if (nm != l_nm || found[MVF_PTR] != l_f[0] || found[MVF_CALL] != l_f[1] || found[MVF_TOUCH] != l_f[2]) {\n"
+        "            l_nm = nm; l_f[0] = found[MVF_PTR]; l_f[1] = found[MVF_CALL]; l_f[2] = found[MVF_TOUCH];\n"
+        "            fprintf(stderr, \"[mv-autoplay-ui] scan at %.1fs: %u active behaviours%s; pointable %u, call %u, touch %u found\\n\",\n"
+        "                    now - t0, nm, mv_noscan ? \" (no scene search: Unity UI only)\" : \"\",\n"
+        "                    found[MVF_PTR], found[MVF_CALL], found[MVF_TOUCH]);\n"
+        "        }\n"
+        "    }\n")
+    open(p, "w").write(s)
+print("overlay: the presser attaches through any FindObjects overload left, and logs why when it is off")
+PYEOF
+
+# 121 — the presser touches trigger volumes with a hand. A title's own script
+# with OnTriggerEnter (or OnTriggerStay) and nothing else to press was only
+# counted ("trigger-only"): menu items, level buttons, poke targets and
+# zones that react to a hand or finger entering them. The touch family now
+# calls them the way physics would when a hand enters: OnTriggerEnter and
+# OnTriggerStay with the scene's own hand collider, OnTriggerExit _HOLD_MS
+# later. The hand is the enabled collider whose name, or an ancestor's (six
+# up), reads most like a fingertip, then a hand or controller, then the
+# player; one under a tracked rig (TrackingSpace, a camera rig, an XR origin,
+# a ...Rig) first; never one named like a receiver (volume, trigger, zone,
+# slot, target...) within two levels; with a rigidbody preferred (a trigger
+# fires only with one). Without such a collider, touch elements are found
+# but not pressed.
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the touch family, a hand into a trigger (step 121)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "(step 120)" not in s:
+        sys.exit("overlay: step 121 needs step 120")
+    s = sub(s, '        if (!e->f && k_trig && il.class_get_method_from_name(k, "OnTriggerEnter", 1)) e->f = KF_TRIG;   // counted, not pressed\n',
+        '        if (!e->f && k_trig && (il.class_get_method_from_name(k, "OnTriggerEnter", 1) ||\n'
+        '                                il.class_get_method_from_name(k, "OnTriggerStay", 1)))\n'
+        '            e->f = KF_TRIG;   // pressed by the touch family (step 121)\n')
+    code = r'''// metavision: the touch family, a hand into a trigger (step 121)
+static uintptr_t mv_hc_h;   // the hand's collider, kept while it lives
+static int mv_handish(const char *s) {   // how much a name reads like a finger (3), a hand (2), the player (1)
+    // Receivers, not touchers: the volumes, slots and targets a hand goes into.
+    static const char *const no[] = { "volume", "trigger", "zone", "area", "detector", "sensor", "handle", "tooltip",
+                                      "button", "slot", "socket", "target", "receiver", "snap", 0 };
+    static const char *const t3[] = { "fingertip", "index", "finger", "tip", 0 },
+                      *const t2[] = { "hand", "palm", "wrist", "grabber", "pinch", "interactor", "controller", 0 },
+                      *const t1[] = { "player", "avatar", 0 };
+    char l[64]; size_t i = 0;
+    for (; s[i] && i < 63; i++) l[i] = (char)tolower((unsigned char)s[i]);
+    l[i] = 0;
+    for (int j = 0; no[j]; j++) if (strstr(l, no[j])) return -1;
+    for (int j = 0; t3[j]; j++) if (strstr(l, t3[j])) return 3;
+    for (int j = 0; t2[j]; j++) if (strstr(l, t2[j])) return 2;
+    for (int j = 0; t1[j]; j++) if (strstr(l, t1[j])) return 1;
+    return 0;
+}
+static int mv_riglike(const char *s) {   // the tracked rig: TrackingSpace, a camera rig, an XR origin, a ...Rig
+    char l[64]; size_t i = 0;
+    for (; s[i] && i < 63; i++) l[i] = (char)tolower((unsigned char)s[i]);
+    l[i] = 0;
+    while (i && l[i - 1] == ' ') l[--i] = 0;
+    return strstr(l, "trackingspace") || strstr(l, "camerarig") || strstr(l, "camera rig") ||
+           strstr(l, "xr origin") || strstr(l, "xrorigin") || (i >= 3 && !strcmp(l + i - 3, "rig"));
+}
+static Il2CppObject *mv_hand_col(void) {
+    static Il2CppObject *t_col;
+    static const MethodInfo *m_par, *m_cen, *m_rb;
+    static int said;
+    if (mv_hc_h) {
+        Il2CppObject *o = mvy.gc_get(mv_hc_h);
+        if (mv_alive(o) && mv_b(o, m_cen)) return o;
+        mvy.gc_free(mv_hc_h); mv_hc_h = 0;
+    }
+    if (!k_trig) return NULL;
+    if (!t_col) {
+        t_col = mv_tobj(k_trig);
+        m_par = mv_m(find_class("UnityEngine", "Transform"), "get_parent", 0);
+        m_cen = mv_m(k_trig, "get_enabled", 0);
+        m_rb  = mv_m(k_trig, "get_attachedRigidbody", 0);
+    }
+    Il2CppObject *a = mv_find(t_col), *best = NULL;
+    int bs = 0;
+    char bn[48] = "", own[48], nm[48];
+    for (uint32_t i = 0, n = a ? il.array_length(a) : 0; i < n; i++) {
+        Il2CppObject *o = ((Il2CppObject **)((uint8_t *)a + ARR_DATA))[i];
+        if (!o || !mv_b(o, m_cen)) continue;
+        Il2CppObject *tf = invoke_on(o, m_tf, NULL, "transform");
+        // Its own name and six ancestors': the first hand word (its own counts
+        // more), a tracked rig above it, and no receiver word within two levels.
+        int sc = 0, rig = 0, bad = 0;
+        own[0] = 0;
+        for (int d = 0; tf && d < 7 && !bad; d++) {
+            mv_utf8(invoke_on(tf, m_name, NULL, "name"), nm, sizeof nm);
+            int h = mv_handish(nm);
+            if (!d) snprintf(own, sizeof own, "%s", nm);
+            if (h < 0 && d < 3) bad = 1;
+            if (h > 0 && !sc) sc = h * 2 - (d > 0);
+            rig |= mv_riglike(nm);
+            tf = m_par ? invoke_on(tf, m_par, NULL, "parent") : NULL;
+        }
+        if (bad || (!sc && !rig)) continue;
+        sc = sc ? sc + 3 * rig : 2;          // a hand on the rig first; the rig alone (head, body) last
+        if (m_rb && invoke_on(o, m_rb, NULL, "attachedRigidbody")) sc++;   // a trigger fires only with one
+        if (sc > bs) { bs = sc; best = o; snprintf(bn, sizeof bn, "%s", own); }
+    }
+    if (best) {
+        mv_hc_h = mvy.gc_new(best, 0);
+        fprintf(stderr, "[mv-autoplay-ui] touch: the hand is collider '%s' (score %d)\n", bn, bs);
+    } else if (!said++)
+        fprintf(stderr, "[mv-autoplay-ui] touch: no hand-like collider in the scene (yet)\n");
+    return best;
+}
+
+'''
+    s = sub(s, "typedef struct { Il2CppObject *o; const char *kind; int32_t id; int16_t di; uint8_t fam; char lab[56], go[40];",
+        code + "typedef struct { Il2CppObject *o; const char *kind; int32_t id; int16_t di; uint8_t fam; char lab[56], go[40];")
+    s = sub(s, "    case MVF_UI: case MVF_CLICK: {\n        Il2CppObject *pd = mv_ped(o);   // a new one: the press's was not kept\n",
+        "    case MVF_TOUCH: {   // " + marker + ": the hand leaves\n"
+        "        const MethodInfo *x = mv_m(il.object_get_class(o), \"OnTriggerExit\", 1);\n"
+        "        how = \"no OnTriggerExit\";\n"
+        "        if (x && mv_alive(ior)) {\n"
+        "            Il2CppObject *exc = NULL; void *a[1] = { ior };\n"
+        "            il.runtime_invoke(x, o, a, &exc);\n"
+        "            threw += exc != NULL; how = \"OnTriggerExit(hand)\";\n"
+        "        }\n"
+        "        break;\n"
+        "    }\n"
+        "    case MVF_UI: case MVF_CLICK: {\n        Il2CppObject *pd = mv_ped(o);   // a new one: the press's was not kept\n")
+    s = sub(s, "    int need_ior = 0;\n", "    int need_ior = 0, need_hc = 0;   // need_hc: " + marker + "\n")
+    s = sub(s, "        if (ki->f & KF_TRIG) { trig++; continue; }\n",
+        "        if (ki->f & KF_TRIG) {   // " + marker + "\n"
+        "            trig++;\n"
+        "            if (!(mv_fams & 1u << MVF_TOUCH)) continue;\n"
+        "            fam = MVF_TOUCH; need_hc = 1;\n"
+        "        }\n")
+    s = sub(s, "    double t = now - t0;\n    int pick = -1;\n",
+        "    Il2CppObject *hcol = need_hc ? mv_hand_col() : NULL;   // " + marker + "\n"
+        "    double t = now - t0;\n    int pick = -1;\n")
+    s = sub(s, "        if (c[i].fam == MVF_XRI && !ior) continue;\n",
+        "        if (c[i].fam == MVF_XRI && !ior) continue;\n"
+        "        if (c[i].fam == MVF_TOUCH && !hcol) continue;   // step 121: no hand to touch with\n")
+    s = sub(s, "    case MVF_EVENT: {\n        const mv_kinfo *ki = mv_class(il.object_get_class(p->o));\n",
+        "    case MVF_TOUCH: {   // " + marker + "\n"
+        "        Il2CppClass *pk = il.object_get_class(p->o);\n"
+        "        const MethodInfo *en = mv_m(pk, \"OnTriggerEnter\", 1), *st = mv_m(pk, \"OnTriggerStay\", 1);\n"
+        "        void *a[1] = { hcol };\n"
+        "        if (en) { exc = NULL; il.runtime_invoke(en, p->o, a, &exc); threw += exc != NULL; }\n"
+        "        if (st) { exc = NULL; il.runtime_invoke(st, p->o, a, &exc); threw += exc != NULL; }\n"
+        "        how = en && st ? \"OnTriggerEnter+Stay(hand)\" : en ? \"OnTriggerEnter(hand)\" : \"OnTriggerStay(hand)\";\n"
+        "        held = 1;\n"
+        "        break;\n"
+        "    }\n"
+        "    case MVF_EVENT: {\n        const mv_kinfo *ki = mv_class(il.object_get_class(p->o));\n")
+    s = sub(s, "    if (held) mv_hold(p->o, p->fam == MVF_XRI ? ior : NULL,",
+        "    if (held) mv_hold(p->o, p->fam == MVF_XRI ? ior : p->fam == MVF_TOUCH ? hcol : NULL,")
+    open(p, "w").write(s)
+print("overlay: autoplay touches a title's trigger volumes with the scene's hand collider")
+PYEOF
+
+# 122 — the presser calls a title's own press methods. Titles with their own
+# button framework (3D panel buttons, keyboard keys, press-to-activate props)
+# have no UnityEvent field and no pointer interface the earlier families know:
+# their buttons act in a parameterless method such as OnButtonPressed, Click,
+# EmulatePress or Interact. The call family finds a title MonoBehaviour (not
+# Unity's, an SDK's or an OVR* class) whose class declares, or inherits from
+# another title class, an instance method with one of a fixed list of press
+# names and no parameters, and calls it. It comes after every other family:
+# a class that has an event, a pointer interface or a UnityEvent is pressed
+# through those.
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the call family, a title's own press method (step 122)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "(step 121)" not in s:
+        sys.exit("overlay: step 122 needs step 121")
+    code = r'''// metavision: the call family, a title's own press method (step 122)
+static const MethodInfo *mv_callm(Il2CppClass *k) {
+    static const char *const names[] = {
+        "OnButtonPressed", "OnButtonPress", "OnButtonClick", "OnButtonClicked", "ButtonPressed",
+        "OnPressed", "OnPress", "Press", "OnClick", "OnClicked", "Click", "OnTap", "OnTapped", "Tap",
+        "EmulatePress", "SimulatePress", "SimulateClick", "PretendToPress", "OnInteract", "Interact",
+        "OnSelected", "OnActivate", "OnActivated", "OnPoke", "OnPoked", "OnTouched", "OnGrab", "OnGrabbed",
+        "OnUse", "OnToggle", "Toggle", 0 };
+    static Il2CppClass *(*mcls)(const MethodInfo *);
+    static uint32_t (*mflags)(const MethodInfo *, uint32_t *);
+    static int bound;
+    if (!bound) {
+        bound = 1;
+        kl_image *im = kl_find_image("libil2cpp.so");
+        *(void **)&mcls   = kl_sym(im, "il2cpp_method_get_class");
+        *(void **)&mflags = kl_sym(im, "il2cpp_method_get_flags");
+    }
+    const char *cn = il.class_get_name(k);
+    if (!cn || !strncmp(cn, "OVR", 3)) return NULL;   // the Oculus SDK's root-namespace classes
+    for (int i = 0; names[i]; i++) {
+        const MethodInfo *m = mv_m(k, names[i], 0);
+        if (!m || (mflags && (mflags(m, NULL) & 0x0410))) continue;   // static or abstract
+        Il2CppClass *dk = mcls ? mcls(m) : NULL;
+        const char *ns = dk ? mvx.ns(dk) : NULL;
+        if (ns && (!strncmp(ns, "UnityEngine", 11) || !strcmp(ns, "TMPro") || !strncmp(ns, "Oculus", 6) ||
+                   !strncmp(ns, "Meta.", 5) || !strncmp(ns, "Unity.", 6) || !strncmp(ns, "System", 6))) continue;
+        return m;
+    }
+    return NULL;
+}
+'''
+    s = sub(s, "static const mv_kinfo *mv_class(Il2CppClass *k) {\n", code + "static const mv_kinfo *mv_class(Il2CppClass *k) {\n")
+    s = sub(s, "        if (e->nev) e->f |= KF_EVENT;\n",
+        "        if (e->nev) e->f |= KF_EVENT;\n"
+        "        if (!e->f && (e->pm = mv_callm(k))) e->f = KF_CALL;   // " + marker + "\n")
+    s = sub(s, "ki->f & KF_CLICK ? MVF_CLICK : ki->f & KF_EVENT ? MVF_EVENT : -1;\n",
+        "ki->f & KF_CLICK ? MVF_CLICK : ki->f & KF_EVENT ? MVF_EVENT :\n"
+        "                  ki->f & KF_CALL ? MVF_CALL : -1;   // step 122\n")
+    s = sub(s, "    case MVF_EVENT: {\n        const mv_kinfo *ki = mv_class(il.object_get_class(p->o));\n",
+        "    case MVF_CALL: {   // " + marker + "\n"
+        "        const mv_kinfo *ki = mv_class(il.object_get_class(p->o));\n"
+        "        how = \"no method\";\n"
+        "        if (ki->pm) {\n"
+        "            exc = NULL;\n"
+        "            il.runtime_invoke(ki->pm, p->o, NULL, &exc);\n"
+        "            threw += exc != NULL; how = mvy.mname(ki->pm);\n"
+        "        }\n"
+        "        break;\n"
+        "    }\n"
+        "    case MVF_EVENT: {\n        const mv_kinfo *ki = mv_class(il.object_get_class(p->o));\n")
+    open(p, "w").write(s)
+print("overlay: autoplay calls a title's own parameterless press methods")
+PYEOF
+
+# 123 — the presser grabs Interaction SDK grabbables. An Interaction SDK
+# object that is grabbed or poked without a UnityEvent wrapper (Grabbable and
+# every other PointableElement) was not found by any family. The pointable
+# family sends the element its own pointer events, as an interactor would:
+# Hover and Select at the element's own pose (so a grab moves nothing),
+# Unselect and Unhover _HOLD_MS later, dispatched on the object. Pointable
+# canvases are left out: a select there is a UI press at the canvas centre,
+# whatever control sits under it.
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: the pointable family, an SDK grab without a wrapper (step 123)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    if "(step 122)" not in s:
+        sys.exit("overlay: step 123 needs step 122")
+    code = r'''// metavision: the pointable family, an SDK grab without a wrapper (step 123)
+static Il2CppClass *k_pel;
+static const MethodInfo *m_ppe;
+static int mv_canvasish(Il2CppClass *k) {
+    for (; k; k = mvx.parent(k)) { const char *n = il.class_get_name(k); if (n && strstr(n, "Canvas")) return 1; }
+    return 0;
+}
+'''
+    s = sub(s, "// ---- what a class is, cached per class ----\n", code + "// ---- what a class is, cached per class ----\n")
+    s = sub(s, "    else if (mv_is(k_xint, k)) e->f = KF_XRI;\n",
+        "    else if (mv_is(k_xint, k)) e->f = KF_XRI;\n"
+        "    else if (m_ppe && pe_off_type >= 0 && mv_is(k_pel, k) && !mv_canvasish(k)) e->f = KF_PTR;   // step 123\n")
+    s = sub(s, "                  ki->f & KF_CALL ? MVF_CALL : -1;   // step 122\n",
+        "                  ki->f & KF_CALL ? MVF_CALL : ki->f & KF_PTR ? MVF_PTR : -1;   // steps 122, 123\n")
+    s = sub(s, '    k_trig = find_class("UnityEngine", "Collider");\n',
+        '    k_trig = find_class("UnityEngine", "Collider");\n'
+        '    if ((k_pel = find_class("Oculus.Interaction", "PointableElement")))   // ' + marker + '\n'
+        '        m_ppe = mv_m(k_pel, "ProcessPointerEvent", 1);\n')
+    helper = r'''// metavision: the pointable family, an SDK grab without a wrapper (step 123)
+static int mv_pe_call(Il2CppObject *o, const MethodInfo *m, int32_t pet) {   // o.m(a PointerEvent at o's own pose)
+    if (!m || pe_off_type < 0 || pe_size <= 0 || pe_size > 128) return 0;
+    const MethodInfo *v = mvy.virt(o, m);   // Grabbable and others override it
+    uint8_t pe[128] = { 0 };
+    int32_t id = 0x6d76;   // 'mv': no real pointer has it
+    if (pe_off_id >= 0) memcpy(pe + pe_off_id, &id, 4);
+    memcpy(pe + pe_off_type, &pet, 4);
+    Il2CppObject *tf = invoke_on(o, m_tf, NULL, "transform");
+    Il2CppObject *ps = tf ? invoke_on(tf, m_pos, NULL, "position") : NULL;
+    Il2CppObject *rt = tf ? invoke_on(tf, m_rot, NULL, "rotation") : NULL;
+    if (pe_off_pose >= 0 && ps && rt) {
+        memcpy(pe + pe_off_pose, il.object_unbox(ps), 12);
+        memcpy(pe + pe_off_pose + 12, il.object_unbox(rt), 16);
+    }
+    Il2CppObject *exc = NULL; void *a[1] = { pe };
+    il.runtime_invoke(v ? v : m, o, a, &exc);
+    if (exc) fprintf(stderr, "[mv-autoplay-ui]   ProcessPointerEvent threw %s\n", il.class_get_name(il.object_get_class(exc)));
+    return exc ? -1 : 1;
+}
+'''
+    s = sub(s, "static Il2CppObject *mv_xri_mgr(Il2CppObject *able, Il2CppObject *ior) {\n",
+        helper + "static Il2CppObject *mv_xri_mgr(Il2CppObject *able, Il2CppObject *ior) {\n")
+    s = sub(s, "    case MVF_TOUCH: {   // metavision: the touch family, a hand into a trigger (step 121): the hand leaves\n",
+        "    case MVF_PTR:   // " + marker + "\n"
+        "        threw += mv_pe_call(o, m_ppe, pet_unselect) < 0;\n"
+        "        threw += mv_pe_call(o, m_ppe, pet_unhover) < 0;\n"
+        "        how = \"ProcessPointerEvent(Unselect,Unhover)\";\n"
+        "        break;\n"
+        "    case MVF_TOUCH: {   // metavision: the touch family, a hand into a trigger (step 121): the hand leaves\n")
+    s = sub(s, "    case MVF_CALL: {   // metavision: the call family, a title's own press method (step 122)\n",
+        "    case MVF_PTR:   // " + marker + "\n"
+        "        threw += mv_pe_call(p->o, m_ppe, pet_hover) < 0;\n"
+        "        threw += mv_pe_call(p->o, m_ppe, pet_select) < 0;\n"
+        "        how = \"ProcessPointerEvent(Hover,Select)\"; held = 1;\n"
+        "        break;\n"
+        "    case MVF_CALL: {   // metavision: the call family, a title's own press method (step 122)\n")
+    open(p, "w").write(s)
+print("overlay: autoplay grabs Interaction SDK pointable elements with their own pointer events")
+PYEOF

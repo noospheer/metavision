@@ -317,12 +317,16 @@ Autoplay also **presses what each title calls selectable, directly**
 (`MV_AUTOPLAY_UI`, on with `MV_AUTOPLAY`): every 4 s from 10 s in, the
 least-pressed active element of Unity UI (Button, Toggle, Dropdown, a title's
 own Selectable), the Interaction SDK's event wrappers, the XR Interaction
-Toolkit's interactables, pointer-handler scripts, or press-named `UnityEvent`
-fields, released 300 ms later — skipping names that read like leaving the
+Toolkit's interactables, pointer-handler scripts, press-named `UnityEvent`
+fields, a title's own press-named methods (`call`), Interaction SDK grabbables
+(`pointable`), or trigger volumes, touched with the scene's own hand collider
+(`touch`), released 300 ms later — skipping names that read like leaving the
 title (quit, exit, back, home, reset; camelCase too). Each press is logged
 (`[mv-autoplay-ui] pressed 'English'`), and `[mv-autoplay-ui] coverage N/M`
-says how many of the elements found have been pressed; triage reports it.
-`MV_AUTOPLAY_UI_FAMILIES` (default `ui,isdk,xri,click,event`),
+says how many of the elements found have been pressed; triage reports it, or
+why the presser never attached (`[mv-autoplay-ui] off: ...`, a run that ended
+before 10 s, a title that is not Unity IL2CPP).
+`MV_AUTOPLAY_UI_FAMILIES` (default `ui,isdk,xri,click,event,pointable,call,touch`),
 `MV_AUTOPLAY_UI_HOLD_MS`, `_GAP` and `_MAX` tune it.
 
 A **hands-only** title (its manifest requires `oculus.software.handtracking`)
