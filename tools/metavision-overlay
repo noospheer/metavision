@@ -10937,3 +10937,270 @@ if marker not in s:
     open(p, "w").write(s)
 print("overlay: hands-free supplies both controllers, with the movement and turning sticks")
 PYEOF
+
+# 105 — a surface-configured decoder reports each frame's size. Android's
+# MediaCodec, rendering to a Surface, still fills BufferInfo.size with the
+# decoded frame's byte count; only an empty end-of-stream buffer has 0. The
+# runtime answered 0 for every frame, and the common decode loop reads that as
+# "nothing to show": `render = info.size != 0`, then releaseOutputBuffer(render)
+# (a volumetric-video plugin's video thread does exactly this; FFmpeg's
+# MediaCodec decoder skips a size-0 buffer the same way). Every frame was
+# released unrendered, so its SurfaceTexture saw none. A surface-configured
+# codec now reports the frame's 4:2:0 size (width x height x 3/2); without a
+# surface it still reports 0, since there is no output buffer to read.
+python3 - "$K/runtime/media/kl_mediandk.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a surface decoder reports the frame's size (step 105)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    s = sub(s,
+        "                        // Zero, and deliberately: this codec renders to a\n"
+        "                        // surface, so there is no CPU-visible output buffer and\n"
+        "                        // Android reports 0 too. A guest that memcpy'd `size`\n"
+        "                        // bytes out of it would be reading a buffer that does\n"
+        "                        // not exist on Android either.\n"
+        "                        info->size = 0;\n",
+        "                        // " + marker + ": Android fills size\n"
+        "                        // for a frame rendered to a surface too, and a guest\n"
+        "                        // decides whether to render from it (size 0 means an\n"
+        "                        // empty buffer). There is no CPU-visible buffer either\n"
+        "                        // way (getOutputBuffer answers NULL, as on Android);\n"
+        "                        // with no surface there is nothing at all, so 0.\n"
+        "                        size_t mv_w = CVPixelBufferGetWidth(pb), mv_h = CVPixelBufferGetHeight(pb);\n"
+        "                        info->size = c->surface ? (int32_t)(mv_w * mv_h * 3 / 2) : 0;\n")
+    open(p, "w").write(s)
+print("overlay: a surface-configured decoder reports each frame's size, so a guest renders it")
+PYEOF
+
+# 106 — the locale is the headset's language. Every locale answer (Locale
+# getDefault/getLanguage/getCountry/toString/toLanguageTag, the system
+# Configuration's LocaleList, AConfiguration, the platform's user locale) came
+# from the process's LANG, and a visionOS app is launched without one, so the
+# answer was en_US whatever language the headset was set to. With LANG unset
+# (or C/POSIX) the language is now the host's first preferred language
+# (CFLocaleCopyPreferredLanguages: "fr-CA", "zh-Hans-CN"; a script subtag is
+# dropped), its region from that tag or else the current locale's country,
+# falling back to en_US; it is read once and logged. The platform's
+# ovr_GetLoggedInUserLocale reads the same parts, and the system properties
+# persist.sys.locale and ro.product.locale, which were empty, answer the same
+# locale as a BCP 47 tag ("en-US"), as Android does.
+python3 - "$K/runtime/jni/kl_jni_services.c" "$K/runtime/xr/kl_ovrplat.c" "$K/runtime/libc/kl_libc.c" <<'PYEOF'
+import sys
+marker = "metavision: the locale is the headset's language (step 106)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "static void klj_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz) {\n"
+    s = sub(p, s, old, "// " + marker + r''': LANG when the
+// process has one, else the host's first preferred language, as "ll_CC".
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+static char mv_host_locale[64];
+static void mv_host_locale_read(void) {
+    const char *env = getenv("LANG");
+    if (env && *env && strcmp(env, "C") && strncmp(env, "C.", 2) && strcmp(env, "POSIX")) {
+        snprintf(mv_host_locale, sizeof mv_host_locale, "%s", env);
+        fprintf(stderr, "[jni] locale: %s (the process's LANG)\n", mv_host_locale);
+        return;
+    }
+    char tag[64] = "", lang[16] = "", region[16] = "";
+#ifdef __APPLE__
+    CFArrayRef pref = CFLocaleCopyPreferredLanguages();
+    if (pref) {
+        if (CFArrayGetCount(pref) > 0) {
+            CFStringRef first = (CFStringRef)CFArrayGetValueAtIndex(pref, 0);
+            if (first) CFStringGetCString(first, tag, sizeof tag, kCFStringEncodingUTF8);
+        }
+        CFRelease(pref);
+    }
+#endif
+    // "ll[-Ssss][-CC|-NNN][-...]": the language, then the first region-shaped subtag.
+    char t[64];
+    snprintf(t, sizeof t, "%s", tag);
+    int k = 0;
+    for (char *save = NULL, *sp = strtok_r(t, "-_", &save); sp; sp = strtok_r(NULL, "-_", &save), k++) {
+        size_t n = strlen(sp);
+        if (k == 0) {
+            if (n >= 2 && n <= 3) for (size_t i = 0; i <= n; i++) lang[i] = (char)tolower((unsigned char)sp[i]);
+            else break;
+            continue;
+        }
+        int alpha2 = n == 2 && isalpha((unsigned char)sp[0]) && isalpha((unsigned char)sp[1]);
+        int digit3 = n == 3 && isdigit((unsigned char)sp[0]) && isdigit((unsigned char)sp[1]) && isdigit((unsigned char)sp[2]);
+        if (alpha2 || digit3) {
+            for (size_t i = 0; i <= n; i++) region[i] = (char)toupper((unsigned char)sp[i]);
+            break;
+        }
+    }
+#ifdef __APPLE__
+    if (lang[0] && !region[0]) {   // "fr" alone: the region the headset is set to
+        CFLocaleRef cur = CFLocaleCopyCurrent();
+        if (cur) {
+            CFStringRef cc = (CFStringRef)CFLocaleGetValue(cur, kCFLocaleCountryCode);
+            if (cc) CFStringGetCString(cc, region, sizeof region, kCFStringEncodingUTF8);
+            CFRelease(cur);
+        }
+    }
+#endif
+    if (!lang[0]) { snprintf(lang, sizeof lang, "en"); snprintf(region, sizeof region, "US"); }
+    snprintf(mv_host_locale, sizeof mv_host_locale, region[0] ? "%s_%s" : "%s", lang, region);
+    fprintf(stderr, "[jni] locale: %s (the host's preferred language%s%s)\n", mv_host_locale,
+            tag[0] ? " " : ": none, the default", tag);
+}
+static const char *mv_host_lang_env(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, mv_host_locale_read);
+    return mv_host_locale;
+}
+
+''' + old)
+    s = sub(p, s, "    const char *env = getenv(\"LANG\");\n    if (!env || !*env || strncmp(env, \"C\", 2) == 0) return;\n",
+                  "    const char *env = mv_host_lang_env();   // " + marker + "\n"
+                  "    if (!env || !*env || strncmp(env, \"C\", 2) == 0) return;\n")
+    s = sub(p, s, "\"Locale.getDefault() -> %s_%s (from the host LANG)\"",
+                  "\"Locale.getDefault() -> %s_%s (the host's locale)\"")
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s,
+        "        const char *lang = getenv(\"LANG\");            // e.g. \"en_US.UTF-8\"\n"
+        "        int i = 0;\n"
+        "        if (lang) for (; lang[i] && lang[i] != '.' && i < (int)sizeof loc - 1; i++) loc[i] = lang[i];\n"
+        "        if (i == 0) { loc[0]='e'; loc[1]='n'; loc[2]='_'; loc[3]='U'; loc[4]='S'; i=5; }\n"
+        "        loc[i] = '\\0';\n",
+        "        char lang[16], country[16];   // " + marker + ": the one locale\n"
+        "        kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);\n"
+        "        snprintf(loc, sizeof loc, country[0] ? \"%s_%s\" : \"%s\", lang, country);\n")
+    open(p, "w").write(s)
+p = sys.argv[3]
+s = open(p).read()
+if marker not in s:
+    old = ("    for (size_t i = 0; i < sizeof g_sysprops / sizeof *g_sysprops; i++)\n"
+           "        if (strcmp(n, g_sysprops[i].prop) == 0)\n"
+           "            return kl_jni_build_string(g_sysprops[i].build_field);\n"
+           "    return NULL;\n}\n")
+    s = sub(p, s, old,
+        "    if (!strcmp(n, \"persist.sys.locale\") || !strcmp(n, \"ro.product.locale\")) {   // " + marker + "\n"
+        "        static char tag[40];\n"
+        "        char lang[16], country[16];\n"
+        "        kl_jni_locale_parts(lang, sizeof lang, country, sizeof country);\n"
+        "        snprintf(tag, sizeof tag, country[0] ? \"%s-%s\" : \"%s\", lang, country);\n"
+        "        return tag;\n"
+        "    }\n" + old)
+    old = "    if (strcmp(n, \"ro.build.version.sdk\") == 0) return \"ro.build.version.sdk\";\n"
+    s = sub(p, s, old, old +
+        "    if (strcmp(n, \"persist.sys.locale\") == 0) return \"persist.sys.locale\";   // " + marker + "\n"
+        "    if (strcmp(n, \"ro.product.locale\") == 0) return \"ro.product.locale\";\n")
+    open(p, "w").write(s)
+print("overlay: the locale is the headset's preferred language (LANG when set), en_US failing both")
+PYEOF
+
+# 107 — autoplay picks the headset's language. Step 66 presses the first of
+# several equal candidates by instance ID, and on a title whose first screen is
+# a row of language buttons that was whichever language the scene happened to
+# list first — so test runs played in a language nobody chose (the press is a
+# real choice: the title keeps it). Each candidate's label, game object name and
+# up to three ancestors' names are now matched against language names (English
+# and native spellings: "English", "Français", "中文", "한국어", ...). A control
+# naming the host's language (step 106's locale) is pressed before others with
+# the same press count; one naming English, when the host's language is not
+# English, comes after everything that names no language; one naming any other
+# language comes last of all. The host language is logged once.
+python3 - "$K/runtime/diag/kl_mprobe.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: autoplay picks the headset's language (step 107)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if "metavision: every selectable, every framework (step 66)" not in s:
+    sys.exit("overlay: step 107 needs step 66 (mv_cand, mv_before)")
+if marker not in s:
+    old = "typedef struct { Il2CppObject *o; const char *kind; int32_t id; int16_t di; uint8_t fam; char lab[56], go[40]; } mv_cand;\n"
+    s = sub(s, old, "// " + marker + r'''
+void kl_jni_locale_parts(char *lang, size_t lang_sz, char *country, size_t country_sz);
+static const struct { const char *code; const char *names[7]; } mv_langs[] = {   // lowercase (ASCII only)
+    { "en", { "english", 0 } },
+    { "fr", { "french", "fran\xc3\xa7" "ais", "fran\xc3\x87" "ais", "francais", 0 } },
+    { "es", { "spanish", "espa\xc3\xb1" "ol", "espa\xc3\x91" "ol", "espanol", "castellano", 0 } },
+    { "pt", { "portug", 0 } },
+    { "de", { "german", "deutsch", 0 } },
+    { "it", { "italian", 0 } },
+    { "nl", { "dutch", "nederlands", 0 } },
+    { "zh", { "chinese", "\xe4\xb8\xad\xe6\x96\x87", "\xe7\xae\x80\xe4\xbd\x93", "\xe7\xb9\x81\xe9\xab\x94", "\xe6\x99\xae\xe9\x80\x9a", 0 } },
+    { "ja", { "japanese", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", 0 } },
+    { "ko", { "korean", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4", 0 } },
+    { "ru", { "russian", "\xd1\x80\xd1\x83\xd1\x81\xd1\x81\xd0\xba", 0 } },
+    { "pl", { "polish", "polski", 0 } },
+    { "tr", { "turkish", "t\xc3\xbc" "rk\xc3\xa7" "e", 0 } },
+    { "sv", { "swedish", "svenska", 0 } },
+    { "ar", { "arabic", 0 } },
+};
+static int mv_lang_of(const char *name) {   // index into mv_langs, or -1
+    char l[96]; size_t i = 0;
+    if (!name || !*name) return -1;
+    for (; name[i] && i < sizeof l - 1; i++) l[i] = (char)tolower((unsigned char)name[i]);
+    l[i] = 0;
+    for (size_t j = 0; j < sizeof mv_langs / sizeof *mv_langs; j++)
+        for (int k = 0; mv_langs[j].names[k]; k++)
+            if (strstr(l, mv_langs[j].names[k])) return (int)j;
+    return -1;
+}
+// 0 names the host's language, 1 none, 2 English (the host's is another), 3 another.
+static uint8_t mv_lang_rank(Il2CppObject *o, const char *lab, const char *go) {
+    static char host[16];
+    static const MethodInfo *m_par;
+    static int said;
+    if (!host[0]) {
+        char country[16];
+        kl_jni_locale_parts(host, sizeof host, country, sizeof country);
+        m_par = mv_m1(find_class("UnityEngine", "Transform"), "get_parent", 0);
+    }
+    if (!said++)
+        fprintf(stderr, "[mv-autoplay-ui] host language '%s': a control naming it is pressed first, "
+                        "one naming another language last\n", host);
+    int hit[3] = { -1, -1, -1 }, nh = 0;
+    const char *own[2] = { lab, go };
+    for (int i = 0; i < 2; i++) { int g = mv_lang_of(own[i]); if (g >= 0 && nh < 3) hit[nh++] = g; }
+    Il2CppObject *tf = o && m_tf ? invoke_on(o, m_tf, NULL, "transform") : NULL;
+    for (int up = 0; up < 3 && tf && m_par && m_name && nh < 3; up++) {
+        tf = invoke_on(tf, m_par, NULL, "Transform.parent");
+        if (!tf) break;
+        char nm[64];
+        mv_utf8(invoke_on(tf, m_name, NULL, "name"), nm, sizeof nm);
+        int g = mv_lang_of(nm);
+        if (g >= 0) hit[nh++] = g;
+    }
+    if (!nh) return 1;
+    for (int i = 0; i < nh; i++) if (!strcmp(mv_langs[hit[i]].code, host)) return 0;
+    for (int i = 0; i < nh; i++) if (!strcmp(mv_langs[hit[i]].code, "en")) return 2;
+    return 3;
+}
+''' + old.replace("char lab[56], go[40]; } mv_cand;", "char lab[56], go[40]; uint8_t lang; } mv_cand;"))
+    s = sub(s,
+        "    if (mvd[a->di].tries != mvd[b->di].tries) return mvd[a->di].tries < mvd[b->di].tries;\n",
+        "    {   // " + marker + "\n"
+        "        int ga = a->lang >= 2 ? a->lang : 0, gb = b->lang >= 2 ? b->lang : 0;\n"
+        "        if (ga != gb) return ga < gb;\n"
+        "    }\n"
+        "    if (mvd[a->di].tries != mvd[b->di].tries) return mvd[a->di].tries < mvd[b->di].tries;\n"
+        "    if (a->lang != b->lang) return a->lang < b->lang;   // " + marker + "\n")
+    old = "        mv_names(x_->o, x_->lab, sizeof x_->lab, x_->go, sizeof x_->go);                   \\\n"
+    s = sub(s, old, old +
+        "        x_->lang = mv_lang_rank(x_->o, x_->lab, x_->go);   /* " + marker + " */ \\\n")
+    open(p, "w").write(s)
+print("overlay: autoplay presses a control naming the headset's language first, other languages last")
+PYEOF
