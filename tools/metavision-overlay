@@ -16417,3 +16417,136 @@ if '"MetavisionNet.swift"' not in s:
     open(p, "w").write(s)
 print("overlay: MetavisionNet.swift (mv_net_fetch on URLSession) is in the app")
 PYEOF
+
+# 165 — the audio mixer's producer slots (kl_audio.c): four, never given back
+# by the OpenSL or AAudio side (step 151 added the release, only the video
+# plugin used it), and a producer past the fourth folded into slot 0 and
+# appended to that producer's cursor: two streams at half speed each, heard as
+# garbled sound. The slot table is now shims/mv_mixslots.h (host-tested by
+# shims/tests/t_mixslots.c): 16 slots; a newcomer takes a free slot, else one
+# whose producer is idle (its cursor behind the reader, or from before the
+# device was reopened: nothing of it is left to play and its next write would
+# resync anyway), else it is not mixed (its write returns 0 and its feeder
+# paces itself, as with no device) and that is logged; a producer with audio
+# ahead of the reader is never evicted. Only producers touch the slots, under
+# the write lock that a write holds for its whole length, so a release waits
+# for a write in flight; the render thread reads the ring, never a slot.
+# Registrations, releases, reclaims and refusals are logged (bounded).
+python3 - "$K/runtime/media/kl_audio.c" "$ROOT/shims/mv_mixslots.h" <<'PYEOF'
+import os, sys
+marker = "metavision: the mixer's producer slots (step 165)"
+mix_h = os.path.relpath(sys.argv[2], os.path.dirname(os.path.abspath(sys.argv[1])))
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "#define KL_AU_MAX_SRC 4\n",
+        "// " + marker + ": the table is shims/mv_mixslots.h, host-tested.\n"
+        '#include "' + mix_h + '"\n'
+        "#define KL_AU_MAX_SRC MV_MIX_MAX_SRC\n")
+    s = sub(p, s,
+        "// Caller holds g_wlock. Overflow folds into slot 0 rather than dropping audio.\n"
+        "static int src_slot(const void *key) {\n"
+        "    if (!key) return 0;\n"
+        "    for (int i = 0; i < g_src_n; i++) if (g_src_key[i] == key) return i;\n"
+        "    if (g_src_n < KL_AU_MAX_SRC) { g_src_key[g_src_n] = key; g_src_pos[g_src_n] = 0; return g_src_n++; }\n"
+        "    return 0;\n}\n",
+        "// Caller holds g_wlock. -1: every slot holds a producer with audio still ahead\n"
+        "// of the reader; this one is not mixed and nothing live is evicted (" + marker + ").\n"
+        r'''static int src_slot(const void *key) {
+    if (!key) return 0;
+    int n0 = g_src_n, reclaimed = 0;
+    uint64_t r0 = atomic_load_explicit(&g_r, memory_order_acquire);
+    int i = mv_mix_slot_get(g_src_key, g_src_pos, &g_src_n, KL_AU_MAX_SRC, key,
+                            r0, (uint64_t)g_cap, &reclaimed);
+    static unsigned said_in, said_full;
+    static unsigned long refused;
+    if (i < 0) {
+        if (refused++ % 1000 == 0 && said_full++ < 16)
+            fprintf(stderr, "  [au] mixer: ALL %d source slots hold producers with audio "
+                            "pending; source %p is NOT mixed (%lu writes dropped so far, "
+                            "nothing live evicted)\n", KL_AU_MAX_SRC, key, refused);
+    } else if ((reclaimed || g_src_n != n0) && said_in++ < 32) {
+        fprintf(stderr, "  [au] mixer: source %p in at slot %d%s, %d of %d in use\n",
+                key, i, reclaimed ? " (reclaimed from an idle producer)" : "",
+                g_src_n, KL_AU_MAX_SRC);
+    }
+    return i;
+}
+''')
+    s = sub(p, s, r'''    pthread_mutex_lock(&g_wlock);
+    for (int i = 0; i < g_src_n; i++) {
+        if (g_src_key[i] != key) continue;
+        for (int j = i; j + 1 < g_src_n; j++) {
+            g_src_key[j] = g_src_key[j + 1];
+            g_src_pos[j] = g_src_pos[j + 1];
+        }
+        g_src_n--;
+        g_src_key[g_src_n] = NULL;
+        g_src_pos[g_src_n] = 0;
+        break;
+    }
+    pthread_mutex_unlock(&g_wlock);
+''', r'''    // Waits for a write in flight (it holds g_wlock throughout); idempotent.
+    pthread_mutex_lock(&g_wlock);
+    int had = mv_mix_slot_release(g_src_key, g_src_pos, &g_src_n, key);
+    int left = g_src_n;
+    pthread_mutex_unlock(&g_wlock);
+    static unsigned said;
+    if (had && said++ < 32)
+        fprintf(stderr, "  [au] mixer: source %p out, %d of %d in use\n",
+                key, left, KL_AU_MAX_SRC);
+''')
+    s = sub(p, s, "    int slot = src_slot(src);\n",
+        "    int slot = src_slot(src);\n"
+        "    // " + marker + ": no slot, not mixed; the caller paces itself.\n"
+        "    if (slot < 0) { pthread_mutex_unlock(&g_wlock); return 0; }\n")
+    open(p, "w").write(s)
+print("overlay: the mixer has 16 producer slots, reclaims idle ones, never evicts a live one")
+PYEOF
+
+# 166 — an OpenSL ES player gave its mixer slot back never: Destroy (and the
+# re-creation of a player slot, which stops it first) joined the feeder and
+# left the key registered. player_stop now releases it after the join, when
+# no write of this player can be in flight.
+python3 - "$K/runtime/media/kl_opensl.c" <<'PYEOF'
+import sys
+marker = "metavision: a destroyed OpenSL player leaves the mixer (step 166)"
+p = sys.argv[1]
+s = open(p).read()
+old = "    pthread_join(p->thread, NULL);\n    p->started = 0;\n"
+if marker not in s:
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old, old + "    kl_audio_src_release(p);   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: a destroyed OpenSL player gives its mixer slot back")
+PYEOF
+
+# 167 — an AAudio output stream gave its mixer slot back never: requestStop
+# and close joined the feeder and left the key (the stream's address)
+# registered, and close then freed it, so every device reset or reopen of an
+# engine's output leaked a slot. The stop-and-join both paths share now
+# releases it after the join (a blocking-write stream has no feeder; a write
+# in flight on another thread is waited for by the release). A stream started
+# again registers anew on its first write. It runs before close frees the
+# stream, so a new stream at the same address cannot lose its slot to it.
+python3 - "$K/runtime/media/kl_aaudio.c" <<'PYEOF'
+import sys
+marker = "metavision: a stopped or closed AAudio stream leaves the mixer (step 167)"
+p = sys.argv[1]
+s = open(p).read()
+old = ("        if (s->direction != AAUDIO_DIRECTION_INPUT) kl_audio_pause();\n"
+       "        pthread_join(s->thread, NULL);\n"
+       "    }\n")
+if marker not in s:
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    s = s.replace(old, old +
+        "    if (s->direction != AAUDIO_DIRECTION_INPUT) kl_audio_src_release(s);   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: a stopped or closed AAudio stream gives its mixer slot back")
+PYEOF
