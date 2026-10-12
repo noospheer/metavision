@@ -11204,3 +11204,138 @@ static uint8_t mv_lang_rank(Il2CppObject *o, const char *lab, const char *go) {
     open(p, "w").write(s)
 print("overlay: autoplay presses a control naming the headset's language first, other languages last")
 PYEOF
+
+python3 - "$K/runtime/jni/kl_jni_looper.c" <<'PYEOF'
+import sys
+marker = "metavision: Handler.obtainMessage with arguments (step 110)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "// sendToTarget() posts the message to the Handler it came from. Never delivered\n"
+    s = sub(p, s, old, "// " + marker + r''': the
+// overloads that also carry arg1/arg2 and/or obj. Unity's own video decoder
+// asks its HandlerThread for a surface with obtainMessage(what, texture, 0);
+// unbound, that answered NULL, sendToTarget() went nowhere, and the engine waited
+// for a surface that was never made ("surface creation stalled") with the scene
+// held on a video that never started. Same object as obtainMessage(what), with
+// the extra public fields written through the same per-object field table so
+// handleMessage's GetIntField/GetObjectField see them. obj is pinned: it rides
+// the queue past the frame that passed it in.
+static klj_val mv_Handler_obtainMessage_args(void *env, void *self, const klj_val *a,
+                                             int n, int has_args, int obj_at) {
+    klj_val r = klj_Handler_obtainMessage(env, self, a, n > 0 ? 1 : 0);
+    klj_message *m = klj_as_message(r.l);
+    if (!m) return r;
+    void *cls = klj_class_object("android/os/Message");
+    if (has_args && n >= 3) {
+        m->arg1 = (int32_t)a[1].j;
+        m->arg2 = (int32_t)a[2].j;
+        klj_field_store(r.l, klj_want(cls, "arg1", "I", 'f'),
+                        (klj_val){.j = (uint64_t)(int64_t)m->arg1});
+        klj_field_store(r.l, klj_want(cls, "arg2", "I", 'f'),
+                        (klj_val){.j = (uint64_t)(int64_t)m->arg2});
+    }
+    if (obj_at > 0 && n > obj_at) {
+        m->obj = a[obj_at].l;
+        if (m->obj) kl_jni_pin_object(m->obj);
+        klj_field_store(r.l, klj_want(cls, "obj", "Ljava/lang/Object;", 'f'),
+                        (klj_val){.l = m->obj});
+    }
+    KLJ_LOG("Handler.obtainMessage(what=%d, arg1=%d, arg2=%d, obj=%p)",
+            m->what, m->arg1, m->arg2, m->obj);
+    return r;
+}
+static klj_val mv_Handler_obtainMessage_iii(void *env, void *self, const klj_val *a, int n) {
+    return mv_Handler_obtainMessage_args(env, self, a, n, 1, 0);
+}
+static klj_val mv_Handler_obtainMessage_iiio(void *env, void *self, const klj_val *a, int n) {
+    return mv_Handler_obtainMessage_args(env, self, a, n, 1, 3);
+}
+static klj_val mv_Handler_obtainMessage_io(void *env, void *self, const klj_val *a, int n) {
+    return mv_Handler_obtainMessage_args(env, self, a, n, 0, 1);
+}
+
+''' + old)
+    old = '    {"android/os/Handler", "obtainMessage", "(I)Landroid/os/Message;", klj_Handler_obtainMessage},\n'
+    s = sub(p, s, old, old +
+        '    // ' + marker + '\n'
+        '    {"android/os/Handler", "obtainMessage", "(III)Landroid/os/Message;", mv_Handler_obtainMessage_iii},\n'
+        '    {"android/os/Handler", "obtainMessage", "(IIILjava/lang/Object;)Landroid/os/Message;", mv_Handler_obtainMessage_iiio},\n'
+        '    {"android/os/Handler", "obtainMessage", "(ILjava/lang/Object;)Landroid/os/Message;", mv_Handler_obtainMessage_io},\n')
+    open(p, "w").write(s)
+print("overlay: Handler.obtainMessage(what, arg1, arg2[, obj]) and (what, obj) build a Message")
+PYEOF
+
+python3 - "$K/runtime/xr/kl_openxr.c" <<'PYEOF'
+import sys
+marker = "metavision: passthrough answered in xrGetSystemProperties (step 111)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if marker not in s:
+    old = "static XrResult klxr_CreateInstance(const XrInstanceCreateInfo *info, void **instance) {\n"
+    s = sub(p, s, old, "// " + marker + r''': XR_FB_passthrough
+// is advertised and its entry points are served (step 64), but a guest asks
+// whether the SYSTEM supports it by chaining XrSystemPassthroughPropertiesFB (and
+// ...Properties2FB) onto xrGetSystemProperties — and the chain was never written,
+// so the zeroed flag read "unsupported" and the guest disabled passthrough
+// ("doesn't support XR_FB_passthrough ... XRCameraSubsystem won't be created"),
+// leaving a mixed-reality scene over black. Answered only for an instance that
+// enabled the extension; every other chained struct is still left untouched.
+//
+// The chain is walked through vm_read_overwrite rather than dereferenced: some
+// guests leave `next` as stack garbage on this very call (see klxr_log_chain), and
+// a probe that fails ends the walk instead of faulting. A node is written only
+// when its type is exactly one of the two structure types, which garbage does
+// not produce. KL_XR_PASSTHROUGH_PROPS=0 restores the old silence.
+#include <mach/mach.h>
+static int mv_xr_fb_passthrough_on;
+static int mv_xr_probe(const void *p, void *out, size_t len) {
+    if (!p || ((uintptr_t)p & 7)) return 0;
+    vm_size_t got = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)p, (vm_size_t)len,
+                             (vm_address_t)out, &got) == KERN_SUCCESS && got == len;
+}
+static void mv_xr_system_props_chain(const void *next) {
+    if (!mv_xr_fb_passthrough_on || !kl_env_on("KL_XR_PASSTHROUGH_PROPS", 1)) return;
+    for (int depth = 0; next && depth < 16; depth++) {
+        struct { int32_t type; uint32_t pad; const void *next; } h;
+        if (!mv_xr_probe(next, &h, sizeof h)) return;
+        if (h.type == 1000118000) {          // XrSystemPassthroughPropertiesFB
+            *(uint32_t *)((char *)(uintptr_t)next + 16) = 1;   // supportsPassthrough
+            static int said;
+            if (!said++) fprintf(stderr, "  [xr] xrGetSystemProperties: "
+                                         "XrSystemPassthroughPropertiesFB -> supported\n");
+        } else if (h.type == 1000118006) {   // XrSystemPassthroughProperties2FB
+            // PASSTHROUGH_CAPABILITY_BIT_FB | COLOR_BIT_FB: the room is in colour;
+            // no LAYER_DEPTH, since nothing here composites against its depth.
+            *(uint64_t *)((char *)(uintptr_t)next + 16) = 0x1 | 0x2;
+            static int said;
+            if (!said++) fprintf(stderr, "  [xr] xrGetSystemProperties: "
+                                         "XrSystemPassthroughProperties2FB -> passthrough, colour\n");
+        }
+        next = h.next;
+    }
+}
+
+''' + old)
+    old = ("    for (uint32_t i = 0; i < info->enabledExtensionCount; i++) {\n"
+           "        const char *name = info->enabledExtensionNames[i];\n"
+           "        int known = klxr_ext_advertised(name);\n")
+    s = sub(p, s, old, "    mv_xr_fb_passthrough_on = 0;   // " + marker + "\n" + old)
+    old = '        if (strcmp(name, "XR_KHR_vulkan_enable") == 0)    g_instance.ext_vulkan = 1;\n'
+    s = sub(p, s, old, old +
+        '        if (strcmp(name, "XR_FB_passthrough") == 0) mv_xr_fb_passthrough_on = 1;   // ' + marker + '\n')
+    old = '    klxr_log_chain("xrGetSystemProperties", props->next);\n'
+    s = sub(p, s, old, old +
+        '    mv_xr_system_props_chain(props->next);   // ' + marker + '\n')
+    open(p, "w").write(s)
+print("overlay: xrGetSystemProperties answers the XR_FB_passthrough system properties")
+PYEOF
