@@ -8476,6 +8476,1850 @@ static klj_val mv_vw_destroy(void *env, void *self, const klj_val *a, int n) {
 print("overlay: the 3D WebView answers 'no web content' and tells C# so")
 PYEOF
 
+# 90 — a stored zip entry's byte range, for the host. A video plugin opens
+# jar:file://<obb>!/assets/<movie>.mp4 and plays it in place, as Android's
+# extractor does on a stored entry; the archive reader here only answered the
+# guest's java.util.zip calls. mv_zip_stored_range(zip, entry, &off, &len)
+# finds the entry (the last archive's directory is kept, so an OBB is read
+# once), refuses a compressed one (-2) and answers where its bytes begin, from
+# the entry's local header.
+python3 - "$K/runtime/jni/kl_jni_io.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+marker = "metavision: a stored zip entry's byte range (step 90)"
+def sub(s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+if marker not in s:
+    old = "static klj_val klj_ZipFile_init(void *env, void *clazz, const klj_val *a, int n) {\n"
+    s = sub(s, old, "// " + marker + r'''. 0 and the range; -1 no
+// such archive or entry; -2 the entry is compressed.
+int mv_zip_stored_range(const char *zip, const char *entry, uint64_t *off, uint64_t *len) {
+    static pthread_mutex_t lk = PTHREAD_MUTEX_INITIALIZER;
+    static klj_zip *z;
+    if (!zip || !entry || !off || !len) return -1;
+    pthread_mutex_lock(&lk);
+    if (!z || strcmp(z->path, zip) != 0) {
+        if (z) { if (z->f) fclose(z->f); free(z->e); free(z); z = NULL; }
+        klj_zip *n = calloc(1, sizeof *n);
+        if (n && klj_zip_open(n, zip) == 0) z = n;
+        else if (n) { if (n->f) fclose(n->f); free(n->e); free(n); }
+    }
+    int rc = -1;
+    const klj_zent *e = z ? klj_zip_find(z, entry) : NULL;
+    uint64_t data = 0;
+    if (e && e->method != 0) rc = -2;
+    else if (e && klj_zip_data_off(z, e, &data) == 0) {
+        *off = data;
+        *len = e->size;
+        rc = 0;
+    }
+    pthread_mutex_unlock(&lk);
+    return rc;
+}
+
+''' + old)
+    open(p, "w").write(s)
+print("overlay: the host finds a stored zip entry's byte range")
+PYEOF
+
+# 91 — a video-player plugin's Java side, as runtime/jni/kl_jni_videoplugin.c.
+# The plugin's native library is thin (no GL, no codec): it caches static method
+# IDs on its Java class in nativeInit — which the class initialiser calls, and
+# which never ran — and forwards render events and getters to them. Nothing
+# answered any of it, so every player failed to create. The file is that Java,
+# on the host's pieces: the class initialiser on first construction (load the
+# library, nativeInit with the class); players with the Java's command queue
+# and states; a source that is a file or a stored entry of an OBB/APK
+# (step 90); per-player extractor -> AMediaCodec into a SurfaceTexture's
+# window (steps 82, 84, 85, through klj_call_binding, step 81), frames
+# released at their presentation time against the player's clock; on the
+# render thread updateTexImage, and for the non-OES path a draw through the
+# texture transform into an RGBA FBO texture that saves and restores GL state;
+# AAC decoded to 48 kHz stereo into a ring per player and mixed into the open
+# device as one source (never reopened), the sound driving the clock; GL
+# objects of a destroyed player deleted on the render thread.
+# MV_VIDEO_PLUGIN=0 refuses CreatePlayer.
+python3 - "$K/runtime/jni/kl_jni_videoplugin.c" <<'PYEOF'
+import os, sys
+p = sys.argv[1]
+src = r'''// metavision: a video-player plugin's Java side (step 91)
+//
+// The plugin's Android build is three layers: C# in the title, a thin native
+// library (no GL, no codec — it stores the JavaVM in JNI_OnLoad, caches static
+// method IDs on its Java interface class in nativeInit and forwards render
+// events and a few getters to them) and a Java player (MediaPlayer or ExoPlayer
+// into a SurfaceTexture). The Java is what is missing here, so this file is
+// that Java, on the host's own media pieces:
+//
+//  - the interface class: <init> does what its class initialiser would (load
+//    the library, call nativeInit with the class), the version string,
+//    SetContext, CreatePlayer (lowest free index, as the Java), DestroyPlayer,
+//    and the static render-event / getter surface the native library calls.
+//  - the player object: its public methods, the same command queue
+//    (Play/Pause/Stop/Seek wait until the source is prepared and replace each
+//    other as the Java's RemoveDuplicateCommand does) and the same states
+//    (Idle 0 .. Finished 8; no texture below Prepared).
+//  - a source is a plain or file:// path, or jar:file://<zip>!/<entry> — a
+//    stored entry of an OBB or APK, demuxed in place (AMediaExtractor on the
+//    file's byte range).
+//  - RendererSetupPlayer (render thread): a GL texture, a SurfaceTexture over
+//    it (step 85) with the player as its frame listener, its Surface and that
+//    Surface's window (step 84). A worker thread per player feeds extractor ->
+//    AMediaCodec configured with the window and releases each frame at its
+//    presentation time against the player's clock with
+//    releaseOutputBufferAtTime (step 82); decode order is put back into
+//    presentation order through a small hold-back.
+//  - RenderPlayer (render thread): updateTexImage for each frame that arrived.
+//    The fast-OES path hands out that texture; otherwise the frame is drawn
+//    through the SurfaceTexture's transform into an RGBA texture behind an FBO
+//    (as the Java's GlRender does), saving and restoring the GL state it
+//    touches.
+//  - sound: an AAC track decodes to PCM on its own thread into a per-player
+//    ring (48 kHz stereo); one mixer thread sums the playing players (volume,
+//    mute, pan) into the open device as a single source, never reopening it,
+//    and the sound it has handed over drives that player's clock.
+//  - GL objects of a destroyed player are deleted on the render thread.
+//
+// MV_VIDEO_PLUGIN=0 refuses CreatePlayer (the title's own no-player path).
+#include <errno.h>
+#include <fcntl.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#include "kl_jni_int.h"
+#include "klepton.h"
+#include "kl_env.h"
+#include "kl_audio.h"
+#include "kl_egl.h"
+#include "kl_glfb.h"
+#include "kl_mediandk.h"
+#include "kl_ndk.h"
+
+void *klb_dlopen(const char *path, int flags);   // kl_dl.c — the guest's own dlopen
+void *klb_dlsym(void *handle, const char *name);
+int   mv_zip_stored_range(const char *zip, const char *entry, uint64_t *off, uint64_t *len);   // step 90
+
+#define AVP_IFACE   "com/RenderHeads/AVProVideo/AVProMobileVideo"
+#define AVP_PLAYER  "com/RenderHeads/AVProVideo/AVProVideoPlayer"
+#define AVP_ST      "android/graphics/SurfaceTexture"
+#define AVP_SURFACE "android/view/Surface"
+#define AVP_ST_SIG  "Landroid/graphics/SurfaceTexture;"
+#define AVP_MAX     16          // players alive at once (the Java allows 256 indices)
+#define AVP_RATE    48000       // the device's rate; the mixer never reopens it
+#define AVP_RING    24000       // frames of stereo a player decodes ahead of the mixer
+#define AVP_MIX     960         // frames per mixer write (20 ms)
+#define AVP_LAT_US  80000       // what the device holds beyond the mixer's last write
+#define AVP_HOLD    3           // decoded frames held back to restore presentation order
+
+enum { ST_IDLE, ST_OPENING, ST_PREPARING, ST_PREPARED, ST_BUFFERING, ST_PLAYING,
+       ST_STOPPED, ST_PAUSED, ST_FINISHED };
+enum { CMD_PLAY, CMD_PAUSE, CMD_STOP, CMD_SEEK, CMD_AUDIO, CMD_LOOP, CMD_SEEKFAST };
+enum { ERR_LOAD = 100, ERR_DECODE = 200 };
+
+static int64_t avp_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+// ---------------------------------------------------------------- the NDK media calls
+// Through the same door a native plugin's imports resolve through.
+typedef struct { int32_t offset, size; int64_t pts; uint32_t flags; } avp_bufinfo;
+static struct {
+    int ok;
+    void   *(*ex_new)(void);
+    int     (*ex_delete)(void *);
+    int     (*ex_fd)(void *, int, int64_t, int64_t);
+    size_t  (*ex_count)(void *);
+    void   *(*ex_format)(void *, size_t);
+    int     (*ex_select)(void *, size_t);
+    ssize_t (*ex_read)(void *, uint8_t *, size_t);
+    int64_t (*ex_time)(void *);
+    bool    (*ex_advance)(void *);
+    int     (*ex_seek)(void *, int64_t, int);
+    int     (*fmt_delete)(void *);
+    bool    (*fmt_i32)(void *, const char *, int32_t *);
+    bool    (*fmt_i64)(void *, const char *, int64_t *);
+    bool    (*fmt_str)(void *, const char *, const char **);
+    void   *(*codec_new)(const char *);
+    int     (*codec_configure)(void *, const void *, void *, void *, uint32_t);
+    int     (*codec_start)(void *);
+    int     (*codec_stop)(void *);
+    int     (*codec_flush)(void *);
+    int     (*codec_delete)(void *);
+    ssize_t (*codec_in)(void *, int64_t);
+    uint8_t *(*codec_inbuf)(void *, size_t, size_t *);
+    int     (*codec_queue)(void *, size_t, off_t, size_t, uint64_t, uint32_t);
+    ssize_t (*codec_out)(void *, avp_bufinfo *, int64_t);
+    uint8_t *(*codec_outbuf)(void *, size_t, size_t *);
+    void   *(*codec_outfmt)(void *);
+    int     (*codec_release)(void *, size_t, bool);
+    int     (*codec_release_at)(void *, size_t, int64_t);
+    void   *(*win_from_surface)(void *, void *);
+    void    (*win_release)(void *);
+} M;
+static pthread_once_t avp_media_once = PTHREAD_ONCE_INIT;
+static void avp_media_load(void) {
+    int ok = 1;
+#define MR(f, n) do { *(void **)&M.f = kl_mediandk_lookup(n); if (!M.f) ok = 0; } while (0)
+    MR(ex_new, "AMediaExtractor_new");
+    MR(ex_delete, "AMediaExtractor_delete");
+    MR(ex_fd, "AMediaExtractor_setDataSourceFd");
+    MR(ex_count, "AMediaExtractor_getTrackCount");
+    MR(ex_format, "AMediaExtractor_getTrackFormat");
+    MR(ex_select, "AMediaExtractor_selectTrack");
+    MR(ex_read, "AMediaExtractor_readSampleData");
+    MR(ex_time, "AMediaExtractor_getSampleTime");
+    MR(ex_advance, "AMediaExtractor_advance");
+    MR(ex_seek, "AMediaExtractor_seekTo");
+    MR(fmt_delete, "AMediaFormat_delete");
+    MR(fmt_i32, "AMediaFormat_getInt32");
+    MR(fmt_i64, "AMediaFormat_getInt64");
+    MR(fmt_str, "AMediaFormat_getString");
+    MR(codec_new, "AMediaCodec_createDecoderByType");
+    MR(codec_configure, "AMediaCodec_configure");
+    MR(codec_start, "AMediaCodec_start");
+    MR(codec_stop, "AMediaCodec_stop");
+    MR(codec_flush, "AMediaCodec_flush");
+    MR(codec_delete, "AMediaCodec_delete");
+    MR(codec_in, "AMediaCodec_dequeueInputBuffer");
+    MR(codec_inbuf, "AMediaCodec_getInputBuffer");
+    MR(codec_queue, "AMediaCodec_queueInputBuffer");
+    MR(codec_out, "AMediaCodec_dequeueOutputBuffer");
+    MR(codec_outbuf, "AMediaCodec_getOutputBuffer");
+    MR(codec_outfmt, "AMediaCodec_getOutputFormat");
+    MR(codec_release, "AMediaCodec_releaseOutputBuffer");
+    MR(codec_release_at, "AMediaCodec_releaseOutputBufferAtTime");
+#undef MR
+    *(void **)&M.win_from_surface = kl_ndk_lookup("ANativeWindow_fromSurface");
+    *(void **)&M.win_release = kl_ndk_lookup("ANativeWindow_release");
+    M.ok = ok && M.win_from_surface;
+    if (!M.ok) KLJ_LOG("video plugin: the NDK media calls are not all here — no playback");
+}
+
+// ---------------------------------------------------------------- GL, render thread only
+#define GL_TEXTURE_2D_            0x0DE1
+#define GL_TEXTURE_MAG_FILTER_    0x2800
+#define GL_TEXTURE_MIN_FILTER_    0x2801
+#define GL_TEXTURE_WRAP_S_        0x2802
+#define GL_TEXTURE_WRAP_T_        0x2803
+#define GL_LINEAR_                0x2601
+#define GL_CLAMP_TO_EDGE_         0x812F
+#define GL_RGBA8_                 0x8058
+#define GL_DRAW_FRAMEBUFFER_      0x8CA9
+#define GL_READ_FRAMEBUFFER_      0x8CA8
+#define GL_DRAW_FB_BINDING_       0x8CA6
+#define GL_READ_FB_BINDING_       0x8CAA
+#define GL_COLOR_ATTACHMENT0_     0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE_  0x8CD5
+#define GL_VIEWPORT_              0x0BA2
+#define GL_CURRENT_PROGRAM_       0x8B8D
+#define GL_VERTEX_ARRAY_BINDING_  0x85B5
+#define GL_ACTIVE_TEXTURE_        0x84E0
+#define GL_TEXTURE0_              0x84C0
+#define GL_TEXTURE_BINDING_2D_    0x8069
+#define GL_SAMPLER_BINDING_       0x8919
+#define GL_COLOR_WRITEMASK_       0x0C23
+#define GL_TRIANGLE_STRIP_        0x0005
+#define GL_VERTEX_SHADER_         0x8B31
+#define GL_FRAGMENT_SHADER_       0x8B30
+#define GL_COMPILE_STATUS_        0x8B81
+#define GL_LINK_STATUS_           0x8B82
+static const uint32_t avp_caps[] = {
+    0x0BE2 /* BLEND */, 0x0B71 /* DEPTH_TEST */, 0x0B44 /* CULL_FACE */, 0x0C11 /* SCISSOR_TEST */,
+    0x0B90 /* STENCIL_TEST */, 0x8C89 /* RASTERIZER_DISCARD */, 0x8037 /* POLYGON_OFFSET_FILL */,
+    0x809E /* SAMPLE_ALPHA_TO_COVERAGE */, 0x80A0 /* SAMPLE_COVERAGE */,
+};
+#define AVP_NCAPS (sizeof avp_caps / sizeof avp_caps[0])
+
+static struct {
+    int tried, ok;
+    void     (*GenTextures)(int32_t, uint32_t *);
+    void     (*DeleteTextures)(int32_t, const uint32_t *);
+    void     (*BindTexture)(uint32_t, uint32_t);
+    void     (*TexParameteri)(uint32_t, uint32_t, int32_t);
+    void     (*TexStorage2D)(uint32_t, int32_t, uint32_t, int32_t, int32_t);
+    void     (*GenFramebuffers)(int32_t, uint32_t *);
+    void     (*DeleteFramebuffers)(int32_t, const uint32_t *);
+    void     (*BindFramebuffer)(uint32_t, uint32_t);
+    void     (*FramebufferTexture2D)(uint32_t, uint32_t, uint32_t, uint32_t, int32_t);
+    uint32_t (*CheckFramebufferStatus)(uint32_t);
+    void     (*Viewport)(int32_t, int32_t, int32_t, int32_t);
+    void     (*GetIntegerv)(uint32_t, int32_t *);
+    void     (*GetBooleanv)(uint32_t, uint8_t *);
+    uint8_t  (*IsEnabled)(uint32_t);
+    void     (*Enable)(uint32_t);
+    void     (*Disable)(uint32_t);
+    void     (*ColorMask)(uint8_t, uint8_t, uint8_t, uint8_t);
+    void     (*ActiveTexture)(uint32_t);
+    void     (*BindSampler)(uint32_t, uint32_t);
+    uint32_t (*CreateShader)(uint32_t);
+    void     (*ShaderSource)(uint32_t, int32_t, const char *const *, const int32_t *);
+    void     (*CompileShader)(uint32_t);
+    void     (*GetShaderiv)(uint32_t, uint32_t, int32_t *);
+    void     (*GetShaderInfoLog)(uint32_t, int32_t, int32_t *, char *);
+    void     (*DeleteShader)(uint32_t);
+    uint32_t (*CreateProgram)(void);
+    void     (*AttachShader)(uint32_t, uint32_t);
+    void     (*LinkProgram)(uint32_t);
+    void     (*GetProgramiv)(uint32_t, uint32_t, int32_t *);
+    void     (*DeleteProgram)(uint32_t);
+    void     (*UseProgram)(uint32_t);
+    int32_t  (*GetUniformLocation)(uint32_t, const char *);
+    void     (*Uniform1i)(int32_t, int32_t);
+    void     (*UniformMatrix4fv)(int32_t, int32_t, uint8_t, const float *);
+    void     (*GenVertexArrays)(int32_t, uint32_t *);
+    void     (*BindVertexArray)(uint32_t);
+    void     (*DrawArrays)(uint32_t, int32_t, int32_t);
+    uint32_t prog, vao;
+    int32_t  u_m, u_tex;
+    int      prog_failed;
+} G;
+
+// Through the guest's own GL door (kl_egl_sym), so whatever the runtime
+// tracks about GL objects and bindings sees these calls as well.
+static int avp_gl_load(void) {
+    if (G.tried) return G.ok;
+    G.tried = 1;
+    int ok = 1;
+#define GR(n) do { *(void **)&G.n = kl_egl_sym("gl" #n); if (!G.n) ok = 0; } while (0)
+    GR(GenTextures); GR(DeleteTextures); GR(BindTexture); GR(TexParameteri); GR(TexStorage2D);
+    GR(GenFramebuffers); GR(DeleteFramebuffers); GR(BindFramebuffer); GR(FramebufferTexture2D);
+    GR(CheckFramebufferStatus); GR(Viewport); GR(GetIntegerv); GR(GetBooleanv); GR(IsEnabled);
+    GR(Enable); GR(Disable); GR(ColorMask); GR(ActiveTexture); GR(BindSampler); GR(CreateShader);
+    GR(ShaderSource); GR(CompileShader); GR(GetShaderiv); GR(GetShaderInfoLog); GR(DeleteShader);
+    GR(CreateProgram); GR(AttachShader); GR(LinkProgram); GR(GetProgramiv); GR(DeleteProgram);
+    GR(UseProgram); GR(GetUniformLocation); GR(Uniform1i); GR(UniformMatrix4fv);
+    GR(GenVertexArrays); GR(BindVertexArray); GR(DrawArrays);
+#undef GR
+    G.ok = ok;
+    if (!ok) KLJ_LOG("video plugin: GL entry points missing — no video texture");
+    return ok;
+}
+
+static const char avp_vs[] =
+    "#version 300 es\n"
+    "uniform mat4 u_m;\n"
+    "out vec2 v_uv;\n"
+    "void main() {\n"
+    "    vec2 p = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+    "    v_uv = (u_m * vec4(p, 0.0, 1.0)).xy;\n"
+    "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+static const char avp_fs[] =
+    "#version 300 es\n"
+    "precision mediump float;\n"
+    "uniform sampler2D u_tex;\n"
+    "in vec2 v_uv;\n"
+    "out vec4 o;\n"
+    "void main() { o = texture(u_tex, v_uv); }\n";
+
+static uint32_t avp_shader(uint32_t kind, const char *src) {
+    uint32_t s = G.CreateShader(kind);
+    G.ShaderSource(s, 1, &src, NULL);
+    G.CompileShader(s);
+    int32_t ok = 0;
+    G.GetShaderiv(s, GL_COMPILE_STATUS_, &ok);
+    if (!ok) {
+        char log[512] = "";
+        G.GetShaderInfoLog(s, sizeof log, NULL, log);
+        KLJ_LOG("video plugin: blit shader did not compile: %s", log);
+        G.DeleteShader(s);
+        return 0;
+    }
+    return s;
+}
+static int avp_prog(void) {
+    if (G.prog) return 1;
+    if (G.prog_failed || !avp_gl_load()) return 0;
+    uint32_t vs = avp_shader(GL_VERTEX_SHADER_, avp_vs), fs = avp_shader(GL_FRAGMENT_SHADER_, avp_fs);
+    uint32_t p = (vs && fs) ? G.CreateProgram() : 0;
+    int32_t ok = 0;
+    if (p) {
+        G.AttachShader(p, vs);
+        G.AttachShader(p, fs);
+        G.LinkProgram(p);
+        G.GetProgramiv(p, GL_LINK_STATUS_, &ok);
+    }
+    if (vs) G.DeleteShader(vs);
+    if (fs) G.DeleteShader(fs);
+    if (!ok) {
+        if (p) G.DeleteProgram(p);
+        G.prog_failed = 1;
+        KLJ_LOG("video plugin: blit program did not link — the RGBA path shows nothing");
+        return 0;
+    }
+    G.prog = p;
+    G.u_m = G.GetUniformLocation(p, "u_m");
+    G.u_tex = G.GetUniformLocation(p, "u_tex");
+    G.GenVertexArrays(1, &G.vao);   // empty: the quad comes from gl_VertexID
+    return 1;
+}
+
+static void avp_tex_params(uint32_t tex) {
+    int32_t prev = 0;
+    G.GetIntegerv(GL_TEXTURE_BINDING_2D_, &prev);
+    G.BindTexture(GL_TEXTURE_2D_, tex);
+    G.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MIN_FILTER_, GL_LINEAR_);
+    G.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_MAG_FILTER_, GL_LINEAR_);
+    G.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_S_, GL_CLAMP_TO_EDGE_);
+    G.TexParameteri(GL_TEXTURE_2D_, GL_TEXTURE_WRAP_T_, GL_CLAMP_TO_EDGE_);
+    G.BindTexture(GL_TEXTURE_2D_, (uint32_t)prev);
+}
+
+// ---------------------------------------------------------------- the player
+typedef struct avp {
+    int       index, alive, api, fast_oes, poster;
+    void     *self;                    // the pinned player jobject
+    pthread_mutex_t lk;
+    // the source
+    char      src[1024];
+    int64_t   src_off, src_len;
+    // facts the worker reads from the file
+    int       w, h, has_video, has_audio, n_audio;
+    int64_t   dur_ms;
+    float     fps;
+    // state, as the Java keeps it
+    int       state, looping, muted, accept, seeking, video_done;
+    float     volume, pan, rate;
+    int       last_error, deinit_flagged, deinitialised, extracting;
+    struct { int cmd, val; } q[16];
+    int       nq;
+    // the clock: clock_us at clock_ns, advancing at `rate` while clock_run
+    int       clock_run;
+    int64_t   clock_us, clock_ns;
+    unsigned  seek_gen;
+    int64_t   seek_us;
+    int       seek_fast;
+    // threads
+    pthread_t vthr, athr;
+    int       vthr_on, athr_on;
+    atomic_int quit;
+    void     *aex, *afmt;              // handed from the worker to the sound thread
+    // GL objects (render thread); window also read by the worker under lk
+    uint32_t  oes_tex, fbo, rgba_tex;
+    int32_t   rgba_w, rgba_h;
+    void     *st, *surface, *window, *mtx;
+    int       gl_setup, want_target, latched;
+    atomic_int frames_avail;
+    int       frame_count;
+    int64_t   tex_ts_ns;
+    int64_t   dr_t0_ns;
+    long      dr_frames;
+    float     display_rate;
+    // sound: decoded 48 kHz stereo, ahead of the mixer
+    int16_t  *ring;
+    int       ring_r, ring_n;
+    int64_t   ring_pts;                // presentation time of the next frame out
+} avp;
+
+static avp            *g_slot[AVP_MAX];
+static pthread_mutex_t g_tab_lk = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_open_lk = PTHREAD_MUTEX_INITIALIZER;   // one extractor open at a time
+static void           *g_iface;        // s_Interface
+static int             g_iface_live;
+
+typedef struct avp_grave {
+    uint32_t tex[2], fbo;
+    void    *st, *surface, *window;
+    struct avp_grave *next;
+} avp_grave;
+static avp_grave *g_graves;            // under g_tab_lk; emptied on the render thread
+
+static avp *avp_of(void *obj) {
+    klj_object *o = klj_as_object(obj);
+    return (o && o->data && strcmp(o->cls, AVP_PLAYER) == 0) ? o->data : NULL;
+}
+static avp *avp_at(int index) {
+    avp *p = NULL;
+    pthread_mutex_lock(&g_tab_lk);
+    if (g_iface_live && index >= 0 && index < AVP_MAX) p = g_slot[index];
+    pthread_mutex_unlock(&g_tab_lk);
+    return p;
+}
+
+// ---- the clock (lk held)
+static int64_t clk_locked(avp *p) {
+    if (!p->clock_run) return p->clock_us;
+    return p->clock_us + (int64_t)((double)(avp_now_ns() - p->clock_ns) / 1000.0 * (double)p->rate);
+}
+static void clk_set_locked(avp *p, int64_t us) {
+    p->clock_us = us < 0 ? 0 : us;
+    p->clock_ns = avp_now_ns();
+}
+static void clk_run_locked(avp *p, int run) {
+    if (!!run == !!p->clock_run) return;
+    p->clock_us = clk_locked(p);
+    p->clock_ns = avp_now_ns();
+    p->clock_run = run;
+}
+
+// ---- commands (lk held)
+static void seek_locked(avp *p, int64_t us, int fast) {
+    if (us < 0) us = 0;
+    if (p->dur_ms > 0 && us > p->dur_ms * 1000) us = p->dur_ms * 1000;
+    p->seek_us = us;
+    p->seek_fast = fast;
+    p->seek_gen++;
+    p->seeking = 1;
+    p->video_done = 0;
+    clk_set_locked(p, us);
+    if (p->state == ST_FINISHED) { p->state = ST_PLAYING; clk_run_locked(p, 1); }   // the Java player: ready again, still playWhenReady
+}
+static void cmd_apply_locked(avp *p, int cmd, int val) {
+    switch (cmd) {
+    case CMD_PLAY:
+        if (p->state == ST_FINISHED) seek_locked(p, 0, 0);
+        p->state = ST_PLAYING;
+        clk_run_locked(p, 1);
+        break;
+    case CMD_PAUSE:
+        if (p->state != ST_STOPPED && p->state != ST_FINISHED) { p->state = ST_PAUSED; clk_run_locked(p, 0); }
+        break;
+    case CMD_STOP:
+        p->state = ST_STOPPED;
+        clk_run_locked(p, 0);
+        break;
+    case CMD_SEEK:     seek_locked(p, (int64_t)val * 1000, 0); break;
+    case CMD_SEEKFAST: seek_locked(p, (int64_t)val * 1000, 1); break;
+    default: break;                    // volumes and looping are read where they are used
+    }
+}
+static void cmd_run_locked(avp *p) {
+    if (!p->accept) return;
+    for (int i = 0; i < p->nq; i++) cmd_apply_locked(p, p->q[i].cmd, p->q[i].val);
+    p->nq = 0;
+}
+static void cmd_remove_locked(avp *p, int cmd) {
+    for (int i = 0; i < p->nq; i++)
+        if (p->q[i].cmd == cmd) {
+            memmove(&p->q[i], &p->q[i + 1], (size_t)(p->nq - i - 1) * sizeof p->q[0]);
+            p->nq--;
+            return;                    // the Java removes the first match only
+        }
+}
+static void cmd_add(avp *p, int cmd, int val, const int *drop, int ndrop) {
+    pthread_mutex_lock(&p->lk);
+    for (int i = 0; i < ndrop; i++) cmd_remove_locked(p, drop[i]);
+    if (p->nq < (int)(sizeof p->q / sizeof p->q[0])) {
+        p->q[p->nq].cmd = cmd;
+        p->q[p->nq].val = val;
+        p->nq++;
+    }
+    cmd_run_locked(p);
+    pthread_mutex_unlock(&p->lk);
+}
+
+// ---------------------------------------------------------------- the source
+// jar:file://<zip>!/<entry> (a stored entry), file://<path> or <path>.
+static int avp_resolve(const char *url, int64_t extra, char *out, size_t cap,
+                       int64_t *off, int64_t *len) {
+    char tmp[1024], buf[1024];
+    const char *s = url;
+    int jar = 0;
+    if (!strncmp(s, "jar:", 4)) { s += 4; jar = 1; }
+    if (!strncmp(s, "file://", 7)) s += 7;
+    else if (strstr(s, "://")) {
+        KLJ_LOG("video plugin: \"%s\" is a stream — only local files play here", url);
+        return -1;
+    }
+    struct stat sb;
+    if (jar) {
+        const char *bang = strstr(s, "!/");
+        if (!bang || (size_t)(bang - s) >= sizeof tmp) return -1;
+        memcpy(tmp, s, (size_t)(bang - s));
+        tmp[bang - s] = 0;
+        const char *zip = kl_guest_path(tmp, buf, sizeof buf);
+        snprintf(out, cap, "%s", zip);
+        uint64_t o = 0, l = 0;
+        int rc = mv_zip_stored_range(out, bang + 2, &o, &l);
+        if (rc == -2) {
+            KLJ_LOG("video plugin: %s in %s is compressed — a video must be stored to play in place",
+                    bang + 2, out);
+            return -1;
+        }
+        if (rc == 0) {
+            *off = (int64_t)o;
+            *len = (int64_t)l;
+        } else {
+            // Not a readable archive here (an APK the runtime unpacked): the
+            // entry as a file beside it.
+            snprintf(tmp, sizeof tmp, "%s/%s", out, bang + 2);
+            const char *f = kl_guest_path(tmp, buf, sizeof buf);
+            if (stat(f, &sb) != 0) {
+                KLJ_LOG("video plugin: %s not found in %s", bang + 2, out);
+                return -1;
+            }
+            snprintf(out, cap, "%s", f);
+            *off = 0;
+            *len = (int64_t)sb.st_size;
+        }
+    } else {
+        const char *f = kl_guest_path(s, buf, sizeof buf);
+        if (stat(f, &sb) != 0) {
+            KLJ_LOG("video plugin: cannot open %s: %s", f, strerror(errno));
+            return -1;
+        }
+        snprintf(out, cap, "%s", f);
+        *off = 0;
+        *len = (int64_t)sb.st_size;
+    }
+    if (extra > 0 && extra < *len) { *off += extra; *len -= extra; }
+    return 0;
+}
+
+// ---------------------------------------------------------------- the sound ring
+static void ring_flush(avp *p) {
+    pthread_mutex_lock(&p->lk);
+    p->ring_r = p->ring_n = 0;
+    pthread_mutex_unlock(&p->lk);
+}
+
+// Push `n` stereo frames presented from `pts`; waits for room. 0 if a seek or
+// quit came first (the frames are stale then).
+static int ring_push(avp *p, const int16_t *pcm, int n, int64_t pts, unsigned gen) {
+    while (n > 0) {
+        if (atomic_load(&p->quit)) return 0;
+        pthread_mutex_lock(&p->lk);
+        if (p->seek_gen != gen) { pthread_mutex_unlock(&p->lk); return 0; }
+        int room = AVP_RING - p->ring_n;
+        if (room <= 0) { pthread_mutex_unlock(&p->lk); usleep(5000); continue; }
+        int take = n < room ? n : room;
+        if (!p->ring_n) { p->ring_pts = pts; p->ring_r = 0; }
+        for (int i = 0; i < take; i++) {
+            int at = (p->ring_r + p->ring_n + i) % AVP_RING;
+            p->ring[2 * at] = pcm[2 * i];
+            p->ring[2 * at + 1] = pcm[2 * i + 1];
+        }
+        p->ring_n += take;
+        pthread_mutex_unlock(&p->lk);
+        pcm += 2 * take;
+        n -= take;
+        pts += (int64_t)take * 1000000 / AVP_RATE;
+    }
+    return 1;
+}
+
+// One source into the device for every player: the device keeps a handful of
+// source slots for the life of the process, so players do not each take one.
+static char           g_mix_key;
+static pthread_once_t g_mix_once = PTHREAD_ONCE_INIT;
+static void *avp_mix_main(void *arg) {
+    (void)arg;
+    static int16_t out[AVP_MIX * 2];
+    static int32_t acc[AVP_MIX * 2];
+    for (;;) {
+        int any = 0;
+        memset(acc, 0, sizeof acc);
+        int dev = kl_audio_active();
+        pthread_mutex_lock(&g_tab_lk);
+        for (int s = 0; s < AVP_MAX; s++) {
+            avp *p = g_slot[s];
+            if (!p || !p->ring) continue;
+            pthread_mutex_lock(&p->lk);
+            if (p->state == ST_PLAYING && p->rate == 1.0f && p->ring_n > 0) {
+                int take = p->ring_n < AVP_MIX ? p->ring_n : AVP_MIX;
+                float v = p->muted ? 0.0f : p->volume;
+                float gl = v * (p->pan > 0 ? 1.0f - p->pan : 1.0f);
+                float gr = v * (p->pan < 0 ? 1.0f + p->pan : 1.0f);
+                for (int i = 0; i < take; i++) {
+                    int at = (p->ring_r + i) % AVP_RING;
+                    acc[2 * i]     += (int32_t)lrintf((float)p->ring[2 * at] * gl);
+                    acc[2 * i + 1] += (int32_t)lrintf((float)p->ring[2 * at + 1] * gr);
+                }
+                p->ring_r = (p->ring_r + take) % AVP_RING;
+                p->ring_n -= take;
+                p->ring_pts += (int64_t)take * 1000000 / AVP_RATE;
+                // What is heard now is what was handed over a device-latency ago:
+                // the sound sets the clock while there is sound.
+                int64_t heard = p->ring_pts - AVP_LAT_US;
+                int64_t c = clk_locked(p);
+                if (dev && !p->seeking && heard > 0 && llabs(heard - c) > 80000) clk_set_locked(p, heard);
+                any = 1;
+            }
+            pthread_mutex_unlock(&p->lk);
+        }
+        pthread_mutex_unlock(&g_tab_lk);
+        if (!any) { usleep(10000); continue; }
+        for (int i = 0; i < AVP_MIX * 2; i++)
+            out[i] = (int16_t)(acc[i] > 32767 ? 32767 : acc[i] < -32768 ? -32768 : acc[i]);
+        size_t want = sizeof out, put = dev ? kl_audio_write_src(&g_mix_key, out, want) : 0;
+        if (put < want) usleep((useconds_t)((want - put) / 4 * 1000000ull / AVP_RATE));
+    }
+    return NULL;
+}
+static void avp_mix_start(void) {
+    pthread_t t;
+    if (pthread_create(&t, NULL, avp_mix_main, NULL) == 0) pthread_detach(t);
+}
+
+// AAC track -> 48 kHz stereo -> the ring.
+static void *avp_audio_main(void *arg) {
+    avp *p = arg;
+    void *ex = p->aex, *fmt = p->afmt;
+    int16_t *tmp = NULL;               // the resampled buffer
+    size_t tmp_cap = 0;
+    void *codec = M.codec_new("audio/mp4a-latm");
+    if (!codec || M.codec_configure(codec, fmt, NULL, NULL, 0) != 0 || M.codec_start(codec) != 0) {
+        KLJ_LOG("video plugin player %d: no AAC decoder — video only", p->index);
+        goto done;
+    }
+    int32_t rate = 0, ch = 0;
+    M.fmt_i32(fmt, "sample-rate", &rate);
+    M.fmt_i32(fmt, "channel-count", &ch);
+    if (rate <= 0) rate = 44100;
+    if (ch <= 0) ch = 2;
+    pthread_mutex_lock(&p->lk);
+    unsigned gen = p->seek_gen;
+    pthread_mutex_unlock(&p->lk);
+    int in_eos = 0;
+    int64_t drop_until = -1, last_out = avp_now_ns();
+    double phase = 0;                  // resampler position within the input
+    int16_t prev[2] = {0, 0};
+    while (!atomic_load(&p->quit)) {
+        pthread_mutex_lock(&p->lk);
+        unsigned g = p->seek_gen;
+        int64_t tgt = p->seek_us, clk = clk_locked(p);
+        int master = !p->has_video, loop = p->looping, done = p->video_done;
+        pthread_mutex_unlock(&p->lk);
+        if (g != gen) {
+            gen = g;
+            M.codec_flush(codec);
+            M.ex_seek(ex, tgt, 0);
+            ring_flush(p);
+            in_eos = 0;
+            drop_until = tgt;
+            phase = 0;
+            prev[0] = prev[1] = 0;
+            last_out = avp_now_ns();
+            continue;
+        }
+        int did = 0;
+        for (int k = 0; k < 2 && !in_eos; k++) {
+            ssize_t ii = M.codec_in(codec, 0);
+            if (ii < 0) break;
+            size_t cap = 0;
+            uint8_t *b = M.codec_inbuf(codec, (size_t)ii, &cap);
+            ssize_t n = b ? M.ex_read(ex, b, cap) : -1;
+            if (n < 0 || (size_t)n > cap) {
+                M.codec_queue(codec, (size_t)ii, 0, 0, 0, 4 /* END_OF_STREAM */);
+                in_eos = 1;
+                break;
+            }
+            int64_t t = M.ex_time(ex);
+            M.codec_queue(codec, (size_t)ii, 0, (size_t)n, (uint64_t)(t < 0 ? 0 : t), 0);
+            M.ex_advance(ex);
+            did = 1;
+        }
+        avp_bufinfo bi;
+        ssize_t oi = M.codec_out(codec, &bi, 0);
+        if (oi == -2) {                // OUTPUT_FORMAT_CHANGED: the decoder's own numbers
+            void *of = M.codec_outfmt(codec);
+            if (of) {
+                int32_t r2 = 0, c2 = 0;
+                if (M.fmt_i32(of, "sample-rate", &r2) && r2 > 0) rate = r2;
+                if (M.fmt_i32(of, "channel-count", &c2) && c2 > 0) ch = c2;
+                M.fmt_delete(of);
+            }
+            continue;
+        }
+        if (oi >= 0) {
+            did = 1;
+            last_out = avp_now_ns();
+            size_t cap = 0;
+            const int16_t *pcm = (const int16_t *)M.codec_outbuf(codec, (size_t)oi, &cap);
+            int n = (pcm && bi.size > 0) ? bi.size / (2 * ch) : 0;
+            int64_t pts = bi.pts, dur = (int64_t)n * 1000000 / rate;
+            int skip = 0;
+            if (drop_until >= 0 && pts < drop_until)
+                skip = pts + dur <= drop_until ? n : (int)((drop_until - pts) * rate / 1000000);
+            if (n > skip && pts + dur < clk - 200000) skip = n;   // behind the picture: let it go
+            if (n > skip) {
+                drop_until = -1;
+                int64_t start = pts + (int64_t)skip * 1000000 / rate;
+                size_t need = (size_t)((double)(n - skip) * AVP_RATE / rate) + 4;
+                if (need > tmp_cap) {
+                    int16_t *t2 = realloc(tmp, need * 2 * sizeof *tmp);
+                    if (t2) { tmp = t2; tmp_cap = need; }
+                }
+                int m = 0;
+                double step = (double)rate / AVP_RATE;
+                for (; tmp && (size_t)m < tmp_cap; m++) {
+                    int i0 = (int)floor(phase);
+                    if (i0 + 1 >= n - skip) break;
+                    double f = phase - i0;
+                    for (int c = 0; c < 2; c++) {
+                        int cc = c < ch ? c : 0;
+                        int a = i0 < 0 ? prev[c] : pcm[(size_t)(skip + i0) * ch + cc];
+                        int b = pcm[(size_t)(skip + i0 + 1) * ch + cc];
+                        tmp[2 * m + c] = (int16_t)lrint(a + (b - a) * f);
+                    }
+                    phase += step;
+                }
+                for (int c = 0; c < 2; c++) prev[c] = pcm[(size_t)(n - 1) * ch + (c < ch ? c : 0)];
+                phase -= (double)(n - skip);
+                if (phase < -1) phase = -1;
+                M.codec_release(codec, (size_t)oi, false);
+                if (m > 0) ring_push(p, tmp, m, start, gen);
+            } else {
+                M.codec_release(codec, (size_t)oi, false);
+            }
+        }
+        if (in_eos && oi < 0 && avp_now_ns() - last_out > 300000000LL && master && !done) {
+            // No picture: the sound decides when the file ends.
+            pthread_mutex_lock(&p->lk);
+            if (p->seek_gen == gen) {
+                if (loop) { seek_locked(p, 0, 0); p->seeking = 0; }
+                else {
+                    p->video_done = 1;
+                    if (p->state == ST_PLAYING) p->state = ST_FINISHED;
+                    clk_run_locked(p, 0);
+                }
+            }
+            pthread_mutex_unlock(&p->lk);
+        }
+        if (!did) usleep(3000);
+    }
+done:
+    free(tmp);
+    if (codec) { M.codec_stop(codec); M.codec_delete(codec); }
+    if (fmt) M.fmt_delete(fmt);
+    if (ex) M.ex_delete(ex);
+    p->aex = p->afmt = NULL;
+    return NULL;
+}
+
+// ---------------------------------------------------------------- the picture
+static int avp_open_track(const char *path, int64_t off, int64_t len, const char *want,
+                          void **ex_out, void **fmt_out, int64_t *dur_us) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    void *ex = M.ex_new();
+    int rc = ex ? M.ex_fd(ex, fd, off, len) : -1;
+    close(fd);
+    if (rc != 0) { if (ex) M.ex_delete(ex); return -1; }
+    size_t n = M.ex_count(ex);
+    for (size_t i = 0; i < n; i++) {
+        void *f = M.ex_format(ex, i);
+        const char *mime = NULL;
+        if (f && M.fmt_str(f, "mime", &mime) && mime && !strncmp(mime, want, strlen(want))) {
+            int64_t d = 0;
+            if (M.fmt_i64(f, "durationUs", &d) && d > *dur_us) *dur_us = d;
+            M.ex_select(ex, i);
+            *ex_out = ex;
+            *fmt_out = f;
+            return 0;
+        }
+        if (f) M.fmt_delete(f);
+    }
+    M.ex_delete(ex);
+    return 1;                          // opened; no such track
+}
+
+static void *avp_video_main(void *arg) {
+    avp *p = arg;
+    char path[1024];
+    pthread_mutex_lock(&p->lk);
+    snprintf(path, sizeof path, "%s", p->src);
+    int64_t off = p->src_off, len = p->src_len;
+    if (p->state == ST_OPENING) p->state = ST_PREPARING;
+    pthread_mutex_unlock(&p->lk);
+
+    void *vex = NULL, *vfmt = NULL, *aex = NULL, *afmt = NULL, *codec = NULL;
+    int64_t dur_us = 0;
+    // One open at a time across players: the extractor copies an OBB entry out
+    // to a cache file the first time, and two players racing on one file would
+    // each see the other's half-written copy.
+    pthread_mutex_lock(&g_open_lk);
+    int rv = avp_open_track(path, off, len, "video/", &vex, &vfmt, &dur_us);
+    int ra = rv >= 0 ? avp_open_track(path, off, len, "audio/mp4a-latm", &aex, &afmt, &dur_us) : -1;
+    pthread_mutex_unlock(&g_open_lk);
+    if (!vex && !aex) {
+        KLJ_LOG("video plugin player %d: cannot demux %s [%lld+%lld]", p->index, path,
+                (long long)off, (long long)len);
+        pthread_mutex_lock(&p->lk);
+        p->last_error = ERR_LOAD;
+        p->state = ST_IDLE;
+        pthread_mutex_unlock(&p->lk);
+        return NULL;
+    }
+    int32_t w = 0, h = 0, fps = 0;
+    const char *mime = "video/avc";
+    if (vfmt) {
+        M.fmt_i32(vfmt, "width", &w);
+        M.fmt_i32(vfmt, "height", &h);
+        M.fmt_i32(vfmt, "frame-rate", &fps);
+        M.fmt_str(vfmt, "mime", &mime);
+    }
+    KLJ_LOG("video plugin player %d: %s [%lld+%lld] %dx%d %d fps, %lld ms, %s", p->index, path,
+            (long long)off, (long long)len, w, h, fps, (long long)(dur_us / 1000),
+            aex ? "AAC sound" : (ra == 0 ? "sound" : "no sound"));
+    pthread_mutex_lock(&p->lk);
+    p->w = vex ? w : 0;
+    p->h = vex ? h : 0;
+    p->fps = (float)fps;
+    p->display_rate = (float)fps;
+    p->dur_ms = dur_us / 1000;
+    p->has_video = vex != NULL;
+    p->has_audio = aex != NULL;
+    p->n_audio = aex ? 1 : 0;
+    // The Java player's READY: playing if a Play is in force, else Stopped; and
+    // the commands queued meanwhile run on the next Update.
+    p->state = p->state == ST_PLAYING ? ST_PLAYING : ST_STOPPED;
+    p->want_target = vex != NULL;
+    p->accept = 1;
+    if (aex) {
+        p->aex = aex;
+        p->afmt = afmt;
+        pthread_once(&g_mix_once, avp_mix_start);
+        p->athr_on = pthread_create(&p->athr, NULL, avp_audio_main, p) == 0;
+        if (!p->athr_on) { M.fmt_delete(afmt); M.ex_delete(aex); p->aex = p->afmt = NULL; p->has_audio = 0; }
+    }
+    unsigned gen = p->seek_gen;
+    pthread_mutex_unlock(&p->lk);
+    if (!vex) {                        // sound only: nothing to show
+        while (!atomic_load(&p->quit)) usleep(10000);
+        return NULL;
+    }
+
+    void *win = NULL;
+    while (!atomic_load(&p->quit)) {   // RendererSetupPlayer makes the window
+        pthread_mutex_lock(&p->lk);
+        win = p->window;
+        pthread_mutex_unlock(&p->lk);
+        if (win) break;
+        usleep(5000);
+    }
+    if (win) {
+        codec = M.codec_new(mime);
+        if (!codec || M.codec_configure(codec, vfmt, win, NULL, 0) != 0 || M.codec_start(codec) != 0) {
+            KLJ_LOG("video plugin player %d: no %s decoder", p->index, mime);
+            if (codec) { M.codec_delete(codec); codec = NULL; }
+            pthread_mutex_lock(&p->lk);
+            p->last_error = ERR_DECODE;
+            pthread_mutex_unlock(&p->lk);
+        }
+    }
+    struct { size_t idx; int64_t pts; } pend[16];
+    int np = 0, in_eos = 0, first = 1, anchor = 0, in_flight = 0;
+    int64_t drop_until = -1, last_out = avp_now_ns(), last_shown = 0;
+    while (codec && !atomic_load(&p->quit)) {
+        pthread_mutex_lock(&p->lk);
+        unsigned g = p->seek_gen;
+        int64_t tgt = p->seek_us, clk = clk_locked(p);
+        int fast = p->seek_fast, loop = p->looping, done = p->video_done;
+        pthread_mutex_unlock(&p->lk);
+        if (g != gen) {                // seek: drop what is held, flush, start over
+            gen = g;
+            for (int i = 0; i < np; i++) M.codec_release(codec, pend[i].idx, false);
+            np = 0;
+            M.codec_flush(codec);
+            M.ex_seek(vex, tgt, fast ? 0 /* PREVIOUS_SYNC */ : 2 /* CLOSEST_SYNC */);
+            in_eos = 0;
+            in_flight = 0;
+            drop_until = fast ? -1 : tgt;
+            first = 1;
+            anchor = fast;
+            last_out = avp_now_ns();
+            continue;
+        }
+        int did = 0;
+        while (!in_eos && in_flight + np < 6) {
+            ssize_t ii = M.codec_in(codec, 0);
+            if (ii < 0) break;
+            size_t cap = 0;
+            uint8_t *b = M.codec_inbuf(codec, (size_t)ii, &cap);
+            ssize_t n = b ? M.ex_read(vex, b, cap) : -1;
+            if (n < 0 || (size_t)n > cap) {
+                M.codec_queue(codec, (size_t)ii, 0, 0, 0, 4 /* END_OF_STREAM */);
+                in_eos = 1;
+                break;
+            }
+            int64_t t = M.ex_time(vex);
+            M.codec_queue(codec, (size_t)ii, 0, (size_t)n, (uint64_t)(t < 0 ? 0 : t), 0);
+            M.ex_advance(vex);
+            in_flight++;
+            did = 1;
+        }
+        while (np < (int)(sizeof pend / sizeof pend[0])) {
+            avp_bufinfo bi;
+            ssize_t oi = M.codec_out(codec, &bi, 0);
+            if (oi == -2 || oi == -3) continue;
+            if (oi < 0) break;
+            pend[np].idx = (size_t)oi;
+            pend[np].pts = bi.pts;
+            np++;
+            if (in_flight > 0) in_flight--;
+            last_out = avp_now_ns();
+            did = 1;
+        }
+        // A sample that never produced a frame must not hold the feed back forever.
+        if (in_flight && avp_now_ns() - last_out > 250000000LL) in_flight = 0;
+        while (np > 0 && (np >= AVP_HOLD || in_eos)) {
+            int k = 0;
+            for (int i = 1; i < np; i++) if (pend[i].pts < pend[k].pts) k = i;
+            size_t idx = pend[k].idx;
+            int64_t pts = pend[k].pts;
+            int show = 0, drop = 0;
+            int64_t now = avp_now_ns();
+            if (drop_until >= 0 && pts < drop_until) drop = 1;
+            else if (first) show = 1;
+            else if (pts <= clk + 4000) {
+                // Late by more than a few frames: skip it, unless nothing has
+                // been shown for a while (a decoder that cannot keep up still
+                // shows something).
+                if (pts < clk - 60000 && np > 1 && now - last_shown < 100000000LL) drop = 1;
+                else show = 1;
+            }
+            if (!show && !drop) break;
+            pend[k] = pend[--np];
+            did = 1;
+            if (drop) { M.codec_release(codec, idx, false); continue; }
+            if (first && anchor) {     // SeekFast lands on the keyframe: the clock follows it
+                pthread_mutex_lock(&p->lk);
+                if (p->seek_gen == gen) clk_set_locked(p, pts);
+                pthread_mutex_unlock(&p->lk);
+                clk = pts;
+            }
+            if (first) {
+                pthread_mutex_lock(&p->lk);
+                if (p->seek_gen == gen) p->seeking = 0;
+                pthread_mutex_unlock(&p->lk);
+            }
+            first = 0;
+            anchor = 0;
+            drop_until = -1;
+            last_shown = now;
+            M.codec_release_at(codec, idx, pts * 1000);   // getTimestamp: the frame's media time
+        }
+        if (in_eos && np == 0 && !done && avp_now_ns() - last_out > 250000000LL) {
+            pthread_mutex_lock(&p->lk);
+            if (p->seek_gen == gen) {
+                if (loop) { seek_locked(p, 0, 0); p->seeking = 0; }
+                else {
+                    p->video_done = 1;
+                    if (p->state == ST_PLAYING) p->state = ST_FINISHED;
+                    clk_run_locked(p, 0);
+                }
+            }
+            pthread_mutex_unlock(&p->lk);
+            did = 1;
+        }
+        if (!did) usleep(3000);
+    }
+    while (!atomic_load(&p->quit)) usleep(10000);   // no decoder: hold the state until closed
+    for (int i = 0; i < np; i++) M.codec_release(codec, pend[i].idx, false);
+    if (codec) { M.codec_stop(codec); M.codec_delete(codec); }
+    if (vfmt) M.fmt_delete(vfmt);
+    if (vex) M.ex_delete(vex);
+    return NULL;
+}
+
+// Stop and join a player's threads and forget its source (any thread but
+// those two).
+static void avp_close(avp *p) {
+    atomic_store(&p->quit, 1);
+    if (p->vthr_on) { pthread_join(p->vthr, NULL); p->vthr_on = 0; }
+    pthread_mutex_lock(&p->lk);
+    int a = p->athr_on;
+    p->athr_on = 0;
+    pthread_mutex_unlock(&p->lk);
+    if (a) pthread_join(p->athr, NULL);
+    atomic_store(&p->quit, 0);
+    pthread_mutex_lock(&p->lk);
+    p->state = ST_IDLE;
+    p->nq = 0;
+    p->accept = 0;
+    p->w = p->h = 0;
+    p->dur_ms = 0;
+    p->rate = 1.0f;
+    p->has_video = p->has_audio = p->n_audio = 0;
+    p->fps = 0;
+    p->frame_count = 0;
+    p->tex_ts_ns = INT64_MIN;
+    p->last_error = 0;
+    p->seeking = 0;
+    p->video_done = 0;
+    p->clock_run = 0;
+    clk_set_locked(p, 0);
+    p->ring_r = p->ring_n = 0;
+    p->latched = 0;
+    pthread_mutex_unlock(&p->lk);
+}
+
+// ---------------------------------------------------------------- render thread
+static void avp_gl_reap(void) {
+    pthread_mutex_lock(&g_tab_lk);
+    avp_grave *g = g_graves;
+    g_graves = NULL;
+    pthread_mutex_unlock(&g_tab_lk);
+    while (g) {
+        avp_grave *next = g->next;
+        if (g->st) {
+            klj_val none = { .l = NULL };
+            klj_call_binding(g->st, "setOnFrameAvailableListener",
+                             "(Landroid/graphics/SurfaceTexture$OnFrameAvailableListener;)V", &none, 1);
+            klj_call_binding(g->st, "release", "()V", NULL, 0);   // drops its frame while a context is current
+        }
+        if (g->surface) klj_call_binding(g->surface, "release", "()V", NULL, 0);
+        if (g->window && M.win_release) M.win_release(g->window);
+        if (avp_gl_load()) {
+            for (int i = 0; i < 2; i++) if (g->tex[i]) G.DeleteTextures(1, &g->tex[i]);
+            if (g->fbo) G.DeleteFramebuffers(1, &g->fbo);
+        }
+        free(g);
+        g = next;
+    }
+}
+
+static void avp_target(avp *p, int32_t w, int32_t h) {
+    if (p->fbo) { G.DeleteFramebuffers(1, &p->fbo); p->fbo = 0; }
+    if (p->rgba_tex) { G.DeleteTextures(1, &p->rgba_tex); p->rgba_tex = 0; }
+    if (w <= 0 || h <= 0) return;
+    int32_t prev_tex = 0, prev_fb = 0;
+    G.GetIntegerv(GL_TEXTURE_BINDING_2D_, &prev_tex);
+    G.GenTextures(1, &p->rgba_tex);
+    G.BindTexture(GL_TEXTURE_2D_, p->rgba_tex);
+    G.TexStorage2D(GL_TEXTURE_2D_, 1, GL_RGBA8_, w, h);
+    G.BindTexture(GL_TEXTURE_2D_, (uint32_t)prev_tex);
+    avp_tex_params(p->rgba_tex);
+    G.GetIntegerv(GL_DRAW_FB_BINDING_, &prev_fb);
+    G.GenFramebuffers(1, &p->fbo);
+    G.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, p->fbo);
+    G.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D_, p->rgba_tex, 0);
+    uint32_t st = G.CheckFramebufferStatus(GL_DRAW_FRAMEBUFFER_);
+    G.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, (uint32_t)prev_fb);
+    p->rgba_w = w;
+    p->rgba_h = h;
+    KLJ_LOG("video plugin player %d: RGBA target %dx%d (texture %u)%s", p->index, w, h, p->rgba_tex,
+            st == GL_FRAMEBUFFER_COMPLETE_ ? "" : " — framebuffer incomplete");
+}
+
+// The latched frame through the SurfaceTexture's transform into the RGBA
+// target, leaving every piece of GL state it touches as it found it.
+static void avp_blit(avp *p) {
+    if (!p->fbo || !avp_prog()) return;
+    float m[16] = { 1, 0, 0, 0,  0, -1, 0, 0,  0, 0, 1, 0,  0, 1, 0, 1 };
+    if (p->mtx) {
+        klj_val a = { .l = p->mtx };
+        klj_call_binding(p->st, "getTransformMatrix", "([F)V", &a, 1);
+        klj_array *arr = klj_arr(p->mtx);
+        if (arr && arr->data && arr->len >= 16) memcpy(m, arr->data, sizeof m);
+    }
+    int32_t prog = 0, dfb = 0, rfb = 0, vp[4] = {0}, vao = 0, active = 0, tex = 0, smp = 0;
+    uint8_t mask[4] = {1, 1, 1, 1}, on[AVP_NCAPS];
+    G.GetIntegerv(GL_CURRENT_PROGRAM_, &prog);
+    G.GetIntegerv(GL_DRAW_FB_BINDING_, &dfb);
+    G.GetIntegerv(GL_READ_FB_BINDING_, &rfb);
+    G.GetIntegerv(GL_VIEWPORT_, vp);
+    G.GetIntegerv(GL_VERTEX_ARRAY_BINDING_, &vao);
+    G.GetIntegerv(GL_ACTIVE_TEXTURE_, &active);
+    G.GetBooleanv(GL_COLOR_WRITEMASK_, mask);
+    for (size_t i = 0; i < AVP_NCAPS; i++) {
+        on[i] = G.IsEnabled(avp_caps[i]);
+        if (on[i]) G.Disable(avp_caps[i]);
+    }
+    G.ActiveTexture(GL_TEXTURE0_);
+    G.GetIntegerv(GL_TEXTURE_BINDING_2D_, &tex);
+    G.GetIntegerv(GL_SAMPLER_BINDING_, &smp);
+
+    G.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, p->fbo);
+    G.Viewport(0, 0, p->rgba_w, p->rgba_h);
+    G.ColorMask(1, 1, 1, 1);
+    G.UseProgram(G.prog);
+    G.UniformMatrix4fv(G.u_m, 1, 0, m);
+    G.Uniform1i(G.u_tex, 0);
+    G.BindTexture(GL_TEXTURE_2D_, p->oes_tex);
+    G.BindSampler(0, 0);
+    G.BindVertexArray(G.vao);
+    G.DrawArrays(GL_TRIANGLE_STRIP_, 0, 4);
+
+    G.BindVertexArray((uint32_t)vao);
+    G.BindSampler(0, (uint32_t)smp);
+    G.BindTexture(GL_TEXTURE_2D_, (uint32_t)tex);
+    G.ActiveTexture((uint32_t)active);
+    G.UseProgram((uint32_t)prog);
+    G.ColorMask(mask[0], mask[1], mask[2], mask[3]);
+    G.Viewport(vp[0], vp[1], vp[2], vp[3]);
+    G.BindFramebuffer(GL_DRAW_FRAMEBUFFER_, (uint32_t)dfb);
+    G.BindFramebuffer(GL_READ_FRAMEBUFFER_, (uint32_t)rfb);
+    for (size_t i = 0; i < AVP_NCAPS; i++) if (on[i]) G.Enable(avp_caps[i]);
+}
+
+static void avp_render_setup(avp *p) {
+    if (!p || p->gl_setup || p->deinit_flagged) return;
+    pthread_once(&avp_media_once, avp_media_load);
+    if (!M.ok) return;
+    if (!kl_glfb_current_context()) {
+        KLJ_LOG_ONCE("video plugin: RendererSetupPlayer with no current GL context — retried on render");
+        return;
+    }
+    if (!avp_gl_load()) return;
+    uint32_t tex = 0;
+    G.GenTextures(1, &tex);
+    avp_tex_params(tex);
+    klj_val a = { .j = tex };
+    void *st = klj_call_binding(klj_class_object(AVP_ST), "<init>", "(I)V", &a, 1).l;
+    if (!st) { G.DeleteTextures(1, &tex); return; }
+    klj_val l = { .l = p->self };
+    klj_call_binding(st, "setOnFrameAvailableListener",
+                     "(Landroid/graphics/SurfaceTexture$OnFrameAvailableListener;)V", &l, 1);
+    klj_val s = { .l = st };
+    void *surface = klj_call_binding(klj_class_object(AVP_SURFACE), "<init>", "(" AVP_ST_SIG ")V", &s, 1).l;
+    void *win = surface ? M.win_from_surface(kl_jni_env(), surface) : NULL;
+    void *mtx = klj_new_array('F', NULL, 16);
+    if (mtx) kl_jni_pin_object(mtx);
+    pthread_mutex_lock(&p->lk);
+    p->oes_tex = tex;
+    p->st = st;
+    p->surface = surface;
+    p->window = win;
+    p->mtx = mtx;
+    p->gl_setup = 1;
+    pthread_mutex_unlock(&p->lk);
+    KLJ_LOG("video plugin player %d: texture %u, SurfaceTexture %p, window %p%s", p->index, tex, st, win,
+            p->fast_oes ? " (fast OES path)" : "");
+}
+
+static void avp_render(avp *p) {
+    if (!p || p->deinit_flagged) return;
+    if (!p->gl_setup) avp_render_setup(p);
+    if (!p->gl_setup || !kl_glfb_current_context()) return;
+    pthread_mutex_lock(&p->lk);
+    void *st = p->st;                  // DestroyPlayer may move it to the graves meanwhile;
+                                       // they are emptied on this thread, after this call
+    int want = p->want_target, w = p->w, h = p->h;
+    int hv = p->has_video, ha = p->has_audio;
+    if (want) {
+        p->want_target = 0;
+        if (p->state >= ST_PREPARED) {
+            p->accept = 1;
+            if (p->state != ST_PLAYING && p->state != ST_BUFFERING) p->state = ST_STOPPED;
+        }
+    }
+    pthread_mutex_unlock(&p->lk);
+    if (want && !p->fast_oes && (w != p->rgba_w || h != p->rgba_h || !p->fbo)) avp_target(p, w, h);
+    int n = atomic_load(&p->frames_avail);
+    if (!st || n <= 0 || !((w > 0 && hv) || ha)) return;
+    atomic_fetch_sub(&p->frames_avail, n);
+    for (int i = 0; i < n && i < 8; i++) klj_call_binding(st, "updateTexImage", "()V", NULL, 0);
+    int64_t ts = (int64_t)klj_call_binding(st, "getTimestamp", "()J", NULL, 0).j;
+    if (!p->fast_oes) avp_blit(p);
+    int64_t now = avp_now_ns();
+    pthread_mutex_lock(&p->lk);
+    p->frame_count += n;
+    p->tex_ts_ns = ts;
+    p->latched = 1;
+    p->dr_frames += n;
+    if (!p->dr_t0_ns) p->dr_t0_ns = now;
+    if (now - p->dr_t0_ns >= 500000000LL) {
+        p->display_rate = (float)p->dr_frames / ((float)(now - p->dr_t0_ns) / 1e9f);
+        p->dr_frames = 0;
+        p->dr_t0_ns = now;
+    }
+    pthread_mutex_unlock(&p->lk);
+}
+
+// ---------------------------------------------------------------- the interface class
+static void avp_clinit(void) {
+    // The class initialiser: System.loadLibrary("AVProLocal"); nativeInit().
+    void *env = kl_jni_env();
+    klj_val lib = { .l = kl_jni_new_string("AVProLocal") };
+    klj_UnityPlayer_loadLibrary(env, NULL, &lib, 1);
+    void *fn = kl_jni_native(AVP_IFACE, "nativeInit", NULL);
+    if (!fn) {
+        char path[1024];
+        snprintf(path, sizeof path, "%s/libAVProLocal.so", g_native_lib_dir);
+        void *h = klb_dlopen(path, 0x00002);
+        fn = h ? klb_dlsym(h, "Java_com_RenderHeads_AVProVideo_AVProMobileVideo_nativeInit") : NULL;
+    }
+    if (fn) ((void (*)(void *, void *))fn)(env, klj_class_object(AVP_IFACE));
+    KLJ_LOG("video plugin: Java interface class initialised (%s)", fn ? "nativeInit called" : "nativeInit not found");
+}
+static klj_val avp_iface_init(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, avp_clinit);
+    void *obj = kl_jni_new_object(AVP_IFACE);
+    kl_jni_pin_object(obj);
+    pthread_mutex_lock(&g_tab_lk);
+    if (!g_iface_live) { g_iface = obj; g_iface_live = 1; }
+    pthread_mutex_unlock(&g_tab_lk);
+    return (klj_val){.l = obj};
+}
+static klj_val avp_iface_version(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){.l = kl_jni_new_string("1.11.3")};
+}
+static klj_val avp_noop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    return (klj_val){0};
+}
+static klj_val avp_iface_deinit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    pthread_mutex_lock(&g_tab_lk);
+    g_iface_live = 0;
+    g_iface = NULL;
+    pthread_mutex_unlock(&g_tab_lk);
+    return (klj_val){0};
+}
+
+// CreatePlayer(api, useFastOesPath, showPosterFrame, int, bool)
+static klj_val avp_create(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    if (!kl_env_on("MV_VIDEO_PLUGIN", 1)) {
+        KLJ_LOG_ONCE("video plugin: MV_VIDEO_PLUGIN=0 — CreatePlayer refused");
+        return (klj_val){0};
+    }
+    pthread_once(&avp_media_once, avp_media_load);
+    int api = n > 0 ? (int)(int32_t)a[0].j : 0;
+    if (!M.ok || (api != 1 && api != 2)) return (klj_val){0};
+    pthread_mutex_lock(&g_tab_lk);
+    if (!g_iface_live || self != g_iface) { pthread_mutex_unlock(&g_tab_lk); return (klj_val){0}; }
+    int index = -1;
+    for (int i = 0; i < AVP_MAX && index < 0; i++) if (!g_slot[i]) index = i;
+    if (index < 0) { pthread_mutex_unlock(&g_tab_lk); KLJ_LOG("video plugin: no free player"); return (klj_val){0}; }
+    avp *p = calloc(1, sizeof *p);
+    int16_t *ring = calloc(AVP_RING * 2, sizeof *ring);
+    if (!p || !ring) { pthread_mutex_unlock(&g_tab_lk); free(p); free(ring); return (klj_val){0}; }
+    pthread_mutex_init(&p->lk, NULL);
+    p->ring = ring;
+    p->index = index;
+    p->alive = 1;
+    p->api = api;
+    p->fast_oes = n > 1 && a[1].j;
+    p->poster = n > 2 && a[2].j;
+    p->volume = 1.0f;
+    p->rate = 1.0f;
+    p->tex_ts_ns = INT64_MIN;
+    p->self = klj_new_object_data(AVP_PLAYER, p);
+    kl_jni_pin_object(p->self);        // the title keeps it as a global ref
+    g_slot[index] = p;
+    pthread_mutex_unlock(&g_tab_lk);
+    KLJ_LOG("video plugin: CreatePlayer(api %d%s) -> player %d", api, p->fast_oes ? ", fast OES" : "", index);
+    return (klj_val){.l = p->self};
+}
+
+static void avp_bury(avp *p) {
+    avp_grave *g = calloc(1, sizeof *g);
+    pthread_mutex_lock(&p->lk);
+    if (g) {
+        g->tex[0] = p->oes_tex;
+        g->tex[1] = p->rgba_tex;
+        g->fbo = p->fbo;
+        g->st = p->st;
+        g->surface = p->surface;
+        g->window = p->window;
+    }
+    p->oes_tex = p->rgba_tex = p->fbo = 0;
+    p->st = p->surface = p->window = NULL;
+    p->gl_setup = 0;
+    pthread_mutex_unlock(&p->lk);
+    if (!g) return;
+    pthread_mutex_lock(&g_tab_lk);
+    g->next = g_graves;
+    g_graves = g;
+    pthread_mutex_unlock(&g_tab_lk);
+}
+
+static klj_val avp_destroy(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    int index = n > 0 ? (int)(int32_t)a[0].j : -1;
+    avp *p = avp_at(index);
+    if (!p) return (klj_val){0};
+    avp_close(p);                      // Deinitialise
+    pthread_mutex_lock(&g_tab_lk);
+    if (g_slot[index] == p) g_slot[index] = NULL;
+    pthread_mutex_unlock(&g_tab_lk);
+    pthread_mutex_lock(&p->lk);
+    p->alive = 0;
+    p->deinit_flagged = 1;
+    pthread_mutex_unlock(&p->lk);
+    avp_bury(p);                       // GL objects go on the render thread
+    p->deinitialised = 1;
+    KLJ_LOG("video plugin: DestroyPlayer(%d)", index);
+    return (klj_val){0};               // the struct stays: the title may still hold the object
+}
+
+// ---- the static surface the native library calls
+static klj_val avp_s_setup(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    avp_gl_reap();
+    if (n > 0) avp_render_setup(avp_at((int)(int32_t)a[0].j));
+    return (klj_val){0};
+}
+static klj_val avp_s_render(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    avp_gl_reap();
+    if (n > 0) avp_render(avp_at((int)(int32_t)a[0].j));
+    return (klj_val){0};
+}
+static klj_val avp_s_wait(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self;
+    avp *p = n > 0 ? avp_at((int)(int32_t)a[0].j) : NULL;
+    if (!p) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    int before = p->frame_count;
+    pthread_mutex_unlock(&p->lk);
+    for (int i = 0; i < 50; i++) {     // the Java: RenderPlayer and 10 ms naps, 50 times at most
+        avp_render(p);
+        pthread_mutex_lock(&p->lk);
+        int now = p->frame_count;
+        pthread_mutex_unlock(&p->lk);
+        if (now > before) break;
+        usleep(10000);
+    }
+    pthread_mutex_lock(&p->lk);
+    p->extracting = 0;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static klj_val avp_s_destroy_players(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    avp_gl_reap();
+    return (klj_val){0};
+}
+static klj_val avp_s_reset(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)self; (void)a; (void)n;
+    // A new context: every player's GL objects again (the old names died with it).
+    for (int i = 0; i < AVP_MAX; i++) {
+        avp *p = avp_at(i);
+        if (!p) continue;
+        pthread_mutex_lock(&p->lk);
+        p->oes_tex = p->rgba_tex = p->fbo = 0;
+        p->rgba_w = p->rgba_h = 0;
+        p->gl_setup = 0;
+        p->want_target = p->has_video;
+        pthread_mutex_unlock(&p->lk);
+        avp_render_setup(p);
+    }
+    return (klj_val){0};
+}
+
+#define AVP_GET(name, expr, field)                                                  \
+    static klj_val name(void *env, void *self, const klj_val *a, int n) {           \
+        (void)env;                                                                  \
+        avp *p = (n > 0 && !avp_of(self)) ? avp_at((int)(int32_t)a[0].j) : avp_of(self); \
+        klj_val r = {0};                                                            \
+        if (!p) return r;                                                           \
+        pthread_mutex_lock(&p->lk);                                                 \
+        r.field = (expr);                                                           \
+        pthread_mutex_unlock(&p->lk);                                               \
+        return r;                                                                   \
+    }
+static uint32_t avp_texture_locked(avp *p) {
+    if (p->state < ST_PREPARED || !p->latched) return 0;
+    return p->fast_oes ? p->oes_tex : p->rgba_tex;
+}
+static int avp_canplay_locked(avp *p) {
+    return p->state == ST_STOPPED || p->state == ST_PAUSED || p->state == ST_PLAYING || p->state == ST_FINISHED;
+}
+static int avp_last_error_locked(avp *p) {
+    int e = p->last_error;
+    p->last_error = 0;
+    return e;
+}
+static int64_t avp_position_locked(avp *p) {
+    int64_t ms = clk_locked(p) / 1000;
+    if (ms < 0) ms = 0;
+    if (p->dur_ms > 0 && ms > p->dur_ms) ms = p->dur_ms;
+    return ms;
+}
+AVP_GET(avp_g_width,        (uint64_t)(int64_t)p->w, j)
+AVP_GET(avp_g_height,       (uint64_t)(int64_t)p->h, j)
+AVP_GET(avp_g_texture,      (uint64_t)avp_texture_locked(p), j)
+AVP_GET(avp_g_duration,     (uint64_t)p->dur_ms, j)
+AVP_GET(avp_g_frames,       (uint64_t)(int64_t)p->frame_count, j)
+AVP_GET(avp_g_error,        (uint64_t)(int64_t)avp_last_error_locked(p), j)
+AVP_GET(avp_g_display_rate, (double)p->display_rate, d)
+AVP_GET(avp_g_canplay,      (uint64_t)avp_canplay_locked(p), j)
+AVP_GET(avp_g_bitrate,      (uint64_t)0, j)
+AVP_GET(avp_g_position,     (uint64_t)avp_position_locked(p), j)
+AVP_GET(avp_g_playing,      (uint64_t)(p->state == ST_PLAYING), j)
+AVP_GET(avp_g_paused,       (uint64_t)(p->state == ST_PAUSED), j)
+AVP_GET(avp_g_finished,     (uint64_t)(p->state == ST_FINISHED), j)
+AVP_GET(avp_g_seeking,      (uint64_t)p->seeking, j)
+AVP_GET(avp_g_buffering,    (uint64_t)0, j)
+AVP_GET(avp_g_looping,      (uint64_t)p->looping, j)
+AVP_GET(avp_g_muted,        (uint64_t)p->muted, j)
+AVP_GET(avp_g_has_audio,    (uint64_t)p->has_audio, j)
+AVP_GET(avp_g_has_video,    (uint64_t)p->has_video, j)
+AVP_GET(avp_g_volume,       (double)p->volume, d)
+AVP_GET(avp_g_pan,          (double)p->pan, d)
+AVP_GET(avp_g_rate,         (double)p->rate, d)
+AVP_GET(avp_g_fps,          (double)p->fps, d)
+AVP_GET(avp_g_tex_ts,       (uint64_t)(p->tex_ts_ns / 100), j)
+AVP_GET(avp_g_index,        (uint64_t)(int64_t)p->index, j)
+AVP_GET(avp_g_audio_tracks, (uint64_t)(int64_t)p->n_audio, j)
+AVP_GET(avp_g_audio_track,  (uint64_t)(int64_t)(p->n_audio ? 0 : -1), j)
+AVP_GET(avp_g_buffered,     (double)(p->state >= ST_PREPARED ? 100.0 : 0.0), d)
+AVP_GET(avp_g_abs_time,     (double)avp_position_locked(p) / 1000.0, d)
+AVP_GET(avp_g_deinited,     (uint64_t)p->deinitialised, j)
+AVP_GET(avp_g_false,        (uint64_t)0, j)
+
+// ---- the player object
+static klj_val avp_open(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    const char *url = n > 0 ? klj_str(a[0].l) : NULL;
+    int64_t extra = n > 1 ? (int64_t)a[1].j : 0;
+    if (!p || !url) return (klj_val){.j = 0};
+    avp_close(p);                      // the Java's CloseVideo first
+    char path[1024];
+    int64_t off = 0, len = 0;
+    if (avp_resolve(url, extra, path, sizeof path, &off, &len) != 0) {
+        pthread_mutex_lock(&p->lk);
+        p->last_error = ERR_LOAD;
+        pthread_mutex_unlock(&p->lk);
+        return (klj_val){.j = 0};
+    }
+    pthread_mutex_lock(&p->lk);
+    snprintf(p->src, sizeof p->src, "%s", path);
+    p->src_off = off;
+    p->src_len = len;
+    p->state = ST_OPENING;
+    p->vthr_on = pthread_create(&p->vthr, NULL, avp_video_main, p) == 0;
+    if (!p->vthr_on) { p->state = ST_IDLE; p->last_error = ERR_LOAD; }
+    int ok = p->vthr_on;
+    pthread_mutex_unlock(&p->lk);
+    KLJ_LOG("video plugin player %d: OpenVideoFromFile(%s) -> %s [%lld+%lld]", p->index, url, path,
+            (long long)off, (long long)len);
+    return (klj_val){.j = (uint64_t)ok};
+}
+static klj_val avp_closevideo(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (p) avp_close(p);
+    return (klj_val){0};
+}
+static klj_val avp_deinitialise(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (p) avp_close(p);
+    return (klj_val){0};
+}
+static klj_val avp_play(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const int drop[] = { CMD_STOP, CMD_PLAY, CMD_PAUSE };
+    avp *p = avp_of(self);
+    if (p) cmd_add(p, CMD_PLAY, 0, drop, 3);
+    return (klj_val){0};
+}
+static klj_val avp_pause(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const int drop[] = { CMD_STOP, CMD_PLAY, CMD_PAUSE };
+    avp *p = avp_of(self);
+    if (p) cmd_add(p, CMD_PAUSE, 0, drop, 3);
+    return (klj_val){0};
+}
+static klj_val avp_stop(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    static const int drop[] = { CMD_STOP, CMD_PLAY, CMD_PAUSE };
+    avp *p = avp_of(self);
+    if (p) cmd_add(p, CMD_STOP, 0, drop, 3);
+    return (klj_val){0};
+}
+static klj_val avp_seek(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    static const int drop[] = { CMD_SEEK, CMD_SEEKFAST };
+    avp *p = avp_of(self);
+    if (p && n > 0) cmd_add(p, CMD_SEEK, (int)(int32_t)a[0].j, drop, 2);
+    return (klj_val){0};
+}
+static klj_val avp_seekfast(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    static const int drop[] = { CMD_SEEK, CMD_SEEKFAST };
+    avp *p = avp_of(self);
+    if (p && n > 0) cmd_add(p, CMD_SEEKFAST, (int)(int32_t)a[0].j, drop, 2);
+    return (klj_val){0};
+}
+static klj_val avp_update(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (!p) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    cmd_run_locked(p);
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static float avp_clampf(double v, float lo, float hi) {
+    return v < lo ? lo : v > hi ? hi : (float)v;
+}
+static klj_val avp_set_looping(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    if (!p || n < 1) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    p->looping = a[0].j != 0;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static klj_val avp_set_volume(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    if (!p || n < 1) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    p->volume = avp_clampf(a[0].d, 0.0f, 1.0f);
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static klj_val avp_set_pan(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    if (!p || n < 1) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    p->pan = avp_clampf(a[0].d, -1.0f, 1.0f);
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static klj_val avp_mute(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    if (!p || n < 1) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    p->muted = a[0].j != 0;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+// Any rate the clock can run at; the sound plays only at 1x.
+static klj_val avp_set_rate(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    if (!p || n < 1) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    float r = avp_clampf(a[0].d, 0.0f, 16.0f);
+    p->clock_us = clk_locked(p);
+    p->clock_ns = avp_now_ns();
+    p->rate = r;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static klj_val avp_set_options(void *env, void *self, const klj_val *a, int n) {
+    (void)env;
+    avp *p = avp_of(self);
+    if (!p || n < 2) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    p->fast_oes = a[0].j != 0;
+    p->poster = a[1].j != 0;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+static klj_val avp_flag_deinit(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (!p) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    p->deinit_flagged = 1;
+    p->deinitialised = 0;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+// [m0, m1, -m4, -m5, 0, 0] of the SurfaceTexture's matrix on the fast-OES
+// path, null otherwise — exactly what the Java returns.
+static klj_val avp_transform(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (!p || !p->fast_oes || !p->st || !p->mtx) return (klj_val){0};
+    klj_val m = { .l = p->mtx };
+    klj_call_binding(p->st, "getTransformMatrix", "([F)V", &m, 1);
+    klj_array *src = klj_arr(p->mtx);
+    void *out = klj_new_array('F', NULL, 6);
+    klj_array *dst = klj_arr(out);
+    if (!src || !src->data || src->len < 16 || !dst || !dst->data) return (klj_val){.l = out};
+    const float *s = src->data;
+    float *d = dst->data;
+    d[0] = s[0]; d[1] = s[1]; d[2] = -s[4]; d[3] = -s[5]; d[4] = 0; d[5] = 0;
+    return (klj_val){.l = out};
+}
+static klj_val avp_seekable(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    void *out = klj_new_array('F', NULL, 2);
+    klj_array *dst = klj_arr(out);
+    if (p && dst && dst->data) {
+        pthread_mutex_lock(&p->lk);
+        ((float *)dst->data)[1] = (float)p->dur_ms / 1000.0f;
+        pthread_mutex_unlock(&p->lk);
+    }
+    return (klj_val){.l = out};
+}
+static klj_val avp_extract(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (!p) return (klj_val){.j = 0};
+    pthread_mutex_lock(&p->lk);
+    p->extracting = 1;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){.j = 1};
+}
+static klj_val avp_wait_extract(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (!p) return (klj_val){0};
+    pthread_mutex_lock(&p->lk);
+    int before = p->frame_count;
+    pthread_mutex_unlock(&p->lk);
+    for (int i = 0; i < 50; i++) {
+        pthread_mutex_lock(&p->lk);
+        int now = p->frame_count;
+        pthread_mutex_unlock(&p->lk);
+        if (now > before) break;
+        usleep(10000);
+    }
+    pthread_mutex_lock(&p->lk);
+    p->extracting = 0;
+    pthread_mutex_unlock(&p->lk);
+    return (klj_val){0};
+}
+// SurfaceTexture.OnFrameAvailableListener, on the frame consumer's thread.
+static klj_val avp_on_frame(void *env, void *self, const klj_val *a, int n) {
+    (void)env; (void)a; (void)n;
+    avp *p = avp_of(self);
+    if (p) atomic_fetch_add(&p->frames_avail, 1);
+    return (klj_val){0};
+}
+
+#define AVP_P(name, sig, fn) {AVP_PLAYER, name, sig, fn}
+#define AVP_I(name, sig, fn) {AVP_IFACE, name, sig, fn}
+const klj_binding klj_bind_videoplugin[] = {
+    AVP_I("<init>", "()V", avp_iface_init),
+    AVP_I("GetPluginVersion", "()Ljava/lang/String;", avp_iface_version),
+    AVP_I("SetContext", "(Landroid/content/Context;)V", avp_noop),
+    AVP_I("SetContext", "(Lcom/unity3d/player/UnityPlayerActivity;)V", avp_noop),   // as the C# spells it
+    AVP_I("CreatePlayer", "(IZZIZ)Ljava/lang/Object;", avp_create),
+    AVP_I("CreatePlayer", "(IZZIZ)L" AVP_PLAYER ";", avp_create),
+    AVP_I("DestroyPlayer", "(I)V", avp_destroy),
+    AVP_I("Deinitialise", "()V", avp_iface_deinit),
+    AVP_I("RendererSetupPlayer", "(II)V", avp_s_setup),
+    AVP_I("RenderPlayer", "(I)V", avp_s_render),
+    AVP_I("WaitForNewFramePlayer", "(I)V", avp_s_wait),
+    AVP_I("RendererReset", "(I)V", avp_s_reset),
+    AVP_I("RendererDestroyPlayers", "()V", avp_s_destroy_players),
+    AVP_I("_GetWidth", "(I)I", avp_g_width),
+    AVP_I("_GetHeight", "(I)I", avp_g_height),
+    AVP_I("_GetTextureHandle", "(I)I", avp_g_texture),
+    AVP_I("_GetDuration", "(I)J", avp_g_duration),
+    AVP_I("_GetLastErrorCode", "(I)I", avp_g_error),
+    AVP_I("_GetFrameCount", "(I)I", avp_g_frames),
+    AVP_I("_GetVideoDisplayRate", "(I)F", avp_g_display_rate),
+    AVP_I("_CanPlay", "(I)Z", avp_g_canplay),
+    AVP_I("_GetCurrentVideoTrackBitrate", "(I)I", avp_g_bitrate),
+
+    AVP_P("OpenVideoFromFile", "(Ljava/lang/String;JLjava/lang/String;I)Z", avp_open),
+    AVP_P("OpenVideoFromFile", "(Ljava/lang/String;JLjava/lang/Object;I)Z", avp_open),   // a null header string
+    AVP_P("CloseVideo", "()V", avp_closevideo),
+    AVP_P("Deinitialise", "()V", avp_deinitialise),
+    AVP_P("DeinitialiseRender", "()V", avp_noop),
+    AVP_P("SetDeinitialiseFlagged", "()V", avp_flag_deinit),
+    AVP_P("GetDeinitialised", "()Z", avp_g_deinited),
+    AVP_P("Play", "()V", avp_play),
+    AVP_P("Pause", "()V", avp_pause),
+    AVP_P("Stop", "()V", avp_stop),
+    AVP_P("Seek", "(I)V", avp_seek),
+    AVP_P("SeekFast", "(I)V", avp_seekfast),
+    AVP_P("Update", "()V", avp_update),
+    AVP_P("SetLooping", "(Z)V", avp_set_looping),
+    AVP_P("SetVolume", "(F)V", avp_set_volume),
+    AVP_P("SetAudioPan", "(F)V", avp_set_pan),
+    AVP_P("MuteAudio", "(Z)V", avp_mute),
+    AVP_P("SetPlaybackRate", "(F)V", avp_set_rate),
+    AVP_P("SetAudioTrack", "(I)V", avp_noop),
+    AVP_P("SetPlayerOptions", "(ZZ)V", avp_set_options),
+    AVP_P("SetHeadRotation", "(FFFF)V", avp_noop),
+    AVP_P("SetFocusRotation", "(FFFF)V", avp_noop),
+    AVP_P("SetFocusProps", "(FF)V", avp_noop),
+    AVP_P("SetFocusEnabled", "(Z)V", avp_noop),
+    AVP_P("SetPositionTrackingEnabled", "(Z)V", avp_noop),
+    AVP_P("GetCurrentTimeMs", "()J", avp_g_position),
+    AVP_P("GetDurationMs", "()J", avp_g_duration),
+    AVP_P("GetWidth", "()I", avp_g_width),
+    AVP_P("GetHeight", "()I", avp_g_height),
+    AVP_P("GetTextureHandle", "()I", avp_g_texture),
+    AVP_P("GetFrameCount", "()I", avp_g_frames),
+    AVP_P("GetLastErrorCode", "()I", avp_g_error),
+    AVP_P("GetDisplayRate", "()F", avp_g_display_rate),
+    AVP_P("GetSourceVideoFrameRate", "()F", avp_g_fps),
+    AVP_P("GetCurrentVideoTrackBitrate", "()I", avp_g_bitrate),
+    AVP_P("GetTextureTimeStamp", "()J", avp_g_tex_ts),
+    AVP_P("GetTextureTransform", "()[F", avp_transform),
+    AVP_P("GetSeekableTimeRange", "()[F", avp_seekable),
+    AVP_P("GetCurrentAbsoluteTimestamp", "()D", avp_g_abs_time),
+    AVP_P("GetBufferingProgressPercent", "()F", avp_g_buffered),
+    AVP_P("GetEstimatedBandwidthUsed", "()J", avp_g_bitrate),
+    AVP_P("GetPlayerIndex", "()I", avp_g_index),
+    AVP_P("GetVolume", "()F", avp_g_volume),
+    AVP_P("GetAudioPan", "()F", avp_g_pan),
+    AVP_P("GetPlaybackRate", "()F", avp_g_rate),
+    AVP_P("GetNumberAudioTracks", "()I", avp_g_audio_tracks),
+    AVP_P("GetCurrentAudioTrackIndex", "()I", avp_g_audio_track),
+    AVP_P("CanPlay", "()Z", avp_g_canplay),
+    AVP_P("IsPlaying", "()Z", avp_g_playing),
+    AVP_P("IsPaused", "()Z", avp_g_paused),
+    AVP_P("IsFinished", "()Z", avp_g_finished),
+    AVP_P("IsSeeking", "()Z", avp_g_seeking),
+    AVP_P("IsBuffering", "()Z", avp_g_buffering),
+    AVP_P("IsLooping", "()Z", avp_g_looping),
+    AVP_P("IsMuted", "()Z", avp_g_muted),
+    AVP_P("HasAudio", "()Z", avp_g_has_audio),
+    AVP_P("HasVideo", "()Z", avp_g_has_video),
+    AVP_P("HasSubtitles", "()Z", avp_g_false),
+    AVP_P("HasTimedText", "()Z", avp_g_false),
+    AVP_P("StartExtractFrame", "()Z", avp_extract),
+    AVP_P("WaitForExtract", "()V", avp_wait_extract),
+    AVP_P("WaitForNewFrame", "()V", avp_wait_extract),
+    AVP_P("onFrameAvailable", "(" AVP_ST_SIG ")V", avp_on_frame),
+    {NULL, NULL, NULL, NULL},
+};
+'''
+if not os.path.exists(p) or open(p).read() != src:
+    open(p, "w").write(src)
+print("overlay: a video-player plugin's Java side (runtime/jni/kl_jni_videoplugin.c)")
+PYEOF
+
+# 92 — step 91's file joins the runtime: RUNTIME_JNI in the Makefile (the app
+# links libklepton.a, so this is its one source list), its binding table in
+# kl_jni_int.h and in the list klj_find_binding walks.
+python3 - "$K/Makefile" "$K/runtime/jni/kl_jni_int.h" "$K/runtime/kl_jni.c" <<'PYEOF'
+import sys
+marker = "metavision: a video-player plugin's Java side (step 92)"
+def sub(p, s, old, new):
+    if s.count(old) != 1:
+        sys.exit(f"overlay: anchor moved upstream in {p}: {old[:60]!r}")
+    return s.replace(old, new)
+p = sys.argv[1]
+s = open(p).read()
+if "runtime/jni/kl_jni_videoplugin.c" not in s:
+    s = sub(p, s, " runtime/jni/kl_jni_jkxr.c", " runtime/jni/kl_jni_jkxr.c runtime/jni/kl_jni_videoplugin.c")
+    open(p, "w").write(s)
+p = sys.argv[2]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "extern const klj_binding klj_bind_jkxr[];\n",
+        "extern const klj_binding klj_bind_jkxr[];\n"
+        "extern const klj_binding klj_bind_videoplugin[];   // " + marker + "\n")
+    open(p, "w").write(s)
+p = sys.argv[3]
+s = open(p).read()
+if marker not in s:
+    s = sub(p, s, "    klj_bind_jkxr,\n",
+        "    klj_bind_jkxr,\n"
+        "    klj_bind_videoplugin,   // " + marker + "\n")
+    open(p, "w").write(s)
+print("overlay: the video-player plugin's bindings are in the runtime")
+PYEOF
+
 # 93 — a native video player plugin's Java side. The plugin's native library
 # embeds mpv and FFmpeg and decodes by itself, but its Kotlin half is what the
 # title's C# reaches first: a plugin object whose Create(activity) registers
