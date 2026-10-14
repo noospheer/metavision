@@ -7,6 +7,12 @@ it without being changed.
 
 This matters most for people who cannot use their hands.
 
+> **Status: not yet usable.** In the last headset test, head pointing with
+> "select" did nothing in most titles. The reworked voice and pointing
+> described here (a visible pointer, voice that restarts itself, a spoken way
+> out) compile but have not been tested on a headset. Expect this page to
+> change.
+
 ## Input modes
 
 | Mode | What controls a title | For |
@@ -173,9 +179,8 @@ set. `MV_HANDS_FREE=0`, the older switch, means the same as `MV_INPUT_MODE=hands
   testing on the headset.
 - Titles built only on **OpenXR** read the same controller state as OVRPlugin
   titles (both controllers are published as tracked, so OpenXR sees them
-  present, with their buttons and sticks), but hands-free play has been
-  confirmed on the headset only for OVRPlugin titles (most Unity and Unreal
-  titles).
+  present, with their buttons and sticks), but hands-free play has not
+  been confirmed on the headset for either.
 
 ## Next
 

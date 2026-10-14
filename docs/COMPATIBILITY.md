@@ -213,57 +213,49 @@ OVRPlugin call in order — the step where a title stops is the last one.
 
 ## Open issues
 
+**Status.** metavision is experimental. Overlay steps up to 95 have been
+through a full test pass on a Vision Pro; steps 96–181 compile in CI and some
+have run in the visionOS Simulator, but none has yet run on a headset. Treat
+every fix below step 96 as tested, and every one after it as expected to work
+but unconfirmed.
+
+- **Hands-free play is not yet usable.** In the last headset test, head
+  pointing with "select" did nothing in most titles; only titles that play
+  without input were usable. Steps 180–181 rework voice and pointing (see
+  ACCESSIBILITY.md) and await a headset test.
+- **Doubled or distorted pictures** in some titles: reported on the headset,
+  not yet diagnosed. One earlier report of a squashed view is under test with
+  foveated rendering off (`KL_VRR=0`), then a unified eye frustum
+  (`KL_OVRP_UNIFY_FRUSTUM=1`).
 - **GPU compute in OpenGL ES titles.** Klepton runs GLES titles on ANGLE's
-  Metal backend, which is GLES 3.0: no compute shaders. Unity 2021+ is now told
-  ES 3.0 (overlay step 35) and falls back cleanly (CPU skinning, ES 3.0
-  variants); effects that need compute — VFX Graph particles, compute effects —
-  are still missing. Unity 2018/2019 keep ES 3.2 (they need 3.x features), so
-  their compute still fails (`GLSL compilation failed`, `Kernel at index (N) is
-  invalid`; triage lists both). Unity 2022.3 GLES builds get 3.0 by the same
-  rule but no test pass has compared them yet. Titles that ship Vulkan run on
-  MoltenVK, which has compute. The full fix is GLES 3.1 compute in the GL path.
-- **Squashed picture** in at least one title: frames render, the
-  view looks compressed. Under test: foveated rendering (`KL_VRR=0`), then a
-  unified eye frustum (`KL_OVRP_UNIFY_FRUSTUM=1`).
-- **`GL_INVALID_FRAMEBUFFER_OPERATION` once a frame** in GLES Unity titles,
-  reported by Unity's native-plugin GL check, on the eye-texture framebuffer.
-  Gone in the Unity 2021+ titles tested with ES 3.0 (step 35); for the rest, a
-  run with `KL_GLFB_ERRSCAN=0x506 KL_TRACE_FBO=1` names the call.
-- **Passthrough** is refused (`XR_FB_passthrough` absent, OVRPlugin's
-  `InitializeInsightPassthrough` unsupported). Mixed-reality titles that expect
-  it draw their few objects on black. The fix is a compositor feature: show the
-  room behind a transparent passthrough layer.
-- **Media.** A VideoPlayer clip with sound plays silent: Klepton's
-  `AMediaExtractor` exposes only the video track and `AMediaCodec` has no audio
-  decoder. Unity's VideoPlayer renders through a `SurfaceTexture`, which Klepton
-  does not have (a flat video app waits forever: `AndroidVideoMedia surface creation
-  stalled`), and MediaCodec in byte-buffer mode returns no output. The AVPro
-  video plugin's Java player (`com/RenderHeads/AVProVideo`) is unbound, so it
-  cannot create its player; it needs a binding over Klepton's video decoder.
-  All are media work in Klepton's `kl_mediandk.c` and its Java media classes.
-- **The OpenSL ES recorder freeze**: in titles that open the recorder from
-  their main thread, every guest thread stops at `[sl] record state ->
-  STOPPED`. Under diagnosis with step 36's call log.
-- **A GPU hang** in one title: the GPU firmware reports a lockup, Compositor
-  Services invalidates the layer renderer and the render loop ends. The hung
-  work is most likely ANGLE's Metal work for the title's GL frame. Next: a run
-  with Metal shader validation to find the draw.
-- **A depth buffer allocated every frame** in one Vulkan Unity title: the
-  engine destroys each image but keeps its views behind its own reference
-  count; step 65 empties that storage. Why it reallocates every frame is not
-  established (likely a 24-bit depth request answered with 32-bit).
-- **GLES compute** for titles shipped with GLES shaders only: their compute
-  effects need compute on the GLES path (ANGLE's Metal backend has none) or
-  ANGLE on Vulkan. A project of its own.
-- **Environment depth / raycasts** (`XR_META_environment_depth`): not offered.
-- **Hand tracking in OpenXR titles.** metavision's hands reach titles through
-  OVRPlugin; Klepton's OpenXR runtime offers no `XR_EXT_hand_tracking`.
-- **An OpenXR title exits on its own about 5 s in**, after its first frames,
-  with no crash report. Not memory: the memory answers are right since step 27
-  and no jetsam report is written. Under investigation.
-- **MoltenVK faults on the first frame** in titles that replay a secondary
-  command buffer beginning a render pass. Step 24's first option did not stop
-  it; graphics jobs are now forced off as well — awaiting a test pass.
+  Metal backend, which is GLES 3.0: no compute shaders. Unity 2021+ is told
+  ES 3.0 (overlay step 35) and falls back cleanly; effects that need compute —
+  VFX Graph particles, compute effects — are still missing. Unity 2018/2019
+  keep ES 3.2, so their compute still fails (`GLSL compilation failed`,
+  `Kernel at index (N) is invalid`; triage lists both). Titles that ship Vulkan
+  run on MoltenVK, which has compute. The full fix is GLES 3.1 compute in the
+  GL path.
+- **`GL_INVALID_FRAMEBUFFER_OPERATION` once a frame** in some GLES Unity
+  titles on the eye-texture framebuffer. A run with
+  `KL_GLFB_ERRSCAN=0x506 KL_TRACE_FBO=1` names the call.
+- **A GPU hang** in one title: Compositor Services invalidates the layer
+  renderer and the render loop ends. Most likely ANGLE's Metal work for the
+  title's GL frame; next is a run with Metal shader validation.
+- **A depth buffer allocated every frame** in one Vulkan Unity title; step 65
+  frees it. Why it reallocates is not established.
+- **An OpenXR title exits on its own about 5 s in**, with no crash report and
+  no jetsam report. Under investigation.
+- **Web views** report every page load as failed; there is no browser engine.
+- **Not provided:** environment depth and raycasts
+  (`XR_META_environment_depth`), voice chat services, Bluetooth LE, haptics
+  vests. Titles that need them run without them or stop.
+- **Online services.** Firestore and the Realtime Database are answered over
+  their REST APIs (steps 145, 160); untested on a headset.
+- **Hands in hands-free mode.** A title that accepts only hands gets a stand-in
+  hand through OVRPlugin; an OpenXR title of that kind does not yet.
+- **Simulator only:** some Vulkan titles fault in MoltenVK's render-pass setup,
+  and some Metal texture descriptors fail the Simulator's validation. Neither
+  is seen on the headset.
 - **Dwell Control inside an immersive title** is untested (see ACCESSIBILITY.md).
 - Titles whose code is 32-bit only, Flutter, Quill's own engine or Unreal 5 are
-  not generated (8 of 54 in the archive).
+  not generated.

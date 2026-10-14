@@ -12,6 +12,12 @@ use of their hands, can play Quest titles with eyes, head and voice. It has
 three input modes: Auto, Hands and Hands-free. See
 [docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md).
 
+**Status: experimental.** Most titles start and render on a Vision Pro, but
+many are not yet playable: hands-free play did not work in the last headset
+test, and some titles render incorrectly. Recent fixes compile in CI but have
+not run on a headset yet. See the open issues in
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#open-issues).
+
 Pull APKs from a Quest you own, triage them for compatibility, relink ARM64 ELF
 to Mach-O, and build a signed visionOS launcher that loads them.
 
